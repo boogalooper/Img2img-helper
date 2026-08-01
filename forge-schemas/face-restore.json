@@ -1,0 +1,92 @@
+{
+  "kind": "photoshop-helper-forge-schema",
+  "backend": "forge",
+  "schema_version": 1,
+  "id": "face-restore",
+  "label": "Face Restore",
+  "ui_family": "face_restore",
+  "order": 10000,
+  "generation": {
+    "endpoint": "sdapi/v1/extra-single-image",
+    "input_mode": "single_image",
+    "input_key": "image",
+    "response_keys": [
+      "image",
+      "images"
+    ],
+    "allowed_payload_fields": [
+      "gfpgan_visibility",
+      "codeformer_visibility",
+      "codeformer_weight"
+    ],
+    "require_any": [
+      "gfpgan",
+      "codeformer"
+    ],
+    "require_any_error": "Select GFPGAN or CodeFormer.",
+    "progress_mode": "request_sent"
+  },
+  "capabilities": {
+    "image_stitch": false,
+    "max_image_inputs": 0
+  },
+  "image_stitch_default": false,
+  "controls": [
+    {
+      "id": "gfpgan",
+      "label": "GFPGAN",
+      "type": "checkbox",
+      "value": true,
+      "visible": true
+    },
+    {
+      "id": "gfpgan_visibility",
+      "label": "GFPGAN visibility",
+      "help": "Strength of the GFPGAN result in the final image.",
+      "type": "float",
+      "value": 1,
+      "min": 0,
+      "max": 1,
+      "step": 0.01,
+      "visible": true,
+      "enabled_by": "gfpgan",
+      "payload_key": "gfpgan_visibility"
+    },
+    {
+      "id": "codeformer",
+      "label": "CodeFormer",
+      "type": "checkbox",
+      "value": true,
+      "visible": true
+    },
+    {
+      "id": "codeformer_visibility",
+      "label": "CodeFormer visibility",
+      "help": "Strength of the CodeFormer result in the final image.",
+      "type": "float",
+      "value": 1,
+      "min": 0,
+      "max": 1,
+      "step": 0.01,
+      "visible": true,
+      "enabled_by": "codeformer",
+      "payload_key": "codeformer_visibility"
+    },
+    {
+      "id": "codeformer_weight",
+      "label": "CodeFormer weight",
+      "help": "0 = maximum effect, 1 = minimum effect.",
+      "type": "float",
+      "value": 0,
+      "min": 0,
+      "max": 1,
+      "step": 0.01,
+      "visible": true,
+      "enabled_by": "codeformer",
+      "payload_key": "codeformer_weight"
+    }
+  ],
+  "image_stitch": {
+    "visible": false
+  }
+}

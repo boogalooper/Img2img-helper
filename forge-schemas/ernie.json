@@ -1,0 +1,126 @@
+{
+  "kind": "photoshop-helper-forge-schema",
+  "backend": "forge",
+  "schema_version": 1,
+  "id": "ernie",
+  "label": "Ernie",
+  "ui_family": "shift",
+  "order": 80,
+  "capabilities": {
+    "image_stitch": false,
+    "max_image_inputs": 0
+  },
+  "image_stitch_default": false,
+  "controls": [
+    {
+      "id": "checkpoint",
+      "label": "Checkpoint",
+      "type": "dropdown",
+      "source": "checkpoints",
+      "value": "",
+      "visible": true,
+      "required_visible": true
+    },
+    {
+      "id": "modules",
+      "label": "VAE / Text encoders",
+      "type": "multiselect",
+      "source": "modules",
+      "value": [],
+      "visible": true,
+      "required_visible": true
+    },
+    {
+      "id": "positive_prompt",
+      "label": "Prompt",
+      "type": "multiline",
+      "value": "",
+      "visible": true,
+      "payload_key": "prompt"
+    },
+    {
+      "id": "negative_prompt",
+      "label": "Negative prompt",
+      "type": "multiline",
+      "value": "",
+      "visible": true,
+      "payload_key": "negative_prompt"
+    },
+    {
+      "id": "sampler",
+      "label": "Sampling method",
+      "type": "dropdown",
+      "source": "samplers",
+      "value": "Euler",
+      "visible": true,
+      "payload_key": "sampler_name"
+    },
+    {
+      "id": "scheduler",
+      "label": "Schedule type",
+      "type": "dropdown",
+      "source": "schedulers",
+      "value": "Simple",
+      "visible": true,
+      "payload_key": "scheduler"
+    },
+    {
+      "id": "steps",
+      "label": "Sampling steps",
+      "type": "integer",
+      "value": 8,
+      "min": 1,
+      "max": 100,
+      "step": 1,
+      "visible": true,
+      "payload_key": "steps"
+    },
+    {
+      "id": "cfg",
+      "label": "CFG Scale",
+      "type": "float",
+      "value": 1.0,
+      "min": 0,
+      "max": 24,
+      "step": 0.5,
+      "visible": true,
+      "payload_key": "cfg_scale"
+    },
+    {
+      "id": "denoise",
+      "label": "Denoising strength",
+      "type": "float",
+      "value": 0.35,
+      "min": 0,
+      "max": 1,
+      "step": 0.01,
+      "visible": true,
+      "payload_key": "denoising_strength"
+    },
+    {
+      "id": "seed",
+      "label": "Seed",
+      "type": "integer",
+      "value": -1,
+      "min": -1,
+      "max": 2147483647,
+      "step": 1,
+      "visible": false,
+      "payload_key": "seed"
+    },
+    {
+      "id": "shift",
+      "label": "Shift",
+      "type": "float",
+      "value": 3.0,
+      "min": 1,
+      "max": 24,
+      "step": 0.5,
+      "visible": true,
+      "payload_key": "distilled_cfg_scale"
+    }
+  ],
+  "image_stitch": {
+    "visible": false
+  }
+}

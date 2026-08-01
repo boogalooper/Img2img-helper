@@ -1,0 +1,106 @@
+{
+  "kind": "photoshop-helper-forge-schema",
+  "backend": "forge",
+  "schema_version": 1,
+  "id": "upscaler",
+  "label": "Upscaler",
+  "ui_family": "upscaler",
+  "order": 10010,
+  "generation": {
+    "endpoint": "sdapi/v1/extra-single-image",
+    "input_mode": "single_image",
+    "input_key": "image",
+    "response_keys": [
+      "image",
+      "images"
+    ],
+    "allowed_payload_fields": [
+      "resize_mode",
+      "show_extras_results",
+      "gfpgan_visibility",
+      "codeformer_visibility",
+      "codeformer_weight",
+      "upscaling_resize",
+      "upscaling_resize_w",
+      "upscaling_resize_h",
+      "upscaling_crop",
+      "upscaler_1",
+      "upscaler_2",
+      "extras_upscaler_2_visibility",
+      "upscale_first",
+      "upscale_cc"
+    ],
+    "progress_mode": "request_sent"
+  },
+  "capabilities": {
+    "image_stitch": false,
+    "max_image_inputs": 0
+  },
+  "image_stitch_default": false,
+  "fixed_values": {
+    "resize_mode": 0,
+    "show_extras_results": true,
+    "gfpgan_visibility": 0,
+    "codeformer_visibility": 0,
+    "codeformer_weight": 0,
+    "upscaling_resize_w": 512,
+    "upscaling_resize_h": 512,
+    "upscaling_crop": true,
+    "upscale_first": false
+  },
+  "controls": [
+    {
+      "id": "upscaling_resize",
+      "label": "Resize",
+      "help": "Upscale factor.",
+      "type": "float",
+      "value": 4,
+      "min": 0,
+      "max": 8,
+      "step": 0.25,
+      "visible": true,
+      "payload_key": "upscaling_resize"
+    },
+    {
+      "id": "upscaler_1",
+      "label": "Upscaler 1",
+      "type": "dropdown",
+      "value": "None",
+      "source": "upscalers",
+      "visible": true,
+      "payload_key": "upscaler_1"
+    },
+    {
+      "id": "upscaler_2",
+      "label": "Upscaler 2",
+      "type": "dropdown",
+      "value": "None",
+      "source": "upscalers",
+      "visible": true,
+      "payload_key": "upscaler_2"
+    },
+    {
+      "id": "extras_upscaler_2_visibility",
+      "label": "Upscaler 2 visibility",
+      "help": "Blend amount for Upscaler 2.",
+      "type": "float",
+      "value": 0,
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "visible": true,
+      "payload_key": "extras_upscaler_2_visibility"
+    },
+    {
+      "id": "upscale_cc",
+      "label": "Color Correction",
+      "type": "checkbox",
+      "value": false,
+      "visible": true,
+      "payload_key": "upscale_cc"
+    }
+  ],
+  "image_stitch": {
+    "visible": false
+  }
+}
