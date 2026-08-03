@@ -36,7 +36,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.12",
+    VER = "0.13",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -162,9 +162,14 @@ function init() {
     settingsReady = true;
     cfg.cleanReferenceHistory();
     var environmentMode = DEBUG_FIRST_LAUNCH_WITH_INTERFACE ? null : $.getenv(APP.dialogEnvKey),
-        showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
-            ? (app.playbackDisplayDialogs == DialogModes.ALL || forceDialog)
-            : (forceDialog || environmentMode == null || environmentMode == "true"));
+        // Значение "true" является общим требованием показать окно после
+        // ошибки, отмены или закрытия предыдущего диалога. Оно должно иметь
+        // приоритет и при воспроизведении Photoshop Action; иначе Action снова
+        // запускает те же ошибочные параметры в тихом режиме.
+        showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || forceDialog ||
+            environmentMode == "true" || (actionPlaybackMode
+                ? app.playbackDisplayDialogs == DialogModes.ALL
+                : environmentMode == null);
     var selection = {
         result: false,
         bounds: null,
@@ -1455,6 +1460,79 @@ function arrayContainsCaseInsensitive(array, value) {
     for (var i = 0; i < array.length; i++) if (String(array[i]).toUpperCase() == value) return true;
     return false;
 }
+function normalizeForgeLoraList(items) {
+    var res = [];
+    if (!(items instanceof Array)) return res;
+    for (var i = 0; i < items.length; i++) {
+        var item = items[i], name = "";
+        if (typeof item == "string") name = item;
+        else if (item && typeof item == "object")
+            name = item.name || item.alias || item.value || item.label || item.model_name || item.title || item.filename || item.path || "";
+        name = String(name || "").replace(/^\s+|\s+$/g, "");
+        if (name && !arrayContainsCaseInsensitive(res, name)) res.push(name);
+    }
+    res.sort(function (a, b) {
+        a = String(a).toLowerCase(); b = String(b).toLowerCase();
+        return a == b ? 0 : (a > b ? 1 : -1);
+    });
+    return res;
+}
+function parseForgeLoraEntry(value) {
+    var text = String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, ""),
+        prefixRemoved,
+        name = "",
+        weight = 1,
+        separator = -1,
+        parsedWeight;
+    text = text.replace(/^<+|>+$/g, "");
+    prefixRemoved = /^lora:/i.test(text) ? text.substring(5) : text;
+    separator = prefixRemoved.lastIndexOf(":");
+    if (separator > 0) {
+        name = prefixRemoved.substring(0, separator).replace(/^\s+|\s+$/g, "");
+        parsedWeight = parseFloat(prefixRemoved.substring(separator + 1));
+        if (!isNaN(parsedWeight)) weight = parsedWeight;
+        else name = prefixRemoved.replace(/^\s+|\s+$/g, "");
+    } else {
+        name = prefixRemoved.replace(/^\s+|\s+$/g, "");
+    }
+    weight = clamp(roundTo(weight, 2), 0, 1);
+    return { name: name, weight: weight };
+}
+function formatForgeLoraWeight(value) {
+    var weight = parseFloat(value);
+    if (isNaN(weight)) weight = 1;
+    weight = clamp(roundTo(weight, 2), 0, 1);
+    return formatNumber(weight, false, 2);
+}
+function formatForgeLoraEntry(name, weight) {
+    name = String(name || "").replace(/^\s+|\s+$/g, "");
+    return name ? "lora:" + name + ":" + formatForgeLoraWeight(weight) : "";
+}
+function normalizeForgeLoraSelection(items, storedValue) {
+    var available = normalizeForgeLoraList(items),
+        source = storedValue instanceof Array ? storedValue : [],
+        res = [],
+        selectedNames = [];
+    for (var i = 0; i < source.length; i++) {
+        var parsed = parseForgeLoraEntry(source[i]),
+            name = parsed.name,
+            matchedName = name;
+        if (!name) continue;
+        if (available.length) {
+            matchedName = "";
+            for (var j = 0; j < available.length; j++)
+                if (String(available[j]).toUpperCase() == String(name).toUpperCase()) {
+                    matchedName = available[j];
+                    break;
+                }
+            if (!matchedName) continue;
+        }
+        if (!matchedName || arrayContainsCaseInsensitive(selectedNames, matchedName)) continue;
+        selectedNames.push(matchedName);
+        res.push(formatForgeLoraEntry(matchedName, parsed.weight));
+    }
+    return res;
+}
 // ============================================================================
 // ЦИКЛ ГЕНЕРАЦИИ И РАБОТА С ДОКУМЕНТОМ PHOTOSHOP
 // Отвечает за экспорт выделения, формирование запроса, progress, получение
@@ -1504,6 +1582,7 @@ function GenerationRuntime() {
         var res = cloneObj(values || {}),
             loras = selectedLoras instanceof Array ? selectedLoras : [],
             tags = [],
+            tagNames = [],
             controls = schema && schema.controls instanceof Array ? schema.controls : [],
             availableLoras = [],
             promptId = "positive_prompt",
@@ -1528,11 +1607,13 @@ function GenerationRuntime() {
         // Forge сам вернёт понятную ошибку для отсутствующей LoRA вместо того,
         // чтобы helper молча запустил генерацию без выбранной модели.
         if (availableLoras.length)
-            loras = ui.normalizeMultiselect({ items: availableLoras }, loras);
+            loras = normalizeForgeLoraSelection(availableLoras, loras);
         for (var i = 0; i < loras.length; i++) {
-            var name = String(loras[i] || "").replace(/^\s+|\s+$/g, "");
-            if (!name || arrayContainsCaseInsensitive(tags, name)) continue;
-            tags.push(name);
+            var parsed = parseForgeLoraEntry(loras[i]),
+                name = parsed.name;
+            if (!name || arrayContainsCaseInsensitive(tagNames, name)) continue;
+            tagNames.push(name);
+            tags.push(parsed);
         }
         if (shouldDisableNegativePrompt(schema, res) && res.hasOwnProperty(negativePromptId))
             delete res[negativePromptId];
@@ -1540,7 +1621,7 @@ function GenerationRuntime() {
         var prompt = String(res[promptId] === undefined || res[promptId] === null ? "" : res[promptId]),
             prefix = "";
         for (var tagIndex = 0; tagIndex < tags.length; tagIndex++)
-            prefix += (prefix ? " " : "") + "<lora:" + tags[tagIndex] + ":1>";
+            prefix += (prefix ? " " : "") + "<lora:" + tags[tagIndex].name + ":" + formatForgeLoraWeight(tags[tagIndex].weight) + ">";
         res[promptId] = prefix + (prompt ? " " + prompt : "");
         return res;
     }
@@ -2979,19 +3060,120 @@ function UI() {
     }
     this.addForgeLoraMultiSelect = function (parent, items, storedValue, preferredWidth) {
         var normalizedItems = normalizeForgeLoraList(items),
-            schema = { items: normalizedItems };
-        return addStaticMultiSelect(parent, {
-            preferredWidth: preferredWidth || self.contentWidth(),
-            label: str.lora,
-            help: str.selectLora,
-            items: normalizedItems,
-            storedValue: storedValue,
-            normalize: function (value) { return self.normalizeMultiselect(schema, value); },
-            selectorTitle: str.selectLora,
-            searchHelp: str.loraSearch,
-            selectHelp: str.selectLora,
-            emptyText: str.lorasNone
-        });
+            values = normalizeForgeLoraSelection(normalizedItems, storedValue),
+            controlWidth = preferredWidth || self.contentWidth(),
+            group = self.addColumn(parent, 0, "top"),
+            header = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:0,margins:0}"),
+            title = header.add("statictext"),
+            add = header.add("button"),
+            selectedHost = group.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}");
+        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = controlWidth;
+        header.preferredSize.width = header.minimumSize.width = header.maximumSize.width = controlWidth;
+        title.alignment = ["fill", "center"];
+        title.minimumSize.width = 0;
+        title.text = str.lora;
+        title.helpTip = str.selectLora;
+        add.alignment = ["right", "center"];
+        self.setFixedWidth(add, self.presetButtonWidth);
+        add.text = str.presetAddButton;
+        add.helpTip = str.selectLora;
+        add.enabled = normalizedItems.length > 0;
+        selectedHost.preferredSize.width = selectedHost.minimumSize.width = selectedHost.maximumSize.width = controlWidth;
+        function relayout() {
+            try { selectedHost.layout.layout(true); } catch (_) { }
+            try { group.layout.layout(true); } catch (_) { }
+            try {
+                var owner = group.window || group;
+                while (owner && owner.parent) owner = owner.parent;
+                if (owner && owner.layout) {
+                    owner.layout.layout(true);
+                    owner.layout.resize();
+                    if (owner.visible) owner.update();
+                }
+            } catch (_) { }
+        }
+        function selectionNames() {
+            var names = [];
+            for (var i = 0; i < values.length; i++) {
+                var parsed = parseForgeLoraEntry(values[i]);
+                if (parsed.name && !arrayContainsCaseInsensitive(names, parsed.name)) names.push(parsed.name);
+            }
+            return names;
+        }
+        function weightMap() {
+            var map = {};
+            for (var i = 0; i < values.length; i++) {
+                var parsed = parseForgeLoraEntry(values[i]);
+                if (parsed.name) map[String(parsed.name).toUpperCase()] = parsed.weight;
+            }
+            return map;
+        }
+        function openSelector() {
+            if (!normalizedItems.length) return;
+            var sel = self.showItemSelector({
+                title: str.selectLora,
+                searchHelp: str.loraSearch,
+                items: normalizedItems,
+                selectedValues: selectionNames(),
+                multiselect: true
+            });
+            if (sel === null) return;
+            var weights = weightMap();
+            values = [];
+            for (var i = 0; i < sel.length; i++) {
+                var name = String(sel[i] || "").replace(/^\s+|\s+$/g, ""),
+                    key = String(name).toUpperCase(),
+                    weight = weights.hasOwnProperty(key) ? weights[key] : 1;
+                if (!name) continue;
+                values.push(formatForgeLoraEntry(name, weight));
+            }
+            values = normalizeForgeLoraSelection(normalizedItems, values);
+            rebuildSelected();
+        }
+        function setLabelTooltip(control, itemLabel) {
+            control.helpTip = itemLabel ? itemLabel : str.lora;
+        }
+        function rebuildSelected() {
+            try { selectedHost.visible = false; } catch (_) { }
+            while (selectedHost.children.length)
+                selectedHost.remove(selectedHost.children[selectedHost.children.length - 1]);
+            if (!values.length) {
+                var empty = selectedHost.add("statictext");
+                empty.text = "› " + str.lorasNone;
+                setLabelTooltip(empty, "");
+            } else {
+                for (var i = 0; i < values.length; i++) {
+                    (function (index) {
+                        var parsed = parseForgeLoraEntry(values[index]),
+                            sliderControl = self.addSlider(selectedHost, "lora:" + parsed.name, 0, 1, parsed.weight, {
+                                controlWidth: controlWidth,
+                                displayValue: formatForgeLoraWeight(parsed.weight)
+                            });
+                        setLabelTooltip(sliderControl.title, parsed.name);
+                        sliderControl.valueText.helpTip = parsed.name;
+                        function syncWeight(finalize) {
+                            var next = roundTo(roundByStep(Number(sliderControl.slider.value), 0.01, 0), 2);
+                            next = clamp(next, 0, 1);
+                            sliderControl.slider.value = next;
+                            sliderControl.valueText.text = formatForgeLoraWeight(next);
+                            values[index] = formatForgeLoraEntry(parsed.name, next);
+                            if (finalize) values = normalizeForgeLoraSelection(normalizedItems, values);
+                        }
+                        sliderControl.slider.onChanging = function () { syncWeight(false); };
+                        sliderControl.slider.onChange = function () { syncWeight(true); };
+                    })(i);
+                }
+            }
+            try { selectedHost.visible = true; } catch (_) { }
+            relayout();
+        }
+        add.onClick = openSelector;
+        rebuildSelected();
+        return {
+            getValue: function () { return cloneObj(values); },
+            control: add,
+            container: group
+        };
     };
     function addMultiSelect(parent, schema, storedValue, preferredWidth) {
         var group = self.addColumn(parent, 0, "top"),
@@ -3329,23 +3511,6 @@ function UI() {
         var id = String(schema.id || "");
         for (var i = 0; i < prefixes.length; i++) if (startsWithSemantic(id, prefixes[i])) return true;
         return false;
-    }
-    function normalizeForgeLoraList(items) {
-        var res = [];
-        if (!(items instanceof Array)) return res;
-        for (var i = 0; i < items.length; i++) {
-            var item = items[i], name = "";
-            if (typeof item == "string") name = item;
-            else if (item && typeof item == "object")
-                name = item.name || item.alias || item.value || item.label || item.model_name || item.title || item.filename || item.path || "";
-            name = String(name || "").replace(/^\s+|\s+$/g, "");
-            if (name && !arrayContainsCaseInsensitive(res, name)) res.push(name);
-        }
-        res.sort(function (a, b) {
-            a = String(a).toLowerCase(); b = String(b).toLowerCase();
-            return a == b ? 0 : (a > b ? 1 : -1);
-        });
-        return res;
     }
     function addPromptControl(parent, schema, storedValue) {
         var group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}"),
@@ -4593,12 +4758,7 @@ function Config() {
         normalizeBaseProfile(profile);
         if (profile.autoResize === undefined) profile.autoResize = self.autoResize;
         if (!(profile.selectedLoras instanceof Array)) profile.selectedLoras = [];
-        var normalizedLoras = [];
-        for (var loraIndex = 0; loraIndex < profile.selectedLoras.length; loraIndex++) {
-            var loraName = String(profile.selectedLoras[loraIndex] || "").replace(/^\s+|\s+$/g, "");
-            if (loraName && !arrayContainsCaseInsensitive(normalizedLoras, loraName)) normalizedLoras.push(loraName);
-        }
-        profile.selectedLoras = normalizedLoras;
+        profile.selectedLoras = normalizeForgeLoraSelection([], profile.selectedLoras);
         if (!(profile.imageStitchInputs instanceof Array)) profile.imageStitchInputs = ["", "", ""];
         while (profile.imageStitchInputs.length < 3) profile.imageStitchInputs.push("");
         if (profile.imageStitchInputs.length > 3) profile.imageStitchInputs = profile.imageStitchInputs.slice(0, 3);
