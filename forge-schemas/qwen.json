@@ -6,6 +6,7 @@
   "label": "QWEN",
   "ui_family": "standard",
   "order": 50,
+  "size_multiple": 16,
   "capabilities": {
     "image_stitch": true,
     "max_image_inputs": 3

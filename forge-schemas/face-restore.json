@@ -6,6 +6,7 @@
   "label": "Face Restore",
   "ui_family": "face_restore",
   "order": 10000,
+  "size_multiple": 16,
   "generation": {
     "endpoint": "sdapi/v1/extra-single-image",
     "input_mode": "single_image",

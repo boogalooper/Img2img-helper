@@ -6,6 +6,7 @@
   "label": "Upscaler",
   "ui_family": "upscaler",
   "order": 10010,
+  "size_multiple": 16,
   "generation": {
     "endpoint": "sdapi/v1/extra-single-image",
     "input_mode": "single_image",
@@ -19,15 +20,10 @@
       "show_extras_results",
       "gfpgan_visibility",
       "codeformer_visibility",
-      "codeformer_weight",
       "upscaling_resize",
-      "upscaling_resize_w",
-      "upscaling_resize_h",
-      "upscaling_crop",
       "upscaler_1",
       "upscaler_2",
       "extras_upscaler_2_visibility",
-      "upscale_first",
       "upscale_cc"
     ],
     "progress_mode": "request_sent"
@@ -41,12 +37,7 @@
     "resize_mode": 0,
     "show_extras_results": true,
     "gfpgan_visibility": 0,
-    "codeformer_visibility": 0,
-    "codeformer_weight": 0,
-    "upscaling_resize_w": 512,
-    "upscaling_resize_h": 512,
-    "upscaling_crop": true,
-    "upscale_first": false
+    "codeformer_visibility": 0
   },
   "controls": [
     {

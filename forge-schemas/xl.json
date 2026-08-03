@@ -6,6 +6,7 @@
   "label": "SDXL",
   "ui_family": "standard",
   "order": 20,
+  "size_multiple": 16,
   "capabilities": {
     "image_stitch": false,
     "max_image_inputs": 0

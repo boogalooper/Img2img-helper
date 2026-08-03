@@ -6,6 +6,7 @@
   "label": "Z-Image",
   "ui_family": "shift",
   "order": 100,
+  "size_multiple": 16,
   "capabilities": {
     "image_stitch": false,
     "max_image_inputs": 0

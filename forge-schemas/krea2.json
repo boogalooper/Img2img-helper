@@ -6,6 +6,7 @@
   "label": "KREA 2",
   "ui_family": "standard",
   "order": 91,
+  "size_multiple": 16,
   "capabilities": {
     "image_stitch": true,
     "max_image_inputs": 3
