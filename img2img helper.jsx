@@ -36,7 +36,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.11",
+    VER = "0.12",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -432,8 +432,10 @@ function mainDialog(selection, initial, responseSeconds) {
         if (!backend.isAvailable(backendId)) return false;
         loadBackend(backendId, progress, true);
         if (backendId == BACKEND_FORGE) {
-            var presetId = metadata.workspace_id || metadata.schema_id || String(metadata.workflow_id || "").replace(/^forge:/, "");
-            if (!backend.findForgeSchema(state.forgePresets, presetId)) return false;
+            var presetId = metadata.workspace_id,
+                presetItem = backend.findForgeSchema(state.forgePresets, presetId);
+            if (!presetItem) return false;
+            presetId = presetItem.id;
             cfg.selectedForgePreset = cfg.data.selectedForgePreset = presetId;
             var loadedForge = backend.loadForgeSchema(presetId, state.forgeCatalog, progress, false);
             state.forgeCatalog = loadedForge.catalog;
@@ -825,8 +827,9 @@ function mainDialog(selection, initial, responseSeconds) {
                 isDirty = false;
                 ui.runWithPaletteProgress(str.progressForgePresets, function (progress) {
                     state.forgePresets = backend.refreshForgeSchemas(progress);
-                    cfg.selectedForgePreset = cfg.data.selectedForgePreset = backend.findForgeSchema(state.forgePresets, schemaId)
-                        ? schemaId
+                    var presetItem = backend.findForgeSchema(state.forgePresets, schemaId);
+                    cfg.selectedForgePreset = cfg.data.selectedForgePreset = presetItem
+                        ? presetItem.id
                         : backend.chooseForgeSchema(state.forgePresets);
                     if (cfg.selectedForgePreset) loadForgeSchemaState(cfg.selectedForgePreset, progress, true);
                     else state.schema = null;
@@ -2199,21 +2202,23 @@ function BackendRuntime() {
         return items;
     }
     function chooseForgeSchema(items) {
+        var selected = findForgeSchema(items, cfg.selectedForgePreset);
+        if (selected) return selected.id;
         return chooseItem(items, cfg.selectedForgePreset, str.uiPreset, forgeSchemaLabel, "forge-preset");
     }
+    // Runtime identity is always the JSON filename supplied as item.id.
+    // Copies with the same internal schema id therefore have separate profiles.
     function findForgeSchema(items, presetId) { return findItem(items, presetId); }
     function hydrateForgeSchema(schema, catalog) {
         schema = cloneObj(schema || {});
         schema.backend = BACKEND_FORGE;
         catalog = catalog || {};
-        var cur = catalog.current || {}, controls = schema.controls || [];
+        var controls = schema.controls || [];
         for (var i = 0; i < controls.length; i++) {
             var control = controls[i], source = control.source;
             if (source && catalog[source] instanceof Array) control.items = cloneObj(catalog[source]);
             control.backend = BACKEND_FORGE;
             control.forgeLoras = cloneObj(catalog.loras instanceof Array ? catalog.loras : []);
-            if (control.id == "checkpoint" && !control.value) control.value = cur.checkpoint || "";
-            if (control.id == "modules" && (!(control.value instanceof Array) || !control.value.length)) control.value = cloneObj(cur.modules || []);
         }
         return schema;
     }
@@ -2284,7 +2289,12 @@ function BackendRuntime() {
         var currentBackend = schemaBackend(schema),
             visible = currentBackend == BACKEND_FORGE
                 ? resolveForgeVisibleControls(schema, profile)
-                : profile.visibleControls;
+                : profile.visibleControls,
+            cleanForgeProfile = currentBackend == BACKEND_FORGE,
+            storedKey;
+        if (cleanForgeProfile)
+            for (storedKey in profile.values)
+                if (profile.values.hasOwnProperty(storedKey)) { cleanForgeProfile = false; break; }
         if (visible === null || visible === undefined) visible = schema.recommended_controls || [];
         var controls = schema.controls instanceof Array ? schema.controls : [],
             schemaId = String(schema.workflow_id || schema.workspace_id || "schema");
@@ -2306,8 +2316,16 @@ function BackendRuntime() {
                 if (String(schemaItemData(items[j]).value) == String(cur)) { found = true; break; }
             if (found) continue;
             var replacement = schemaItemData(items[0]),
-                previous = cur === undefined || cur === null ? "" : cur;
+                previous = cur === undefined || cur === null ? "" : cur,
+                emptySchemaCheckpoint = cleanForgeProfile && !hasStored &&
+                    startsWithSemantic(id, "checkpoint") &&
+                    String(previous).replace(/^\s+|\s+$/g, "") == "";
             profile.values[id] = cloneObj(replacement.value);
+            // Для нового или полностью сброшенного Forge-профиля пустой
+            // checkpoint в JSON означает «использовать первый доступный».
+            // Это начальная инициализация, а не потеря пользовательского
+            // значения, поэтому предупреждение и принудительный диалог не нужны.
+            if (emptySchemaCheckpoint) continue;
             res.notices.push({
                 key: key + ":missing:" + String(previous),
                 message: label + ": " + quotedValue(previous) + " → " + quotedValue(replacement.label)
@@ -3928,7 +3946,7 @@ function LayerMetadata() {
             catch (_) { try { value = eval("(" + source + ")"); } catch (_) { value = null; } }
             if (!isObjectMap(value)) return null;
             if (value.backend == BACKEND_COMFY && !value.workflow_id && !value.relative_path) return null;
-            if (value.backend == BACKEND_FORGE && !value.workspace_id && !value.schema_id) return null;
+            if (value.backend == BACKEND_FORGE && !value.workspace_id) return null;
             return value;
         } catch (_) { }
         return null;
