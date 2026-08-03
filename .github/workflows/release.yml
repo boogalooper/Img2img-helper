@@ -1,0 +1,63 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare release package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_NAME="img2img-helper-${VERSION}"
+          PACKAGE_DIR="dist/${PACKAGE_NAME}"
+
+          mkdir -p "${PACKAGE_DIR}"
+
+          cp "img2img helper.jsx" "${PACKAGE_DIR}/"
+          cp "img2img-api.pyw" "${PACKAGE_DIR}/"
+          cp "README.md" "${PACKAGE_DIR}/"
+
+          cp -R "forge-schemas" "${PACKAGE_DIR}/"
+          cp -R "advanced" "${PACKAGE_DIR}/"
+
+          cd dist
+          zip -r "${PACKAGE_NAME}.zip" "${PACKAGE_NAME}"
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          {
+            echo "## История изменений"
+            echo
+            git log -1 --format=%B
+          } > release-notes.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="dist/img2img-helper-${VERSION}.zip"
+
+          gh release create "${GITHUB_REF_NAME}" \
+            "${ARCHIVE}" \
+            --verify-tag \
+            --title "img2img helper ${VERSION}" \
+            --notes-file release-notes.md \
+            --latest
