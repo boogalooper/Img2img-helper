@@ -36,7 +36,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.1",
+    VER = "0.11",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -188,12 +188,12 @@ function init() {
         api.initialize(startupProgress);
         if (startupProgress) startupProgress.setStage(str.progressHandshake, 22);
         backend.applyStatus(api.handshake(startupProgress));
-        backend.normalizeActiveBackend();
+        var backendChangedAtStartup = backend.normalizeActiveBackend();
         if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
         var initial = backend.loadInitialData(startupProgress),
             responseSeconds = Math.round((((new Date()).getTime() - startupStartedAt) / 1000) * 100) / 100;
         initial.notices = settingsWarnings.concat(initial.notices instanceof Array ? initial.notices : []);
-        if (initial.forceDialog || initial.notices.length ||
+        if (backendChangedAtStartup || initial.forceDialog || initial.notices.length ||
             (initial.emptyDropdownIds instanceof Array && initial.emptyDropdownIds.length)) {
             showInterface = true;
             $.setenv(APP.dialogEnvKey, "true");
@@ -2084,9 +2084,11 @@ function BackendRuntime() {
         return value.mode == BACKEND_COMFY ? "ComfyUI" : "Forge Neo";
     }
     function normalizeActiveBackend() {
-        if (isAvailable(cfg.activeBackend)) return;
+        var previous = cfg.activeBackend;
+        if (isAvailable(previous)) return false;
         if (isAvailable(BACKEND_COMFY)) cfg.activeBackend = cfg.data.activeBackend = BACKEND_COMFY;
         else if (isAvailable(BACKEND_FORGE)) cfg.activeBackend = cfg.data.activeBackend = BACKEND_FORGE;
+        return cfg.activeBackend != previous;
     }
     function comfyFolderReady() {
         return !!cfg.workflowsFolder && (new Folder(cfg.workflowsFolder)).exists;
