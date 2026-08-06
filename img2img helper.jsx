@@ -36,7 +36,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.13",
+    VER = "0.14",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -1886,6 +1886,7 @@ function GenerationRuntime() {
     }
     function exportSelectionFiles(selection, width, height, requestId, inpaintMode) {
         var hst = activeDocument.activeHistoryState,
+            hiddenLayerIds = [],
             c = null;
         try { c = doc.getProperty("center").value; } catch (_) { }
         var p = new Folder(Folder.temp.fsName + "/" + APP.tempFolder);
@@ -1911,7 +1912,7 @@ function GenerationRuntime() {
                 // служебного слоя на пиксельный канал composite.
                 doc.selectLayersByIDs([selection.flattenedSource]);
             } else {
-                hideLayersAboveSource(selection.junk);
+                hiddenLayerIds = hideLayersAboveSource(selection.junk);
             }
             doc.makeSelection(selection.bounds);
             doc.crop(true);
@@ -1926,6 +1927,19 @@ function GenerationRuntime() {
             doc.saveACopy(inputFile);
         } finally {
             activeDocument.activeHistoryState = hst;
+
+            // History State обычно возвращает видимость, но Photoshop не всегда
+            // полностью восстанавливает индивидуальные visible-флаги вложенных
+            // слоёв после Hide + Flatten. Поэтому явно показываем только те
+            // верхнеуровневые слои/группы, которые скрипт сам скрыл и которые
+            // до экспорта были видимы. Внутренняя видимость групп не меняется.
+            if (hiddenLayerIds.length) {
+                try {
+                    doc.selectLayersByIDs(hiddenLayerIds);
+                    doc.showSelectedLayers();
+                    doc.selectLayersByIDs([selection.junk]);
+                } catch (_) { }
+            }
             if (c) try { doc.setProperty("center", c); } catch (_) { }
         }
         if (!inputFile.exists) throw new Error(inpaintMode == "input_alpha" ? str.errSavePng : str.errSaveJpeg);
@@ -1939,15 +1953,47 @@ function GenerationRuntime() {
         }
         function hideLayersAboveSource(layerId) {
             var length = doc.getProperty("numberOfLayers"),
-                from = lr.getProperty("itemIndex", false, layerId) + (doc.getProperty("hasBackgroundLayer") ? 0 : 1);
-            var ids = [];
+                from = lr.getProperty("itemIndex", false, layerId) +
+                    (doc.getProperty("hasBackgroundLayer") ? 0 : 1),
+                ids = [],
+                groupDepth = 0;
+
+            // Индексы перебираются снизу вверх. Для группы сначала встречается
+            // layerSectionEnd, затем её содержимое и только потом заголовок
+            // layerSectionStart. Пока groupDepth > 0, вложенные элементы не
+            // добавляются: при закрытии диапазона выбирается сама группа.
+            // layerSectionStart при depth == 0 является родительской группой
+            // исходного слоя; её скрывать нельзя, поэтому она пропускается.
             for (var i = from; i <= length; i++) {
-                var section = lr.getProperty("layerSection", false, i, true);
-                if (section && section.value == "layerSectionContent") ids.push(lr.getProperty("layerID", false, i, true));
+                var section = lr.getProperty("layerSection", false, i, true),
+                    sectionValue = section ? section.value : "";
+
+                if (sectionValue == "layerSectionEnd") {
+                    groupDepth++;
+                    continue;
+                }
+                if (sectionValue == "layerSectionStart") {
+                    if (groupDepth > 0) {
+                        groupDepth--;
+                        if (groupDepth == 0) addVisibleLayer(i);
+                    }
+                    continue;
+                }
+                if (sectionValue == "layerSectionContent" && groupDepth == 0)
+                    addVisibleLayer(i);
             }
             if (from <= length && ids.length) {
                 doc.selectLayersByIDs(ids);
                 doc.hideSelectedLayers();
+            }
+            return ids;
+
+            function addVisibleLayer(index) {
+                var id = lr.getProperty("layerID", false, index, true),
+                    visible = true;
+                try { visible = !!lr.getProperty("visible", false, id); }
+                catch (_) { }
+                if (visible && !arrayContains(ids, id)) ids.push(id);
             }
         }
     }
@@ -5047,6 +5093,12 @@ function AM(target, order) {
         var list = new ActionList(); list.putReference(ref);
         var desc = new AD(); desc.putList(s2t("null"), list);
         executeAction(s2t("hide"), desc, DialogModes.NO);
+    };
+    this.showSelectedLayers = function () {
+        var ref = new AR(); ref.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
+        var list = new ActionList(); list.putReference(ref);
+        var desc = new AD(); desc.putList(s2t("null"), list);
+        executeAction(s2t("show"), desc, DialogModes.NO);
     };
     this.setName = function (name) {
         var ref = new AR(); ref.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
