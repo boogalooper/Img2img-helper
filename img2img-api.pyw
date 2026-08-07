@@ -77,7 +77,7 @@ FORGE_REFERENCE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_API_MESSAGE = 32 * 1024 * 1024
 
 # Через сколько секунд бездействия фоновый процесс завершается самостоятельно.
-IDLE_TIMEOUT_SECONDS = 5 * 60
+IDLE_TIMEOUT_SECONDS = 15 * 60
 
 # Как часто проверять историю ComfyUI во время генерации.
 HISTORY_POLL_INTERVAL = 0.35
@@ -4275,6 +4275,10 @@ LAST_ACTIVITY_LOCK = threading.Lock()
 BACKEND_STATUS_LOCK = threading.Lock()
 BACKEND_STATUS_CACHE: Optional[Dict[str, Any]] = None
 BACKEND_STATUS_ENDPOINTS: Optional[Tuple[str, int, int]] = None
+# Поиск локальной Comfy input-папки на Windows использует netstat/PowerShell и
+# заметно дороже обычного HTTP ping. Повторяем его только один раз для endpoint
+# за время жизни Python-процесса; сам /system_stats по-прежнему проверяется.
+COMFY_INPUT_FOLDER_ENDPOINT: Optional[Tuple[str, int]] = None
 
 
 @contextmanager
@@ -5257,27 +5261,46 @@ def _compose_backend_status(comfy: Dict[str, Any], forge: Dict[str, Any]) -> Dic
 
 
 def _probe_comfy(host: str, port: int, *, update_runtime: bool) -> Dict[str, Any]:
+    global COMFY_INPUT_FOLDER_ENDPOINT
     started = time.monotonic()
+    endpoint = (normalize_comfy_host(host), int(port))
     try:
         details = ComfyClient(host, int(port)).ping(timeout=2.0)
-        if update_runtime:
+        if update_runtime and COMFY_INPUT_FOLDER_ENDPOINT != endpoint:
             RUNTIME.comfy_input_folder = detect_comfy_input_folder(details, host, int(port))
+            COMFY_INPUT_FOLDER_ENDPOINT = endpoint
+        # Полный /system_stats нужен Python для определения input-папки, но JSX
+        # использует только available/latency. Не гоняем большой JSON обратно.
+        public_details = {"ok": True}
         return _backend_probe_result(
-            "comfy", host, int(port), started, available=True, details=details,
+            "comfy", host, int(port), started, available=True, details=public_details,
         )
     except Exception as exc:
         if update_runtime:
             RUNTIME.comfy_input_folder = None
+            COMFY_INPUT_FOLDER_ENDPOINT = None
         return _backend_probe_result(
             "comfy", host, int(port), started, available=False, error=str(exc),
         )
 
 
 def _probe_forge(host: str, port: int) -> Dict[str, Any]:
+    global FORGE_CATALOG_CACHE_SERVER
     started = time.monotonic()
     try:
-        details = ForgeClient(host, int(port), timeout=2.0).ping(timeout=2.0)
-        is_forge_neo = bool(details.get("ok") and details.get("forge_neo"))
+        client = ForgeClient(host, int(port), timeout=2.0)
+        options = client.get_json("sdapi/v1/options", timeout=2.0)
+        is_forge_neo = isinstance(options, dict) and "forge_additional_modules" in options
+        details = {"ok": isinstance(options, dict), "forge_neo": bool(is_forge_neo)}
+        if is_forge_neo:
+            # /options уже был получен для probe. Сохраняем current в process-cache,
+            # чтобы первая загрузка Forge schema не запрашивала /options второй раз.
+            server_key = (normalize_comfy_host(host), int(port))
+            with FORGE_CATALOG_CACHE_LOCK:
+                if FORGE_CATALOG_CACHE_SERVER != server_key:
+                    FORGE_CATALOG_CACHE.clear()
+                    FORGE_CATALOG_CACHE_SERVER = server_key
+            _update_forge_catalog_current(options)
         return _backend_probe_result(
             "forge", host, int(port), started,
             available=is_forge_neo,
@@ -5389,7 +5412,6 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     if host:
         RUNTIME.backend_host = normalize_comfy_host(host)
         RUNTIME.comfy_host = RUNTIME.backend_host
-        RUNTIME.comfy_input_folder = None
     if message.get("comfyPort"):
         RUNTIME.comfy_port = int(message["comfyPort"])
     if message.get("forgePort"):

@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.142",
+    VER = "0.143",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -179,15 +179,14 @@ function init() {
     app.activeDocument.suspendHistory(localize(str.historyCheckSelection), "checkSelection(selection)");
     if (!selection.result) return;
     try {
-        var apiResponsive = false;
-        if (api.isRunning()) {
-            try { api.ping(null, 1000); apiResponsive = true; } catch (_) { }
-        }
-        if (!apiResponsive) {
+        // Один дешёвый TCP-check определяет, нужно ли показывать прогресс запуска.
+        // Сам ping выполняется только один раз внутри initialize().
+        var apiRunning = api.isRunning();
+        if (!apiRunning) {
             startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT + ANALYZE_TIMEOUT);
             startupProgress.show();
         }
-        api.initialize(startupProgress);
+        api.initialize(startupProgress, apiRunning);
         if (startupProgress) startupProgress.setStage(str.progressHandshake, 22);
         backend.applyStatus(api.handshake(startupProgress));
         var backendChangedAtStartup = backend.normalizeActiveBackend();
@@ -4150,16 +4149,29 @@ function BridgeApi() {
     // В сетевом слое явная локализация оставлена намеренно: здесь нужны гарантированно обычные строки.
     var self = this;
     this.isRunning = function () { return checkConnection(API_HOST, API_PORT_SEND); };
-    this.initialize = function (progress) {
+    this.initialize = function (progress, knownRunning) {
+        // init() уже делает TCP-check, чтобы решить, показывать ли progress. Не
+        // повторяем его на обычном тёплом запуске и не ищем Python-файл, пока
+        // действительно не понадобится запуск нового процесса.
+        var running = knownRunning === undefined ? self.isRunning() : !!knownRunning,
+            runningInfo = null;
+        if (running) {
+            try { runningInfo = self.ping(progress); }
+            catch (pingError) {
+                // Редкая гонка: процесс мог завершиться между TCP-check и ping.
+                // Дополнительный check выполняется только после ошибки.
+                if (self.isRunning()) throw pingError;
+                running = false;
+            }
+            if (running) {
+                if (String(runningInfo.protocol) != String(API_PROTOCOL)) {
+                    throw new Error(localize(str.errApiProtocolA) + runningInfo.protocol + localize(str.errApiProtocolB) + API_PROTOCOL + ".");
+                }
+                return true;
+            }
+        }
         var pythonFile = findPythonModule();
         if (!pythonFile) throw new Error(str.errPythonMissingA + API_FILE + str.errPythonMissingB);
-        if (self.isRunning()) {
-            var running = self.ping(progress);
-            if (String(running.protocol) != String(API_PROTOCOL)) {
-                throw new Error(localize(str.errApiProtocolA) + running.protocol + localize(str.errApiProtocolB) + API_PROTOCOL + ".");
-            }
-            return true;
-        }
         if (progress) progress.setStage(str.progressStartPython, 3);
         pythonFile.execute();
         if (!waitForConnection(START_TIMEOUT, progress)) {
