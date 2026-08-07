@@ -14,10 +14,8 @@
 </javascriptresource>
 // END__HARVEST_EXCEPTION_ZSTRING
 */
-
 $.localize = true; // ScriptUI/Photoshop автоматически локализует объекты Locale.
 //$.locale = 'ru'
-
 var APP = {
     name: "img2img helper",
     uuid: "5f6f57dc-80c8-49b4-9ea9-405d132b7b30",
@@ -36,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.14",
+    VER = "0.141",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -123,7 +121,6 @@ finally {
     restoreInitialDocumentState();
 }
 isCancelled ? "cancel" : undefined;
-
 function restoreInitialDocumentState() {
     if (generationResultPlaced || !initialState || !app.documents.length) return;
     try { app.activeDocument.activeHistoryState = initialState; }
@@ -789,19 +786,16 @@ function mainDialog(selection, initial, responseSeconds) {
                         profile.schemaCacheStamp = null;
                         profile.schemaCacheVersion = 0;
                     }
-
                     // Сохраняем принятые настройки до повторного анализа.
                     // Если API снова вернёт ошибку сопоставления, выбранные
                     // input/mask/output/size bindings всё равно останутся в
                     // DESC или в параметрах текущего Photoshop Action.
                     action.saveAcceptedSettings();
-
                     if (bindingsChanged) {
                         ui.runWithPaletteProgress(str.progressAnalyze, function (progress) {
                             reloadSelectedWorkflow(false, progress, true);
                         });
                         showImportantWorkflowErrors(state.schema);
-
                         // После успешного анализа сохраняем и обновлённый cache.
                         action.saveAcceptedSettings();
                     }
@@ -991,7 +985,6 @@ function mainDialog(selection, initial, responseSeconds) {
         watch(cfgControlId);
         refreshRules();
     }
-    
     // ========================================================================
     // РЕДАКТОР СОСТАВА ИНТЕРФЕЙСА
     // Общая оболочка используется и Comfy workflow, и Forge schema; Comfy
@@ -1850,13 +1843,11 @@ function GenerationRuntime() {
     }
     function prepareSelectionLayer(selection) {
         if (selection.previousGeneration) doc.hideSelectedLayers();
-
         // checkSelection() обычно уже выводит документ из Quick Mask. Эта
         // проверка оставлена как защита от изменения режима между проверкой
         // выделения и началом генерации. Сам inpaint определяется только
         // сохранённым флагом selection.inpaint.
         if (doc.getProperty("quickMask")) doc.quickMask("clearEvent");
-
         if (doc.hasProperty("selection")) {
             doc.makeLayer(APP.generatedLayerName);
             doc.makeSelectionMask();
@@ -1876,7 +1867,6 @@ function GenerationRuntime() {
             doc.hideSelectedLayers();
             doc.makeLayer(APP.generatedLayerName);
             doc.mergeVisible();
-
             // Merge Visible создаёт подготовленный composite, который и должен
             // экспортироваться. Его ID сохраняется до возврата к скрытому
             // служебному слою с маской.
@@ -1927,7 +1917,6 @@ function GenerationRuntime() {
             doc.saveACopy(inputFile);
         } finally {
             activeDocument.activeHistoryState = hst;
-
             // History State обычно возвращает видимость, но Photoshop не всегда
             // полностью восстанавливает индивидуальные visible-флаги вложенных
             // слоёв после Hide + Flatten. Поэтому явно показываем только те
@@ -1957,7 +1946,6 @@ function GenerationRuntime() {
                     (doc.getProperty("hasBackgroundLayer") ? 0 : 1),
                 ids = [],
                 groupDepth = 0;
-
             // Индексы перебираются снизу вверх. Для группы сначала встречается
             // layerSectionEnd, затем её содержимое и только потом заголовок
             // layerSectionStart. Пока groupDepth > 0, вложенные элементы не
@@ -1967,7 +1955,6 @@ function GenerationRuntime() {
             for (var i = from; i <= length; i++) {
                 var section = lr.getProperty("layerSection", false, i, true),
                     sectionValue = section ? section.value : "";
-
                 if (sectionValue == "layerSectionEnd") {
                     groupDepth++;
                     continue;
@@ -1987,7 +1974,6 @@ function GenerationRuntime() {
                 doc.hideSelectedLayers();
             }
             return ids;
-
             function addVisibleLayer(index) {
                 var id = lr.getProperty("layerID", false, index, true),
                     visible = true;
@@ -2019,7 +2005,6 @@ function GenerationRuntime() {
         if (cfg.rasterizeImage) try { lr.rasterize(); } catch (_) { }
         lr.setName(APP.generatedLayerName);
         if (cfg.writeLayerMetadata) layerMetadata.write();
-
         // Загрузка выделения из маски временного слоя в некоторых версиях
         // Photoshop может сделать этот временный слой активным. Перед созданием
         // итоговой маски явно возвращаемся к только что вставленному результату,
@@ -2041,13 +2026,11 @@ function GenerationRuntime() {
     function isGeneratedLayerName(name) { return String(name) == APP.generatedLayerName; }
     function checkSelection(res) {
         if (!apl.getProperty("numberOfDocuments")) return;
-
         var quickMaskActive = !!doc.getProperty("quickMask"),
             quickMaskHadSelection = quickMaskActive && doc.hasProperty("selection"),
             quickMaskOuterBounds = quickMaskHadSelection
                 ? doc.descToObject(doc.getProperty("selection").value)
                 : null;
-
         // Inpaint включается только когда Quick Mask была активна и в ней
         // существовало непустое выделение. Границы области генерации при этом
         // фиксируются ДО выхода из Quick Mask: это внешнее выделение, внутри
@@ -2058,7 +2041,6 @@ function GenerationRuntime() {
         // Если Quick Mask была пустой, после выхода используем обычную
         // selection и работаем как обычный img2img, без inpaint.
         if (quickMaskActive) doc.quickMask("clearEvent");
-
         if (doc.hasProperty("selection")) {
             res.result = true;
             res.inpaint = quickMaskHadSelection;
@@ -3486,7 +3468,6 @@ function UI() {
         var declared = String(schema && schema.type || "").toLowerCase();
         if (declared == "float" || declared == "number") return false;
         if (declared != "integer" && declared != "int") return false;
-
         // Fractional metadata is incompatible with an integer slider. This
         // catches stale analysis where FLOAT was inferred from the JSON value 1.
         var keys = ["value", "min", "max", "step"];
@@ -3497,7 +3478,6 @@ function UI() {
                 !isNaN(number) && Math.abs(number - Math.round(number)) > 0.000000001)
                 return false;
         }
-
         // Denoise in a normalized 0..1 range must remain fractional even if an
         // old cache labelled the current literal 1 as integer.
         if (isDenoiseNumericSchema(schema) &&
@@ -3528,7 +3508,6 @@ function UI() {
         var step = schema.step !== undefined ? parseFloat(schema.step) : (integer ? 1 : 0.01);
         if (isNaN(step) || step <= 0) step = integer ? 1 : 0.01;
         if (!integer && isCoarseHalfStepControl(schema)) step = 0.5;
-
         // ScriptUI использует целочисленную шкалу после масштабирования.
         // У FLOAT denoise с диапазоном 0..1 шаг, равный всему диапазону,
         // оставляет только две позиции. Такой результат считается ошибочным
@@ -3541,7 +3520,6 @@ function UI() {
             if (span > 0 && span <= 1.000000001 && step >= span)
                 step = span / 100;
         }
-
         // В интерфейсе поддерживается до шести знаков после запятой.
         if (!integer && step < 0.000001) step = 0.000001;
         return step;
