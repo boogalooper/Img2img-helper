@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.141",
+    VER = "0.142",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,

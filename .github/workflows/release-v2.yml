@@ -1,9 +1,14 @@
 name: Build release
 
+run-name: Release ${{ inputs.version || 'version from JSX' }}
+
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (leave empty to use VER from JSX)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -19,10 +24,42 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+
+          # If no version was entered, read VER from the JSX file.
+          if [ -z "${VERSION}" ]; then
+            VERSION=$(sed -n 's/.*VER[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "img2img helper.jsx" | head -n 1)
+          fi
+
+          # Accept both "0.14" and "v0.14".
+          VERSION="${VERSION#v}"
+
+          if [ -z "${VERSION}" ]; then
+            echo "Could not determine version."
+            exit 1
+          fi
+
+          if ! [[ "${VERSION}" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "Invalid version: ${VERSION}"
+            exit 1
+          fi
+
+          TAG="v${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "Version: ${VERSION}"
+          echo "Tag: ${TAG}"
+
       - name: Prepare release package
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.version }}"
           PACKAGE_NAME="img2img-helper-${VERSION}"
           PACKAGE_DIR="dist/${PACKAGE_NAME}"
 
@@ -52,12 +89,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
           ARCHIVE="dist/img2img-helper-${VERSION}.zip"
 
-          gh release create "${GITHUB_REF_NAME}" \
+          gh release create "${TAG}" \
             "${ARCHIVE}" \
-            --verify-tag \
+            --target "${GITHUB_SHA}" \
             --title "img2img helper ${VERSION}" \
             --notes-file release-notes.md \
             --latest
