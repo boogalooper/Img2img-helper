@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.145",
+    VER = "0.146",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -3077,13 +3077,7 @@ function UI() {
             else ok.enabled = !!this.selection;
         };
         if (clear) clear.onClick = function () { clearSelection(); };
-        if (!multiselect) list.onDoubleClick = function () {
-            if (!this.selection) return;
-            res = itemValue(this.selection);
-            accepted = true;
-            w.close(1);
-        };
-        ok.onClick = function () {
+        function acceptSelection() {
             if (multiselect) {
                 syncVisibleSelection();
                 res = [];
@@ -3097,7 +3091,14 @@ function UI() {
             }
             accepted = true;
             w.close(1);
+        }
+        list.onDoubleClick = function () {
+            var selection = this.selection;
+            if (!selection) return;
+            if (multiselect && selection instanceof Array && selection.length != 1) return;
+            acceptSelection();
         };
+        ok.onClick = acceptSelection;
         ui.enableHoverFocus(w);
         w.center();
         w.show();
