@@ -4689,6 +4689,7 @@ def save_forge_schema_values(
     schema_folder: Any = "",
     values: Optional[Dict[str, Any]] = None,
     destination_path: str = "",
+    selected_loras: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """Save visible UI values to the destination selected by Photoshop."""
 
@@ -4709,6 +4710,8 @@ def save_forge_schema_values(
         raise UserVisibleError(f"Invalid Forge schema JSON {path.name}: {exc}") from exc
     if not isinstance(raw, dict):
         raise UserVisibleError(f"Forge schema {path.name} must be a JSON object.")
+
+    raw_selected_loras = selected_loras if isinstance(selected_loras, list) else []
 
     raw_controls = raw.get("controls") if isinstance(raw.get("controls"), list) else []
     effective_schema = get_forge_schema(schema_id, schema_folder)
@@ -4781,6 +4784,43 @@ def save_forge_schema_values(
         is_source = os.path.normcase(os.path.abspath(str(destination))) == os.path.normcase(os.path.abspath(str(path)))
     if not is_source:
         raw["label"] = destination.stem
+
+    normalized_loras: List[Dict[str, Any]] = []
+    seen_loras: set[str] = set()
+    for item in raw_selected_loras:
+        name = ""
+        weight = 1.0
+        if isinstance(item, str):
+            text = item.strip().strip("<>")
+            if text.lower().startswith("lora:"):
+                text = text[5:]
+            if ":" in text:
+                candidate_name, candidate_weight = text.rsplit(":", 1)
+                name = candidate_name.strip()
+                try:
+                    weight = float(candidate_weight)
+                except (TypeError, ValueError):
+                    weight = 1.0
+            else:
+                name = text.strip()
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("lora") or item.get("value") or item.get("label") or "").strip()
+            try:
+                weight = float(item.get("weight", 1.0))
+            except (TypeError, ValueError):
+                weight = 1.0
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_loras:
+            continue
+        seen_loras.add(key)
+        weight = max(0.0, min(1.0, round(weight, 2)))
+        normalized_loras.append({"name": name, "weight": weight})
+    if normalized_loras:
+        raw["loras"] = normalized_loras
+    else:
+        raw.pop("loras", None)
 
     write_json_atomic(destination, raw, "Forge schema JSON")
     return {
@@ -5595,11 +5635,13 @@ def handle_command(command: Dict[str, Any]) -> None:
 
         if command_type == "forge_schema_save_values":
             values = message.get("values") if isinstance(message.get("values"), dict) else {}
+            selected_loras = message.get("selected_loras") if isinstance(message.get("selected_loras"), list) else []
             answer(save_forge_schema_values(
                 str(message.get("schema_id") or ""),
                 schema_folder=message.get("schema_folder"),
                 values=values,
                 destination_path=str(message.get("destination_path") or ""),
+                selected_loras=selected_loras,
             ), request_id)
             return
 

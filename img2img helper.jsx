@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.144",
+    VER = "0.145",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -261,6 +261,9 @@ function shouldDisableNegativePrompt(schema, values) {
     var cfgId = findForgeCfgControlId(schema);
     return !!cfgId && values && values.hasOwnProperty(cfgId) && isCfgValueOne(values[cfgId]);
 }
+function forgeSchemaId(schema) {
+    return schema ? schema.workspace_id || String(schema.workflow_id || "").replace(/^forge:/, "") : "";
+}
 // ============================================================================
 // ГЛАВНОЕ ОКНО
 // Внутренние функции работают с единым state и полностью перестраивают только
@@ -309,7 +312,7 @@ function mainDialog(selection, initial, responseSeconds) {
         gOk = w.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,10,0,0]}"),
         bOk = gOk.add("button", undefined, undefined, { name: "ok" });
     w.text = APP.name + " v" + VER + " — " + responseSeconds + "s";
-    gGlobal.preferredSize.width = gGlobal.minimumSize.width = gGlobal.maximumSize.width = ui.contentWidth();
+    ui.setFixedWidth(gGlobal, ui.contentWidth());
     tWH.alignment = ["fill", "center"];
     tWH.minimumSize.width = 0;
     gGlobalButtons.alignment = ["right", "center"];
@@ -376,7 +379,7 @@ function mainDialog(selection, initial, responseSeconds) {
         }
         return true;
     };
-    w.layout.layout(true); w.preferredSize.width = w.minimumSize.width = w.maximumSize.width = ui.mainWindowWidth;
+    w.layout.layout(true); ui.setFixedWidth(w, ui.mainWindowWidth);
     ui.enableHoverFocus(w);
     w.center(); w.show(); return state.result;
     function updateSelectionSummary() {
@@ -471,6 +474,8 @@ function mainDialog(selection, initial, responseSeconds) {
             for (var i = 0; i < allowed.length; i++)
                 if (metadata.profile[allowed[i]] !== undefined)
                     profile[allowed[i]] = cloneObj(metadata.profile[allowed[i]]);
+        if (allowed && arrayContains(allowed, "selectedLoras") && metadata.profile && metadata.profile.selectedLoras !== undefined)
+            profile.lorasInitialized = true;
     }
     function loadBackend(backendId, progress, refresh) {
         if (!backend.isAvailable(backendId)) throw new Error(str.errBackendUnavailable);
@@ -503,7 +508,7 @@ function mainDialog(selection, initial, responseSeconds) {
         appendNotices(backend.takeNotices());
         if (gSettings) { try { gSettings.visible = false; } catch (_) { } try { gSettingsHost.remove(gSettings); } catch (_) { } }
         gSettings = gSettingsHost.add("group{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:0}");
-        gSettings.preferredSize.width = gSettings.minimumSize.width = gSettings.maximumSize.width = ui.contentWidth();
+        ui.setFixedWidth(gSettings, ui.contentWidth());
         state.controls = {};
         state.forgeLoraControl = null;
         addBackendControl(gSettings);
@@ -621,7 +626,7 @@ function mainDialog(selection, initial, responseSeconds) {
     }
     function addSchemaControl(parent) {
         var description = schemaControlDescription(), group = ui.addColumn(parent, [0, 10, 0, 5]);
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = ui.contentWidth();
+        ui.setFixedWidth(group, ui.contentWidth());
         var title = group.add("statictext"), toolbar = ui.addToolbarRow(group, ui.contentWidth(), 4),
             dropdown = toolbar.dropdown, buttons = toolbar.controls, sel = 0;
         title.text = description.title;
@@ -895,8 +900,9 @@ function mainDialog(selection, initial, responseSeconds) {
                 showControls();
             },
             save: function (schemaId, values, target) {
+                var profile = cfg.getForgeProfile(schemaId);
                 ui.runWithPaletteProgress(str.progressSaveJson, function (progress) {
-                    var saved = api.forgeSchemaSaveValues(schemaId, values, target.fsName, progress);
+                    var saved = api.forgeSchemaSaveValues(schemaId, values, target.fsName, profile.selectedLoras || [], progress);
                     state.forgePresets = backend.refreshForgeSchemas(progress);
                     var savedSchema = findForgeSchemaBySavedPath(state.forgePresets, saved.path);
                     if (savedSchema) {
@@ -918,7 +924,6 @@ function mainDialog(selection, initial, responseSeconds) {
             }
         };
     }
-    function forgeSchemaId(schema) { return schema.workspace_id || String(schema.workflow_id || "").replace(/^forge:/, ""); }
     function loadForgeSchemaState(schemaId, progress, refresh) {
         var loaded = backend.loadForgeSchema(schemaId, state.forgeCatalog, progress, refresh);
         state.forgeCatalog = loaded.catalog;
@@ -1433,7 +1438,7 @@ function mainDialog(selection, initial, responseSeconds) {
         function presetSlider(parent, options) {
             var group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}"),
                 titleGroup = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:5,margins:0}");
-            group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = ui.settingsControlWidth;
+            ui.setFixedWidth(group, ui.settingsControlWidth);
             var label = titleGroup.add('statictext'),
                 valueText = titleGroup.add('statictext{justify:"right"}'),
                 slider = group.add('slider'),
@@ -1565,30 +1570,59 @@ function formatForgeLoraEntry(name, weight) {
     name = String(name || "").replace(/^\s+|\s+$/g, "");
     return name ? "lora:" + name + ":" + formatForgeLoraWeight(weight) : "";
 }
-function normalizeForgeLoraSelection(items, storedValue) {
-    var available = normalizeForgeLoraList(items),
-        source = storedValue instanceof Array ? storedValue : [],
+function normalizeForgeLoraEntries(value) {
+    var source = value instanceof Array ? value : [],
         res = [],
+        names = [];
+    for (var i = 0; i < source.length; i++) {
+        var item = source[i], parsed = null, name = "", weight;
+        if (typeof item == "string") parsed = parseForgeLoraEntry(item);
+        else if (item && typeof item == "object") {
+            name = item.name || item.lora || item.value || item.label || item.id || item.file || item.filename || "";
+            weight = item.weight;
+            if (weight === undefined) weight = item.scale;
+            if (weight === undefined) weight = item.strength;
+            parsed = parseForgeLoraEntry(formatForgeLoraEntry(name, weight));
+        }
+        if (!parsed || !parsed.name || arrayContainsCaseInsensitive(names, parsed.name)) continue;
+        names.push(parsed.name);
+        res.push(formatForgeLoraEntry(parsed.name, parsed.weight));
+    }
+    return res;
+}
+function resolveForgeLoraSelection(items, storedValue, requireAvailable) {
+    var available = normalizeForgeLoraList(items),
+        source = normalizeForgeLoraEntries(storedValue),
+        selected = [],
+        missing = [],
         selectedNames = [];
     for (var i = 0; i < source.length; i++) {
         var parsed = parseForgeLoraEntry(source[i]),
             name = parsed.name,
             matchedName = name;
-        if (!name) continue;
-        if (available.length) {
+        if (available.length || requireAvailable) {
             matchedName = "";
             for (var j = 0; j < available.length; j++)
                 if (String(available[j]).toUpperCase() == String(name).toUpperCase()) {
                     matchedName = available[j];
                     break;
                 }
-            if (!matchedName) continue;
+            if (!matchedName) {
+                if (requireAvailable && !arrayContainsCaseInsensitive(missing, name)) missing.push(name);
+                continue;
+            }
         }
-        if (!matchedName || arrayContainsCaseInsensitive(selectedNames, matchedName)) continue;
+        if (arrayContainsCaseInsensitive(selectedNames, matchedName)) continue;
         selectedNames.push(matchedName);
-        res.push(formatForgeLoraEntry(matchedName, parsed.weight));
+        selected.push(formatForgeLoraEntry(matchedName, parsed.weight));
     }
-    return res;
+    return { selected: selected, missing: missing };
+}
+function normalizeForgeLoraSelection(items, storedValue) {
+    return resolveForgeLoraSelection(items, storedValue, false).selected;
+}
+function hasDeclaredForgeLoras(schema) {
+    return !!(schema && schema.loras instanceof Array && schema.loras.length);
 }
 // ============================================================================
 // ЦИКЛ ГЕНЕРАЦИИ И РАБОТА С ДОКУМЕНТОМ PHOTOSHOP
@@ -2382,6 +2416,37 @@ function BackendRuntime() {
     // Runtime identity is always the JSON filename supplied as item.id.
     // Copies with the same internal schema id therefore have separate profiles.
     function findForgeSchema(items, presetId) { return findItem(items, presetId); }
+    function forgeLoraNoticeList(names) {
+        var parts = [];
+        for (var i = 0; i < names.length; i++) parts.push(String(names[i] || ""));
+        return parts.join(", ");
+    }
+    function applyForgeSchemaLoraDefaults(schema, catalog) {
+        if (!schema) return;
+        var profile = schemaProfile(schema),
+            available = catalog && catalog.loras instanceof Array ? catalog.loras : [],
+            source = [],
+            validation;
+        if (profile.lorasInitialized !== true) {
+            source = hasDeclaredForgeLoras(schema) ? normalizeForgeLoraEntries(schema.loras) : (profile.selectedLoras || []);
+            validation = resolveForgeLoraSelection(available, source, true);
+            profile.selectedLoras = validation.selected;
+            profile.lorasInitialized = true;
+            if (validation.missing.length)
+                pushNotice(
+                    "forge-schema-default-loras-missing:" + forgeSchemaId(schema) + ":" + validation.missing.join("|"),
+                    "Some default LoRAs from the selected Forge schema were not found and were skipped: " + forgeLoraNoticeList(validation.missing)
+                );
+            return;
+        }
+        validation = resolveForgeLoraSelection(available, profile.selectedLoras || [], true);
+        profile.selectedLoras = validation.selected;
+        if (validation.missing.length)
+            pushNotice(
+                "forge-profile-loras-missing:" + forgeSchemaId(schema) + ":" + validation.missing.join("|"),
+                "Some saved LoRAs for the selected Forge schema were not found and were skipped: " + forgeLoraNoticeList(validation.missing)
+            );
+    }
     function hydrateForgeSchema(schema, catalog) {
         schema = cloneObj(schema || {});
         schema.backend = BACKEND_FORGE;
@@ -2420,6 +2485,8 @@ function BackendRuntime() {
             if (control.source) add(control.source);
             if (id == "positive_prompt") add("loras");
         }
+        if (hasDeclaredForgeLoras(schema) || (profile.selectedLoras instanceof Array && profile.selectedLoras.length))
+            add("loras");
         return res;
     }
     function ensureForgeCatalog(schema, catalog, progress, force) {
@@ -2432,8 +2499,10 @@ function BackendRuntime() {
     }
     function loadForgeSchema(schemaId, catalog, progress, forceCatalog) {
         var raw = api.forgeSchemaGet(schemaId, progress),
-            nextCatalog = ensureForgeCatalog(raw, catalog || {}, progress, !!forceCatalog);
-        return { catalog: nextCatalog, schema: hydrateForgeSchema(raw, nextCatalog) };
+            nextCatalog = ensureForgeCatalog(raw, catalog || {}, progress, !!forceCatalog),
+            hydrated = hydrateForgeSchema(raw, nextCatalog);
+        applyForgeSchemaLoraDefaults(hydrated, nextCatalog);
+        return { catalog: nextCatalog, schema: hydrated };
     }
     var workflowAnalysisArgs = null,
         workflowAnalysisResult = null;
@@ -2855,7 +2924,7 @@ function UI() {
         for (var i = 0; i < rows.length; i++) {
             var d = rows[i], row = parent.add("group{orientation:'row',alignChildren:['left','center'],spacing:5,margins:0}"),
                 title = row.add("statictext"), control, button = null;
-            if (totalWidth) row.preferredSize.width = row.minimumSize.width = row.maximumSize.width = totalWidth;
+            if (totalWidth) self.setFixedWidth(row, totalWidth);
             if (d.labelWidth) title.preferredSize = [d.labelWidth, -1];
             title.text = d.label;
             control = d.type == "static" ? row.add("statictext") : row.add("edittext", undefined, "", d.readOnly ? { readonly: true } : {});
@@ -2885,7 +2954,7 @@ function UI() {
     this.addDropdown = function (parent, labelText, items, preferredWidth, margins) {
         var group = self.addColumn(parent, margins || 0),
             controlWidth = preferredWidth || self.contentWidth();
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = controlWidth;
+        self.setFixedWidth(group, controlWidth);
         var title = group.add("statictext"), dropdown = group.add("dropdownlist{preferredSize:[" + controlWidth + ",-1]}");
         dropdown.minimumSize.width = dropdown.maximumSize.width = controlWidth;
         title.text = labelText;
@@ -2900,13 +2969,13 @@ function UI() {
             titleSpacing = options.titleSpacing === undefined ? 0 : options.titleSpacing,
             titleWidth = options.titleWidth || (controlWidth - valueWidth - titleSpacing),
             group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:" + (options.margins || 0) + "}");
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = controlWidth;
+        self.setFixedWidth(group, controlWidth);
         var titleGroup = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:" + titleSpacing + ",margins:0}");
-        titleGroup.preferredSize.width = titleGroup.minimumSize.width = titleGroup.maximumSize.width = controlWidth;
+        self.setFixedWidth(titleGroup, controlWidth);
         var title = titleGroup.add("statictext{preferredSize:[" + titleWidth + ",-1]}"),
             valueText = titleGroup.add("statictext{preferredSize:[" + valueWidth + ",-1],justify:'right'}"),
             slider = group.add("slider{minvalue:" + min + ",maxvalue:" + max + "}");
-        slider.preferredSize.width = slider.minimumSize.width = slider.maximumSize.width = controlWidth;
+        self.setFixedWidth(slider, controlWidth);
         title.text = labelText;
         slider.value = value;
         valueText.text = options.displayValue !== undefined ? options.displayValue : value;
@@ -3052,8 +3121,8 @@ function UI() {
             title = header.add("statictext"),
             add = header.add("button"),
             selectedHost = group.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}");
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = preferredWidth;
-        header.preferredSize.width = header.minimumSize.width = header.maximumSize.width = preferredWidth;
+        self.setFixedWidth(group, preferredWidth);
+        self.setFixedWidth(header, preferredWidth);
         title.alignment = ["fill", "center"];
         title.minimumSize.width = 0;
         title.text = options.label || "";
@@ -3063,7 +3132,7 @@ function UI() {
         add.text = str.presetAddButton;
         add.helpTip = options.selectHelp || "";
         add.enabled = items.length > 0;
-        selectedHost.preferredSize.width = selectedHost.minimumSize.width = selectedHost.maximumSize.width = preferredWidth;
+        self.setFixedWidth(selectedHost, preferredWidth);
         function displayLabel(value) {
             for (var i = 0; i < items.length; i++) {
                 var data = describe(items[i]);
@@ -3159,8 +3228,8 @@ function UI() {
             title = header.add("statictext"),
             add = header.add("button"),
             selectedHost = group.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}");
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = controlWidth;
-        header.preferredSize.width = header.minimumSize.width = header.maximumSize.width = controlWidth;
+        self.setFixedWidth(group, controlWidth);
+        self.setFixedWidth(header, controlWidth);
         title.alignment = ["fill", "center"];
         title.minimumSize.width = 0;
         title.text = str.lora;
@@ -3170,7 +3239,7 @@ function UI() {
         add.text = str.presetAddButton;
         add.helpTip = str.selectLora;
         add.enabled = normalizedItems.length > 0;
-        selectedHost.preferredSize.width = selectedHost.minimumSize.width = selectedHost.maximumSize.width = controlWidth;
+        self.setFixedWidth(selectedHost, controlWidth);
         function relayout() {
             try { selectedHost.layout.layout(true); } catch (_) { }
             try { group.layout.layout(true); } catch (_) { }
@@ -3271,7 +3340,7 @@ function UI() {
         var group = self.addColumn(parent, 0, "top"),
             title = group.add("statictext"),
             list = group.add("listbox", undefined, [], { multiselect: true });
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = preferredWidth;
+        self.setFixedWidth(group, preferredWidth);
         title.text = label(schema);
         title.helpTip = help(schema);
         list.preferredSize = [preferredWidth, self.multiSelectHeight];
@@ -3362,10 +3431,10 @@ function UI() {
         if (isNaN(value)) value = parseFloat(schema.value) || 0;
         if (generation.isSeedControl(schema)) {
             var seedGroup = self.addColumn(parent, 0);
-            seedGroup.preferredSize.width = seedGroup.minimumSize.width = seedGroup.maximumSize.width = self.contentWidth();
+            self.setFixedWidth(seedGroup, self.contentWidth());
             var seedTitle = seedGroup.add("statictext"),
                 seedRow = seedGroup.add("group{orientation:'row',alignChildren:['fill','center'],spacing:0,margins:0}");
-            seedRow.preferredSize.width = seedRow.minimumSize.width = seedRow.maximumSize.width = self.contentWidth();
+            self.setFixedWidth(seedRow, self.contentWidth());
             var seedEdit = seedRow.add("edittext"),
                 seedRefresh = seedRow.add("button{preferredSize:[30,-1]}");
             seedTitle.text = self.label(schema);
@@ -3450,7 +3519,7 @@ function UI() {
     }
     function addNumericEditControl(parent, schema, storedValue, integer) {
         var editGroup = self.addColumn(parent, 0);
-        editGroup.preferredSize.width = editGroup.minimumSize.width = editGroup.maximumSize.width = self.contentWidth();
+        self.setFixedWidth(editGroup, self.contentWidth());
         var title = editGroup.add("statictext"),
             edit = editGroup.add("edittext{preferredSize:[" + self.contentWidth() + ",-1]}");
         title.text = self.label(schema);
@@ -3611,7 +3680,7 @@ function UI() {
             remove = toolbar.remove,
             edit = group.add("edittext", undefined, "", { multiline: true, scrollable: true }),
             translate = group.add("button");
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = self.contentWidth();
+        self.setFixedWidth(group, self.contentWidth());
         edit.preferredSize = [self.contentWidth(), self.promptHeight()];
         self.setFixedWidth(translate, self.contentWidth());
         var context = schema.id == "negative_prompt" ? "negative" : "positive",
@@ -3720,7 +3789,7 @@ function UI() {
     }
     function addHistoryFileDropdown(parent, options) {
         var group = self.addColumn(parent, 0);
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = self.contentWidth();
+        self.setFixedWidth(group, self.contentWidth());
         if (options.title) {
             var title = group.add("statictext");
             title.text = options.title;
@@ -3840,20 +3909,20 @@ function UI() {
         if (profile.resize === undefined) profile.resize = 1;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName(profile.resizePreset, cfg.resizePresets);
         var group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}");
-        group.preferredSize.width = group.minimumSize.width = group.maximumSize.width = self.contentWidth();
+        self.setFixedWidth(group, self.contentWidth());
         var titleRow = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:0,margins:0}");
-        titleRow.preferredSize.width = titleRow.minimumSize.width = titleRow.maximumSize.width = self.contentWidth();
+        self.setFixedWidth(titleRow, self.contentWidth());
         var checkbox = titleRow.add("checkbox"),
             resizeTitleWidth = self.contentWidth() - self.autoResizeCheckboxWidth - self.sliderValueWidth,
             title = titleRow.add("statictext"),
             valueText = titleRow.add("statictext{justify:'right'}");
-        checkbox.preferredSize.width = checkbox.minimumSize.width = checkbox.maximumSize.width = self.autoResizeCheckboxWidth;
-        title.preferredSize.width = title.minimumSize.width = title.maximumSize.width = resizeTitleWidth;
-        valueText.preferredSize.width = valueText.minimumSize.width = valueText.maximumSize.width = self.sliderValueWidth;
+        self.setFixedWidth(checkbox, self.autoResizeCheckboxWidth);
+        self.setFixedWidth(title, resizeTitleWidth);
+        self.setFixedWidth(valueText, self.sliderValueWidth);
         var slider = group.add("slider{minvalue:1,maxvalue:400}");
-        slider.preferredSize.width = slider.minimumSize.width = slider.maximumSize.width = self.contentWidth();
+        self.setFixedWidth(slider, self.contentWidth());
         var presetGroup = group.add("group{orientation:'column',alignChildren:['fill','center'],spacing:0,margins:[0,5,0,0]}");
-        presetGroup.preferredSize.width = presetGroup.minimumSize.width = presetGroup.maximumSize.width = self.contentWidth();
+        self.setFixedWidth(presetGroup, self.contentWidth());
         var presetDropdown = presetGroup.add("dropdownlist{preferredSize:[" + self.contentWidth() + ",-1]}");
         presetDropdown.minimumSize.width = presetDropdown.maximumSize.width = self.contentWidth();
         checkbox.value = toBooleanValue(profile.autoResize);
@@ -4299,12 +4368,13 @@ function BridgeApi() {
         msg.destination_path = destinationPath || "";
         return call("workflow_save_values", msg, ANALYZE_TIMEOUT, progress);
     };
-    this.forgeSchemaSaveValues = function (schemaId, values, destinationPath, progress) {
+    this.forgeSchemaSaveValues = function (schemaId, values, destinationPath, selectedLoras, progress) {
         return call("forge_schema_save_values", {
             schema_id: schemaId,
             schema_folder: cfg.forgeSchemasFolder || "",
             values: values || {},
-            destination_path: destinationPath || ""
+            destination_path: destinationPath || "",
+            selected_loras: selectedLoras instanceof Array ? cloneObj(selectedLoras) : []
         }, ANALYZE_TIMEOUT, progress);
     };
     this.interrupt = function (requestId) {
@@ -4856,12 +4926,17 @@ function Config() {
         if (!isObjectMap(profile)) profile = profiles[presetId] = {
             values: {}, visibleControls: null, selectedLoras: [], imageStitchInputs: ["", "", ""],
             sizeMultiple: null, autoResize: self.autoResize,
-            resizePreset: presets.normalizeResizeName("", self.resizePresets), resize: 1, manualScale: 1
+            resizePreset: presets.normalizeResizeName("", self.resizePresets), resize: 1, manualScale: 1,
+            lorasInitialized: false
         };
         normalizeBaseProfile(profile);
         if (profile.autoResize === undefined) profile.autoResize = self.autoResize;
         if (!(profile.selectedLoras instanceof Array)) profile.selectedLoras = [];
         profile.selectedLoras = normalizeForgeLoraSelection([], profile.selectedLoras);
+        if (profile.lorasInitialized === undefined)
+            profile.lorasInitialized = true;
+        else
+            profile.lorasInitialized = !!profile.lorasInitialized;
         if (!(profile.imageStitchInputs instanceof Array)) profile.imageStitchInputs = ["", "", ""];
         while (profile.imageStitchInputs.length < 3) profile.imageStitchInputs.push("");
         if (profile.imageStitchInputs.length > 3) profile.imageStitchInputs = profile.imageStitchInputs.slice(0, 3);
