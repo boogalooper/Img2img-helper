@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Локальный API-сервис img2img helper для Photoshop.
 
 Сервис сохраняет существующий backend ComfyUI и добавляет независимый backend
@@ -3341,7 +3341,9 @@ def list_forge_schemas(
             _read_forge_schema_file(path, schema_dir)
             if raw.get("abstract"):
                 continue
-            schema_id = str(raw.get("id") or path.stem)
+            # Runtime/profile identity is the JSON filename, not the optional
+            # internal id. A copied schema may intentionally keep the same id.
+            schema_id = path.stem
             order = int(raw.get("order") or 1000)
         except (UserVisibleError, TypeError, ValueError) as exc:
             report_invalid(path, str(exc))
@@ -4608,8 +4610,9 @@ def save_workflow_values(
     relative_path: str = "",
     overrides: Optional[Dict[str, Any]] = None,
     values: Optional[Dict[str, Any]] = None,
+    destination_path: str = "",
 ) -> Dict[str, Any]:
-    """Persist only the supplied visible UI controls to the source workflow."""
+    """Save visible UI values to the destination selected by Photoshop."""
 
     values = values if isinstance(values, dict) else {}
     if not values:
@@ -4658,11 +4661,24 @@ def save_workflow_values(
             patcher.set_target(target, value)
         updated += 1
 
-    write_json_atomic(workflow_file.absolute_path, patcher.workflow, "workflow JSON")
-    SCHEMA_CACHE.invalidate(workflow_file.workflow_id)
+    raw_destination = str(destination_path or "").strip()
+    if not raw_destination:
+        raise UserVisibleError("No destination file was selected for Save As. The source workflow was not changed.")
+    destination = Path(raw_destination).expanduser()
+    if destination.suffix.lower() != ".json":
+        raise UserVisibleError(f"The workflow must be saved as a .json file:\n{destination}")
+    write_json_atomic(destination, patcher.workflow, "workflow JSON")
+    try:
+        saved_relative = destination.resolve().relative_to(repository.folder.resolve()).as_posix()
+        SCHEMA_CACHE.invalidate(stable_workflow_id(saved_relative))
+    except (OSError, ValueError):
+        saved_relative = ""
+    if destination.resolve() == workflow_file.absolute_path.resolve():
+        SCHEMA_CACHE.invalidate(workflow_file.workflow_id)
     return {
         "ok": True,
-        "path": str(workflow_file.absolute_path),
+        "path": str(destination),
+        "relative_path": saved_relative,
         "updated": updated,
     }
 
@@ -4672,8 +4688,9 @@ def save_forge_schema_values(
     *,
     schema_folder: Any = "",
     values: Optional[Dict[str, Any]] = None,
+    destination_path: str = "",
 ) -> Dict[str, Any]:
-    """Persist only supplied visible UI values to the selected Forge schema."""
+    """Save visible UI values to the destination selected by Photoshop."""
 
     values = values if isinstance(values, dict) else {}
     if not values:
@@ -4693,12 +4710,7 @@ def save_forge_schema_values(
     if not isinstance(raw, dict):
         raise UserVisibleError(f"Forge schema {path.name} must be a JSON object.")
 
-    controls = raw.get("controls") if isinstance(raw.get("controls"), list) else []
-    controls_by_id = {
-        str(control.get("id") or ""): control
-        for control in controls
-        if isinstance(control, dict) and control.get("id")
-    }
+    raw_controls = raw.get("controls") if isinstance(raw.get("controls"), list) else []
     effective_schema = get_forge_schema(schema_id, schema_folder)
     effective_controls = effective_schema.get("controls") if isinstance(effective_schema.get("controls"), list) else []
     effective_by_id = {
@@ -4706,14 +4718,31 @@ def save_forge_schema_values(
         for control in effective_controls
         if isinstance(control, dict) and control.get("id")
     }
+
+    # If a requested visible control is inherited, materialize the complete
+    # effective controls list in the copy. This preserves ``extends`` for other
+    # fields while allowing every visible value to be stored locally.
+    directly_defined = {
+        str(control.get("id") or "")
+        for control in raw_controls
+        if isinstance(control, dict) and control.get("id")
+    }
+    requested_ids = {str(raw_id or "") for raw_id in values if str(raw_id or "") != "image_stitch"}
+    controls = raw_controls
+    if any(control_id not in directly_defined for control_id in requested_ids):
+        controls = copy.deepcopy(effective_controls)
+        raw["controls"] = controls
+
+    controls_by_id = {
+        str(control.get("id") or ""): control
+        for control in controls
+        if isinstance(control, dict) and control.get("id")
+    }
     runtime_catalog = _forge_runtime_control_catalog(effective_schema)
     updated = 0
     for raw_id, value in values.items():
         control_id = str(raw_id or "")
         if control_id == "image_stitch":
-            # Поддержка ImageStitch может быть унаследована через extends.
-            # Проверяем уже разрешённую effective schema, а сохраняем только
-            # локальное значение default в выбранный дочерний JSON.
             capabilities = (
                 effective_schema.get("capabilities")
                 if isinstance(effective_schema.get("capabilities"), dict)
@@ -4727,8 +4756,7 @@ def save_forge_schema_values(
         control = controls_by_id.get(control_id)
         if not control:
             raise UserVisibleError(
-                f"Could not save Forge field {control_id!r}: it is not defined directly in {path.name}. "
-                "Inherited controls must be overridden in the selected schema before they can be saved."
+                f"Could not save Forge field {control_id!r}: it is absent from the selected schema."
             )
         effective_control = effective_by_id.get(control_id, control)
         control["value"] = _forge_coerce_control_value(
@@ -4736,8 +4764,30 @@ def save_forge_schema_values(
         )
         updated += 1
 
-    write_json_atomic(path, raw, "Forge schema JSON")
-    return {"ok": True, "path": str(path), "updated": updated}
+    raw_destination = str(destination_path or "").strip()
+    if not raw_destination:
+        raise UserVisibleError("No destination file was selected for Save As. The source Forge schema was not changed.")
+    destination = Path(raw_destination).expanduser()
+    if destination.suffix.lower() != ".json":
+        raise UserVisibleError(f"The Forge schema must be saved as a .json file:\n{destination}")
+
+    # Save As создаёт самостоятельную копию схемы. Для новой копии label
+    # должен соответствовать имени, которое пользователь ввёл в стандартном
+    # диалоге сохранения. Технический внутренний id намеренно не меняем.
+    # При явной перезаписи исходного файла сохраняем его существующий label.
+    try:
+        is_source = destination.resolve() == path.resolve()
+    except OSError:
+        is_source = os.path.normcase(os.path.abspath(str(destination))) == os.path.normcase(os.path.abspath(str(path)))
+    if not is_source:
+        raw["label"] = destination.stem
+
+    write_json_atomic(destination, raw, "Forge schema JSON")
+    return {
+        "ok": True,
+        "path": str(destination),
+        "updated": updated,
+    }
 
 
 GENERATION_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -5539,6 +5589,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                 relative_path=str(message.get("relative_path") or ""),
                 overrides=overrides,
                 values=values,
+                destination_path=str(message.get("destination_path") or ""),
             ), request_id)
             return
 
@@ -5548,6 +5599,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                 str(message.get("schema_id") or ""),
                 schema_folder=message.get("schema_folder"),
                 values=values,
+                destination_path=str(message.get("destination_path") or ""),
             ), request_id)
             return
 

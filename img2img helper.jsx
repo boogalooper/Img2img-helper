@@ -1,4 +1,4 @@
-﻿#target photoshop
+#target photoshop
 /*
 // BEGIN__HARVEST_EXCEPTION_ZSTRING
 <javascriptresource>
@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.143",
+    VER = "0.144",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -650,7 +650,14 @@ function mainDialog(selection, initial, responseSeconds) {
             items: forge ? state.forgePresets : state.workflows,
             selectedValue: forge ? cfg.selectedForgePreset : cfg.selectedWorkflow,
             itemLabel: forge
-                ? function (preset) { return preset.label || preset.id; }
+                ? function (preset) {
+                    var label = String(preset.label || preset.id), duplicate = false;
+                    for (var j = 0; j < state.forgePresets.length; j++) {
+                        var other = state.forgePresets[j];
+                        if (other !== preset && String(other.label || other.id) == label) { duplicate = true; break; }
+                    }
+                    return duplicate ? label + " [" + String(preset.file || preset.id) + "]" : label;
+                }
                 : function (workflow) { return workflow.relative_path || workflow.name; },
             itemValue: function (item) { return item.id; },
             buttons: forge ? [
@@ -700,11 +707,13 @@ function mainDialog(selection, initial, responseSeconds) {
         }
         if (actionName == "save") {
             if (!state.schema) return;
-            var saveDecision = ui.showDecisionDialog(operations.saveConfirm, APP.name);
-            if (saveDecision !== true) return;
+            var saveTarget;
+            try { saveTarget = chooseSchemaSaveAsTarget(operations); }
+            catch (e) { ui.showErrorMessage(e); return; }
+            if (!saveTarget) return;
             runSchemaAction(function () {
                 saveCurrentValues();
-                operations.save(operations.profileId(), collectDisplayedControlValues());
+                operations.save(operations.profileId(), collectDisplayedControlValues(), saveTarget);
             });
             return;
         }
@@ -714,6 +723,50 @@ function mainDialog(selection, initial, responseSeconds) {
         if (!applySettings) return;
         runSchemaAction(applySettings, showControls);
     }
+    function chooseSchemaSaveAsTarget(operations) {
+        var relativePath = String(operations.sourceRelativePath() || "").replace(/\\/g, "/"),
+            root = String(operations.rootFolder() || ""),
+            sourceFile = new File(new Folder(root).fsName + "/" + relativePath),
+            previousFolder = null, target = null;
+        try {
+            previousFolder = Folder.current;
+            if (sourceFile.parent && sourceFile.parent.exists) Folder.current = sourceFile.parent;
+            target = File.saveDialog(operations.savePrompt, "JSON:*.json");
+        } finally {
+            try { if (previousFolder) Folder.current = previousFolder; } catch (_) { }
+        }
+        if (!target) return null;
+        if (!/\.json$/i.test(target.name)) throw new Error(str.errSaveAsJsonExtension);
+        return target;
+    }
+    function normalizedFsPath(value) {
+        try {
+            var path = value instanceof File ? value.fsName : new File(String(value || "")).fsName;
+            path = String(path || "").replace(/\\/g, "/");
+            return String($.os || "").toLowerCase().indexOf("windows") >= 0 ? path.toLowerCase() : path;
+        } catch (_) { return String(value || "").replace(/\\/g, "/"); }
+    }
+    function sameFsPath(left, right) {
+        return !!left && !!right && normalizedFsPath(left) == normalizedFsPath(right);
+    }
+    function findWorkflowBySavedPath(items, savedPath) {
+        var root = new Folder(cfg.workflowsFolder || "");
+        for (var i = 0; i < items.length; i++) {
+            var relativePath = String(items[i].relative_path || "").replace(/\\/g, "/"),
+                candidate = new File(root.fsName + "/" + relativePath);
+            if (sameFsPath(candidate, savedPath)) return items[i];
+        }
+        return null;
+    }
+    function findForgeSchemaBySavedPath(items, savedPath) {
+        var root = new Folder(cfg.forgeSchemasFolder || backend.defaultForgeFolder() || "");
+        for (var i = 0; i < items.length; i++) {
+            var candidate = new File(root.fsName + "/" + String(items[i].file || ""));
+            if (sameFsPath(candidate, savedPath)) return items[i];
+        }
+        return null;
+    }
+
     function runSchemaAction(callback, after) {
         try { callback(); }
         catch (e) { ui.showErrorMessage(e); }
@@ -725,7 +778,9 @@ function mainDialog(selection, initial, responseSeconds) {
     function workflowOperations() {
         return {
             rebuildConfirm: str.rebuildWorkflowConfirm,
-            saveConfirm: str.saveWorkflowJsonConfirm,
+            savePrompt: str.saveWorkflowAsPrompt,
+            sourceRelativePath: function () { return state.schema ? state.schema.relative_path || "" : ""; },
+            rootFolder: function () { return cfg.workflowsFolder || ""; },
             profileId: function () {
                 return state.schema ? state.schema.workflow_id || cfg.selectedWorkflow : cfg.selectedWorkflow;
             },
@@ -757,20 +812,23 @@ function mainDialog(selection, initial, responseSeconds) {
                 });
                 showImportantWorkflowErrors(state.schema);
             },
-            save: function (workflowId, values) {
+            save: function (workflowId, values, target) {
                 var profile = cfg.getProfile(workflowId);
                 ui.runWithPaletteProgress(str.progressSaveJson, function (progress) {
-                    api.workflowSaveValues(
+                    var saved = api.workflowSaveValues(
                         workflowId,
                         state.schema.relative_path || profile.relativePath || "",
                         profile.bindingOverrides,
                         values,
+                        target.fsName,
                         progress
                     );
-                    profile.schemaCache = null;
-                    profile.schemaCacheStamp = null;
-                    profile.schemaCacheVersion = 0;
-                    reloadSelectedWorkflow(true, progress, true);
+                    state.workflows = backend.refreshWorkflows(progress);
+                    var savedWorkflow = findWorkflowBySavedPath(state.workflows, saved.path);
+                    if (savedWorkflow) {
+                        cfg.selectedWorkflow = cfg.data.selectedWorkflow = savedWorkflow.id;
+                        reloadSelectedWorkflow(true, progress, true);
+                    }
                 });
                 showControls();
             },
@@ -805,7 +863,9 @@ function mainDialog(selection, initial, responseSeconds) {
     function forgeSchemaOperations() {
         return {
             rebuildConfirm: str.rebuildForgeSchemaConfirm,
-            saveConfirm: str.saveForgeSchemaJsonConfirm,
+            savePrompt: str.saveForgeSchemaAsPrompt,
+            sourceRelativePath: function () { return state.schema ? state.schema.relative_path || "" : ""; },
+            rootFolder: function () { return cfg.forgeSchemasFolder || backend.defaultForgeFolder(); },
             profileId: function () { return forgeSchemaId(state.schema); },
             resetProfile: function (schemaId) { cfg.resetForgeProfile(schemaId); },
             select: function (schemaId) {
@@ -834,10 +894,15 @@ function mainDialog(selection, initial, responseSeconds) {
                 });
                 showControls();
             },
-            save: function (schemaId, values) {
+            save: function (schemaId, values, target) {
                 ui.runWithPaletteProgress(str.progressSaveJson, function (progress) {
-                    api.forgeSchemaSaveValues(schemaId, values, progress);
-                    loadForgeSchemaState(schemaId, progress, false);
+                    var saved = api.forgeSchemaSaveValues(schemaId, values, target.fsName, progress);
+                    state.forgePresets = backend.refreshForgeSchemas(progress);
+                    var savedSchema = findForgeSchemaBySavedPath(state.forgePresets, saved.path);
+                    if (savedSchema) {
+                        cfg.selectedForgePreset = cfg.data.selectedForgePreset = savedSchema.id;
+                        loadForgeSchemaState(savedSchema.id, progress, false);
+                    }
                 });
                 showControls();
             },
@@ -4228,16 +4293,18 @@ function BridgeApi() {
         msg.force = true;
         return call("workflow_reinitialize", msg, ANALYZE_TIMEOUT, progress);
     };
-    this.workflowSaveValues = function (workflowId, relativePath, overrides, values, progress) {
+    this.workflowSaveValues = function (workflowId, relativePath, overrides, values, destinationPath, progress) {
         var msg = workflowMessage(workflowId, overrides, relativePath);
         msg.values = values || {};
+        msg.destination_path = destinationPath || "";
         return call("workflow_save_values", msg, ANALYZE_TIMEOUT, progress);
     };
-    this.forgeSchemaSaveValues = function (schemaId, values, progress) {
+    this.forgeSchemaSaveValues = function (schemaId, values, destinationPath, progress) {
         return call("forge_schema_save_values", {
             schema_id: schemaId,
             schema_folder: cfg.forgeSchemasFolder || "",
-            values: values || {}
+            values: values || {},
+            destination_path: destinationPath || ""
         }, ANALYZE_TIMEOUT, progress);
     };
     this.interrupt = function (requestId) {
@@ -5229,10 +5296,11 @@ function Locale() {
         noneReference: ["нет", "none"], selectReferenceImage: ["Выберите референсное изображение", "Select reference image"],
         errReferenceImageFormat: ["Поддерживаются только изображения JPG, JPEG, PNG и WebP.", "Only JPG, JPEG, PNG and WebP images are supported."],
         saveChanges: ["Сохранить изменения", "Save changes"], dialogYes: ["Да", "Yes"], dialogNo: ["Нет", "No"],
-        saveWorkflowJson: ["Сохранить текущие видимые значения в выбранный workflow JSON", "Save current visible values to the selected workflow JSON"],
-        saveWorkflowJsonConfirm: ["Сохранить текущие видимые значения в выбранный workflow JSON?\n\nЗначения соответствующих полей будут перезаписаны непосредственно в исходном файле workflow. После записи workflow будет повторно проанализирован, а интерфейс обновлён.\n\nДа — начать сохранение.\nНет — отменить операцию.", "Save the current visible values to the selected workflow JSON?\n\nThe corresponding field values will be overwritten directly in the source workflow file. After writing, the workflow will be reanalyzed and the interface will be updated.\n\nYes — start saving.\nNo — cancel the operation."],
-        saveForgeSchemaJson: ["Сохранить текущие видимые значения в выбранную JSON-схему Forge", "Save current visible values to the selected Forge JSON schema"],
-        saveForgeSchemaJsonConfirm: ["Сохранить текущие видимые значения в выбранную JSON-схему Forge?\n\nЗначения соответствующих параметров будут перезаписаны непосредственно в исходном файле схемы. После записи схема будет загружена заново, а интерфейс обновлён.\n\nДа — начать сохранение.\nНет — отменить операцию.", "Save the current visible values to the selected Forge JSON schema?\n\nThe corresponding parameter values will be overwritten directly in the source schema file. After writing, the schema will be loaded again and the interface will be updated.\n\nYes — start saving.\nNo — cancel the operation."],
+        saveWorkflowJson: ["Сохранить workflow как…", "Save workflow as…"],
+        saveWorkflowAsPrompt: ["Сохранить workflow JSON как…", "Save workflow JSON as…"],
+        saveForgeSchemaJson: ["Сохранить схему Forge как…", "Save Forge schema as…"],
+        saveForgeSchemaAsPrompt: ["Сохранить JSON-схему Forge как…", "Save Forge schema JSON as…"],
+        errSaveAsJsonExtension: ["Файл должен быть сохранён с расширением .json.", "The file must be saved with a .json extension."],
         infoEmptyWorkflowFolder: ["В выбранной папке нет API-workflow (*.json). Откройте настройки, чтобы выбрать другую папку.", "The selected folder contains no API workflows (*.json). Open Settings to choose another folder."],
         infoMissingWorkflowFolder: ["Папка API-workflow ComfyUI не выбрана или не найдена. Нажмите ⚙ и выберите папку с API-workflow.", "The ComfyUI API-workflow folder is not selected or cannot be found. Click ⚙ and select the API-workflow folder."],
         jsxLine: ["Строка JSX: ", "JSX line: "], layerMetadata: ["Сохранять настройки в метаданных слоя", "Store settings in layer metadata"],
