@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.151",
+    VER = "0.152",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -3932,10 +3932,19 @@ function UI() {
         fillPresetList();
         setSliderValue();
         function syncResizeValue() {
-            var sliderValue = Math.floor(slider.value);
-            profile.resize = (sliderValue >= 97 && sliderValue <= 103) ? 1 : Math.max(0.01, sliderValue / 100);
-            if (!checkbox.value) profile.manualScale = profile.resize;
-            valueText.text = profile.resize.toFixed(2);
+            var sliderValue = Math.floor(slider.value),
+                scale = (sliderValue >= 97 && sliderValue <= 103) ? 1 : Math.max(0.01, sliderValue / 100);
+            // Ручное изменение масштаба означает явный переход из Auto в Manual.
+            // Значение становится постоянным manualScale и сохраняется в профиль/Action
+            // до тех пор, пока пользователь снова явно не включит Автомасштаб.
+            if (checkbox.value) {
+                checkbox.value = false;
+                profile.autoResize = false;
+                presetGroup.enabled = false;
+            }
+            profile.resize = scale;
+            profile.manualScale = scale;
+            valueText.text = scale.toFixed(2);
             title.text = setTitle();
             isDirty = true;
         }
