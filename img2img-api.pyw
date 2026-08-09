@@ -44,7 +44,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.1"
+VERSION = "0.149"
 
 # Единый объект идентичности приложения. Пользовательские каталоги, имена
 # служебных файлов и расположение поставляемых схем вычисляются только отсюда.
@@ -85,6 +85,7 @@ HISTORY_POLL_INTERVAL = 0.35
 # Максимальный возраст временных каталогов перед автоматической очисткой.
 TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
 UPLOAD_SUBFOLDER = APP["upload_subfolder"]
+OUTPUT_SUBFOLDER = "Img2imgHelper"
 
 # Версия формата внутреннего кеша. При изменении структуры увеличить число.
 CACHE_VERSION = 1
@@ -639,10 +640,12 @@ def is_local_comfy_host(host: str) -> bool:
         return False
 
 
-def detect_comfy_input_folder(
+def _detect_comfy_folder(
     stats: Optional[Dict[str, Any]],
     host: str,
     port: int,
+    option: str,
+    default_name: str,
 ) -> Optional[Path]:
     if not is_local_comfy_host(host):
         return None
@@ -671,7 +674,7 @@ def detect_comfy_input_folder(
         if env_root:
             roots.append(env_root)
 
-    explicit = _cli_path(argv, "--input-directory")
+    explicit = _cli_path(argv, option)
     if explicit:
         if explicit.is_absolute():
             found = _existing_directory(explicit)
@@ -683,10 +686,86 @@ def detect_comfy_input_folder(
                 return found
 
     for root in roots:
-        found = _existing_directory(root / "input")
+        found = _existing_directory(root / default_name)
         if found:
             return found
     return None
+
+
+def detect_comfy_input_folder(
+    stats: Optional[Dict[str, Any]],
+    host: str,
+    port: int,
+) -> Optional[Path]:
+    return _detect_comfy_folder(stats, host, port, "--input-directory", "input")
+
+
+def detect_comfy_output_folder(
+    stats: Optional[Dict[str, Any]],
+    host: str,
+    port: int,
+) -> Optional[Path]:
+    return _detect_comfy_folder(stats, host, port, "--output-directory", "output")
+
+
+def cleanup_stale_comfy_outputs(output_folder: Optional[Path]) -> None:
+    """Remove leftovers from the helper-owned ComfyUI output subfolder.
+
+    This runs before a new helper request is queued, so every file already
+    present under ``output/Img2imgHelper`` belongs to an older request.
+    """
+
+    root = _existing_directory(output_folder)
+    if not root:
+        return
+    base = (root / OUTPUT_SUBFOLDER).resolve()
+    if not base.is_dir():
+        return
+    try:
+        for child in base.rglob("*"):
+            try:
+                if child.is_file():
+                    child.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("Could not delete old ComfyUI output file: %s", child)
+        for child in sorted((item for item in base.rglob("*") if item.is_dir()), key=lambda item: len(item.parts), reverse=True):
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+    except OSError:
+        LOGGER.warning("Could not inspect ComfyUI helper output folder: %s", base)
+
+
+def cleanup_comfy_request_outputs(output_folder: Optional[Path], request_id: str) -> None:
+    root = _existing_directory(output_folder)
+    if not root:
+        return
+    base = (root / OUTPUT_SUBFOLDER).resolve()
+    if not base.is_dir():
+        return
+    prefix = safe_filename(request_id)
+    if not prefix:
+        return
+    try:
+        for target in base.rglob("*"):
+            try:
+                resolved = target.resolve()
+                if not resolved.is_file() or (resolved.parent != base and base not in resolved.parents):
+                    continue
+                relative = resolved.relative_to(base)
+                if not any(str(part).startswith(prefix) for part in relative.parts):
+                    continue
+                resolved.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                LOGGER.warning("Could not delete ComfyUI generated output: %s", target)
+        for child in sorted((item for item in base.rglob("*") if item.is_dir()), key=lambda item: len(item.parts), reverse=True):
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+    except OSError:
+        LOGGER.warning("Could not clean ComfyUI output for request %s", request_id)
 
 
 def cleanup_stale_comfy_uploads(input_folder: Path) -> None:
@@ -3171,7 +3250,7 @@ class WorkflowPatcher:
                 continue
             inputs = node.get("inputs", {})
             if "filename_prefix" in inputs and not is_link(inputs["filename_prefix"]):
-                inputs["filename_prefix"] = f"Img2imgHelper/{safe_filename(request_id)}"
+                inputs["filename_prefix"] = f"{OUTPUT_SUBFOLDER}/{safe_filename(request_id)}"
 
         return self.workflow
 
@@ -4257,6 +4336,7 @@ class RuntimeConfig:
     comfy_port: int = 8188
     forge_port: int = 7860
     comfy_input_folder: Optional[Path] = None
+    comfy_output_folder: Optional[Path] = None
     workflows_folder: Path = Path.home() / "Documents" / "Comfy Workflows"
     generation_timeout: int = 20 * 60
 
@@ -4267,6 +4347,7 @@ class GenerationState:
     backend: str = "comfy"
     prompt_id: Optional[str] = None
     input_folder: Optional[Path] = None
+    output_folder: Optional[Path] = None
     uploaded_images: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     # JSX закрывает listener первой стадии и после ответа "init" открывает
@@ -4291,7 +4372,7 @@ LAST_ACTIVITY_LOCK = threading.Lock()
 BACKEND_STATUS_LOCK = threading.Lock()
 BACKEND_STATUS_CACHE: Optional[Dict[str, Any]] = None
 BACKEND_STATUS_ENDPOINTS: Optional[Tuple[str, int, int]] = None
-# Поиск локальной Comfy input-папки на Windows использует netstat/PowerShell и
+# Поиск локальных Comfy input/output-папок на Windows использует netstat/PowerShell и
 # заметно дороже обычного HTTP ping. Повторяем его только один раз для endpoint
 # за время жизни Python-процесса; сам /system_stats по-прежнему проверяется.
 COMFY_INPUT_FOLDER_ENDPOINT: Optional[Tuple[str, int]] = None
@@ -4313,6 +4394,7 @@ def generation_context(task: Dict[str, Any], backend: str):
     GENERATION.prompt_id = None
     GENERATION.backend = backend
     GENERATION.input_folder = None
+    GENERATION.output_folder = None
     GENERATION.uploaded_images = []
     GENERATION.cancel_event.clear()
     GENERATION.ack_event.clear()
@@ -4323,6 +4405,7 @@ def generation_context(task: Dict[str, Any], backend: str):
         yield request_id
     finally:
         try:
+            cleanup_comfy_request_outputs(GENERATION.output_folder, request_id)
             cleanup_uploaded_images(GENERATION.input_folder, GENERATION.uploaded_images)
         finally:
             with CANCELLED_REQUESTS_LOCK:
@@ -4331,6 +4414,7 @@ def generation_context(task: Dict[str, Any], backend: str):
             GENERATION.prompt_id = None
             GENERATION.backend = "comfy"
             GENERATION.input_folder = None
+            GENERATION.output_folder = None
             GENERATION.uploaded_images = []
             GENERATION.active = False
             GENERATION.queued = False
@@ -5145,9 +5229,13 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
 
     client = current_client()
     input_folder = _existing_directory(RUNTIME.comfy_input_folder)
+    output_folder = _existing_directory(RUNTIME.comfy_output_folder)
     GENERATION.input_folder = input_folder
+    GENERATION.output_folder = output_folder
     if input_folder:
         cleanup_stale_comfy_uploads(input_folder)
+    if output_folder:
+        cleanup_stale_comfy_outputs(output_folder)
 
     upload_subfolder = UPLOAD_SUBFOLDER
 
@@ -5372,6 +5460,7 @@ def _probe_comfy(host: str, port: int, *, update_runtime: bool) -> Dict[str, Any
         details = ComfyClient(host, int(port)).ping(timeout=2.0)
         if update_runtime and COMFY_INPUT_FOLDER_ENDPOINT != endpoint:
             RUNTIME.comfy_input_folder = detect_comfy_input_folder(details, host, int(port))
+            RUNTIME.comfy_output_folder = detect_comfy_output_folder(details, host, int(port))
             COMFY_INPUT_FOLDER_ENDPOINT = endpoint
         # Полный /system_stats нужен Python для определения input-папки, но JSX
         # использует только available/latency. Не гоняем большой JSON обратно.
@@ -5382,6 +5471,7 @@ def _probe_comfy(host: str, port: int, *, update_runtime: bool) -> Dict[str, Any
     except Exception as exc:
         if update_runtime:
             RUNTIME.comfy_input_folder = None
+            RUNTIME.comfy_output_folder = None
             COMFY_INPUT_FOLDER_ENDPOINT = None
         return _backend_probe_result(
             "comfy", host, int(port), started, available=False, error=str(exc),
@@ -5537,6 +5627,7 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         "comfy_port": RUNTIME.comfy_port,
         "forge_port": RUNTIME.forge_port,
         "comfy_input_folder": str(RUNTIME.comfy_input_folder or ""),
+        "comfy_output_folder": str(RUNTIME.comfy_output_folder or ""),
         "workflows_folder": str(RUNTIME.workflows_folder),
         "generation_timeout": RUNTIME.generation_timeout,
         "updated": time.time(),
@@ -5840,6 +5931,8 @@ def load_runtime_file() -> None:
         RUNTIME.forge_port = int(data.get("forge_port") or RUNTIME.forge_port)
         input_folder = str(data.get("comfy_input_folder") or "")
         RUNTIME.comfy_input_folder = Path(input_folder) if input_folder else None
+        output_folder = str(data.get("comfy_output_folder") or "")
+        RUNTIME.comfy_output_folder = Path(output_folder) if output_folder else None
         folder = data.get("workflows_folder")
         if folder:
             RUNTIME.workflows_folder = Path(str(folder))
