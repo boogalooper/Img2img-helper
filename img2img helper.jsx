@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.146",
+    VER = "0.147",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -54,6 +54,7 @@ var APP = {
     GENERATION_PREPARE_SEGMENT = 30,
     GENERATION_RUN_SEGMENT = 70,
     PROGRESS_TASK_RANGE = 40,
+    DESC_PROFILE_CLEANUP_INTERVAL = 500,
     BACKEND_COMFY = "comfy",
     BACKEND_FORGE = "forge",
     TRANSFORM_STRETCH = "stretch",
@@ -4687,7 +4688,7 @@ function Config() {
             "autoResize", "sizeMultiple", "resizePresets",
             "flatten", "rasterizeImage", "keepAspectRatioDuringPlace", "recordSettingsToAction", "writeLayerMetadata",
             "selectBrush", "brushOpacity", "generationTimeout", "workflowProfiles", "forgeProfiles",
-            "workflowCatalog", "forgeCatalog", "referenceHistory", "promptPresets"
+            "workflowCatalog", "forgeCatalog", "referenceHistory", "promptPresets", "descSaveCount"
         ];
     this.data = defaultData();
     this.bindProperties = function () {
@@ -4737,6 +4738,86 @@ function Config() {
             if (!arrayContainsCaseInsensitive(res, cur[i])) res.push(cur[i]);
         self.referenceHistory = self.data.referenceHistory = res;
     };
+    // Раз в несколько сотен сохранений DESC удаляем только профили, чьи
+    // исходные JSON уже отсутствуют. Проверка выполняется отдельно для каждого
+    // реально доступного backend; существующий, но повреждённый JSON не удаляет профиль.
+    function probeCleanupBackends() {
+        var res = { comfy: false, forge: false };
+        try {
+            if (!api || !api.isRunning()) return res;
+            var status = api.probeBackends(self);
+            res.comfy = !!(status && status.backends && status.backends.comfy && status.backends.comfy.available);
+            res.forge = !!(status && status.backends && status.backends.forge && status.backends.forge.available);
+        } catch (_) { }
+        return res;
+    }
+    function deletedProfileCleanupPlan(data, available) {
+        var plan = { workflowIds: [], forgeIds: [], workflowCatalog: [], forgeCatalog: [] };
+        available = available || {};
+        function existingFile(root, relativePath) {
+            if (!relativePath) return true;
+            try { return (new File(root.fsName + "/" + String(relativePath))).exists; }
+            catch (_) { return true; }
+        }
+        var workflowFolder = String(data.workflowsFolder || "");
+        if (workflowFolder && available.comfy) {
+            var workflowRoot = new Folder(workflowFolder);
+            if (workflowRoot.exists) {
+                var workflowProfiles = isObjectMap(data.workflowProfiles) ? data.workflowProfiles : {};
+                for (var workflowId in workflowProfiles) if (workflowProfiles.hasOwnProperty(workflowId)) {
+                    var profile = workflowProfiles[workflowId], relativePath = profile && profile.relativePath;
+                    if (relativePath && !existingFile(workflowRoot, relativePath)) plan.workflowIds.push(workflowId);
+                }
+                if (data.workflowCatalog instanceof Array)
+                    for (var wi = 0; wi < data.workflowCatalog.length; wi++) {
+                        var workflow = data.workflowCatalog[wi], path = workflow && workflow.relative_path;
+                        if (path && !existingFile(workflowRoot, path)) plan.workflowCatalog.push(wi);
+                    }
+            }
+        }
+        var forgeFolder = String(data.forgeSchemasFolder || "");
+        if (forgeFolder && available.forge) {
+            var forgeRoot = new Folder(forgeFolder);
+            if (forgeRoot.exists) {
+                var existing = {}, files = [];
+                try { files = forgeRoot.getFiles(); } catch (_) { files = []; }
+                for (var fi = 0; fi < files.length; fi++) {
+                    if (!(files[fi] instanceof File) || !/\.json$/i.test(files[fi].name)) continue;
+                    existing[String(files[fi].name).replace(/\.json$/i, "").toLowerCase()] = true;
+                }
+                var forgeProfiles = isObjectMap(data.forgeProfiles) ? data.forgeProfiles : {};
+                for (var presetId in forgeProfiles) if (forgeProfiles.hasOwnProperty(presetId) && !existing[String(presetId).toLowerCase()])
+                    plan.forgeIds.push(presetId);
+                if (data.forgeCatalog instanceof Array)
+                    for (var fj = 0; fj < data.forgeCatalog.length; fj++) {
+                        var item = data.forgeCatalog[fj], fileName = item && item.file;
+                        if (fileName && !existing[String(fileName).replace(/\.json$/i, "").toLowerCase()]) plan.forgeCatalog.push(fj);
+                    }
+            }
+        }
+        return plan;
+    }
+    function applyDeletedProfileCleanup(data, plan) {
+        var i, profiles;
+        profiles = isObjectMap(data.workflowProfiles) ? data.workflowProfiles : {};
+        for (i = 0; i < plan.workflowIds.length; i++) delete profiles[plan.workflowIds[i]];
+        profiles = isObjectMap(data.forgeProfiles) ? data.forgeProfiles : {};
+        for (i = 0; i < plan.forgeIds.length; i++) delete profiles[plan.forgeIds[i]];
+        if (data.workflowCatalog instanceof Array)
+            for (i = plan.workflowCatalog.length - 1; i >= 0; i--) data.workflowCatalog.splice(plan.workflowCatalog[i], 1);
+        if (data.forgeCatalog instanceof Array)
+            for (i = plan.forgeCatalog.length - 1; i >= 0; i--) data.forgeCatalog.splice(plan.forgeCatalog[i], 1);
+    }
+    function cleanupSaveData(data, plan) {
+        var res = {}, key;
+        for (key in data) if (data.hasOwnProperty(key)) res[key] = data[key];
+        if (plan.workflowIds.length) res.workflowProfiles = cloneObj(data.workflowProfiles);
+        if (plan.forgeIds.length) res.forgeProfiles = cloneObj(data.forgeProfiles);
+        if (plan.workflowCatalog.length) res.workflowCatalog = cloneObj(data.workflowCatalog);
+        if (plan.forgeCatalog.length) res.forgeCatalog = cloneObj(data.forgeCatalog);
+        applyDeletedProfileCleanup(res, plan);
+        return res;
+    }
     // Формирует облегчённый снимок Action. Если запись настроек выключена,
     // сохраняется только маркер и флаг, а при playback читается актуальный DESC.
     function actionData() {
@@ -4753,6 +4834,7 @@ function Config() {
         delete res.referenceHistory;
         delete res.workflowCatalog;
         delete res.forgeCatalog;
+        delete res.descSaveCount;
         var profiles = isObjectMap(res.workflowProfiles) ? res.workflowProfiles : {};
         for (var workflowId in profiles) if (profiles.hasOwnProperty(workflowId) && profiles[workflowId]) {
             delete profiles[workflowId].schemaCache;
@@ -4861,8 +4943,13 @@ function Config() {
     };
     this.save = function () {
         syncData();
-        var desc = descriptorCodec.toDescriptor(self.data),
-            stream = desc.toStream(),
+        var previousSaveCount = parseInt(self.descSaveCount, 10);
+        if (isNaN(previousSaveCount) || previousSaveCount < 0 || previousSaveCount >= DESC_PROFILE_CLEANUP_INTERVAL) previousSaveCount = 0;
+        var nextSaveCount = previousSaveCount + 1,
+            cleanupDue = nextSaveCount >= DESC_PROFILE_CLEANUP_INTERVAL,
+            cleanupBackends = cleanupDue ? probeCleanupBackends() : null,
+            cleanupPlan = cleanupDue ? deletedProfileCleanupPlan(self.data, cleanupBackends) : null,
+            saveData = cleanupDue ? cleanupSaveData(self.data, cleanupPlan) : self.data,
             file = settingsFile(""),
             temp = settingsFile(".tmp"),
             backup = settingsFile(".bak"),
@@ -4872,8 +4959,12 @@ function Config() {
             hadPrimary = file.exists,
             primaryMoved = false,
             promoted = false;
-        writeSettingsStream(temp, stream);
+        if (cleanupDue) saveData.descSaveCount = 0;
+        else self.descSaveCount = self.data.descSaveCount = nextSaveCount;
         try {
+            var desc = descriptorCodec.toDescriptor(saveData),
+                stream = desc.toStream();
+            writeSettingsStream(temp, stream);
             if (hadPrimary) {
                 if (recoveredFromBackup && backup.exists) {
                     // Основной файл уже признан повреждённым, а .bak успешно
@@ -4899,7 +4990,12 @@ function Config() {
             // временного файла и от редких ошибок файловой системы.
             readSettingsData(new File(primaryPath));
             recoveredFromBackup = false;
+            if (cleanupDue) {
+                applyDeletedProfileCleanup(self.data, cleanupPlan);
+                self.descSaveCount = self.data.descSaveCount = 0;
+            }
         } catch (e) {
+            if (!cleanupDue) self.descSaveCount = self.data.descSaveCount = previousSaveCount;
             if (promoted) {
                 if (primaryMoved) {
                     if (!restoreBackup(primaryPath, backupPath))
@@ -5063,7 +5159,8 @@ function Config() {
             workflowCatalog: [],
             forgeCatalog: [],
             referenceHistory: [],
-            promptPresets: presets.defaultPrompt()
+            promptPresets: presets.defaultPrompt(),
+            descSaveCount: 0
         };
     }
     function mergeDefaults(defaults, loaded) {

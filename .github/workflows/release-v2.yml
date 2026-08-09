@@ -76,13 +76,43 @@ jobs:
           zip -r "${PACKAGE_NAME}.zip" "${PACKAGE_NAME}"
 
       - name: Prepare release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          # The new release does not exist yet, so the latest published
+          # release is the previous one and can be used as the start point.
+          PREVIOUS_TAG=$(gh release list \
+            --exclude-drafts \
+            --exclude-pre-releases \
+            --limit 1 \
+            --json tagName \
+            --jq '.[0].tagName // empty')
+
           {
             echo "## История изменений"
             echo
-            git log -1 --format=%B
+
+            if [ -n "${PREVIOUS_TAG}" ]; then
+              echo "Изменения с ${PREVIOUS_TAG}:"
+              echo
+              git log "${PREVIOUS_TAG}..${GITHUB_SHA}" \
+                --reverse \
+                --no-merges \
+                --pretty=format:'- %s'
+              echo
+            else
+              # First release: there is no previous release to compare with.
+              git log "${GITHUB_SHA}" \
+                --reverse \
+                --no-merges \
+                --pretty=format:'- %s'
+              echo
+            fi
           } > release-notes.md
+
+          echo "Release notes:"
+          cat release-notes.md
 
       - name: Publish GitHub release
         env:
