@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.15",
+    VER = "0.151",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -190,8 +190,17 @@ function init() {
         api.initialize(startupProgress, apiRunning);
         if (startupProgress) startupProgress.setStage(str.progressHandshake, 22);
         backend.applyStatus(api.handshake(startupProgress));
-        var backendChangedAtStartup = backend.normalizeActiveBackend();
-        if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
+        var backendChangedAtStartup = false;
+        // Action с записанными настройками обязан использовать backend,
+        // сохранённый в playbackParameters. Не подменяем его другим
+        // доступным backend: иначе Forge Action может открыть Comfy profile
+        // (и наоборот), скрывая реальную причину невозможности запуска.
+        if (actionPlaybackMode && actionUsesRecordedSettings) {
+            if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
+        } else {
+            backendChangedAtStartup = backend.normalizeActiveBackend();
+            if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
+        }
         var initial = backend.loadInitialData(startupProgress),
             responseSeconds = Math.round((((new Date()).getTime() - startupStartedAt) / 1000) * 100) / 100;
         initial.notices = settingsWarnings.concat(initial.notices instanceof Array ? initial.notices : []);
