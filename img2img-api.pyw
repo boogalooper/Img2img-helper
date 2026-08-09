@@ -496,6 +496,32 @@ def clamp_number(value: float, minimum: Optional[float], maximum: Optional[float
     return value
 
 
+def parse_user_float(value: Any) -> float:
+    """Parse a user-entered number accepting both decimal separators."""
+
+    if isinstance(value, str):
+        value = value.strip().replace(",", ".")
+    return float(value)
+
+
+def parse_user_int(value: Any) -> int:
+    """Parse an integer without losing precision; ``12,0`` is accepted."""
+
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError
+        return int(value)
+    text = str(value).strip().replace(",", ".")
+    match = re.fullmatch(r"([+-]?\d+)(?:\.0+)?", text)
+    if not match:
+        raise ValueError
+    return int(match.group(1))
+
+
 def deep_get(mapping: Dict[str, Any], keys: Sequence[str], default: Any = None) -> Any:
     current: Any = mapping
     for key in keys:
@@ -2782,8 +2808,8 @@ class WorkflowPatcher:
                 # Не переводим seed через float: float теряет точность выше
                 # 2^53, тогда как ComfyUI часто допускает 64-bit INT.
                 try:
-                    number_int = int(str(value).strip())
-                except (TypeError, ValueError) as exc:
+                    number_int = parse_user_int(value)
+                except (TypeError, ValueError, OverflowError) as exc:
                     raise UserVisibleError(
                         f"Field {class_type}.{input_name} expects an integer, received {value!r}."
                     ) from exc
@@ -2815,7 +2841,7 @@ class WorkflowPatcher:
                 return number_int
 
             try:
-                number = float(value)
+                number = parse_user_float(value)
             except (TypeError, ValueError, OverflowError) as exc:
                 raise UserVisibleError(
                     f"Field {class_type}.{input_name} expects a number, received {value!r}."
@@ -3873,19 +3899,7 @@ def _forge_coerce_control_value(
 
     if control_type in {"integer", "int"}:
         try:
-            if isinstance(value, bool):
-                number = int(value)
-            elif isinstance(value, int):
-                number = value
-            elif isinstance(value, float):
-                if not math.isfinite(value) or not value.is_integer():
-                    raise ValueError
-                number = int(value)
-            else:
-                text = str(value).strip()
-                if not re.fullmatch(r"[+-]?\d+", text):
-                    raise ValueError
-                number = int(text)
+            number = parse_user_int(value)
         except (TypeError, ValueError, OverflowError) as exc:
             raise UserVisibleError(
                 f"Forge field {control_id} expects an integer, received {value!r}."
@@ -3912,7 +3926,7 @@ def _forge_coerce_control_value(
 
     if control_type in {"float", "number"}:
         try:
-            number = float(value)
+            number = parse_user_float(value)
         except (TypeError, ValueError, OverflowError) as exc:
             raise UserVisibleError(
                 f"Forge field {control_id} expects a number, received {value!r}."

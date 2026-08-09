@@ -3422,14 +3422,33 @@ function UI() {
         }
         return { row: toolbar.row, dropdown: toolbar.dropdown, refresh: refresh, add: add, save: save, remove: remove };
     };
+    function parseNumericText(value) {
+        var text = String(value === undefined || value === null ? "" : value)
+            .replace(/^\s+|\s+$/g, "").replace(/,/g, ".");
+        if (!text) return NaN;
+        var number = Number(text);
+        return isFinite(number) ? number : NaN;
+    }
+    function isSafeIntegerText(value) {
+        var text = String(value || "").replace(/^[-+]/, "").replace(/^0+/, "") || "0",
+            limit = "9007199254740991";
+        if (!/^\d+$/.test(text)) return false;
+        return text.length < limit.length || (text.length == limit.length && text <= limit);
+    }
+    function canRoundNumericValue(value, step, origin) {
+        return isFinite(value) && isFinite(step) && isFinite(origin) &&
+            Math.abs(value) <= 9007199254740991 &&
+            Math.abs(origin) <= 9007199254740991 &&
+            Math.abs(value - origin) <= 9007199254740991;
+    }
     function addNumericControl(parent, schema, storedValue, options) {
         // Тип из /object_info имеет приоритет над типом JSON-литерала.
         // Например, KSampler.denoise является FLOAT, но значение 1 в API JSON
         // сериализуется как integer. Дополнительная проверка ниже также
         // защищает интерфейс от старого закешированного анализа.
         var integer = isIntegerNumericSchema(schema),
-            value = parseFloat(storedValue);
-        if (isNaN(value)) value = parseFloat(schema.value) || 0;
+            value = parseNumericText(storedValue);
+        if (isNaN(value)) value = parseNumericText(schema.value) || 0;
         if (generation.isSeedControl(schema)) {
             var seedGroup = self.addColumn(parent, 0);
             self.setFixedWidth(seedGroup, self.contentWidth());
@@ -3452,8 +3471,8 @@ function UI() {
         var hasMinimum = hasNumericSchemaValue(schema.min),
             hasMaximum = hasNumericSchemaValue(schema.max),
             preferredSlider = isPreferredSliderControl(schema),
-            min = hasMinimum ? parseFloat(schema.min) : Math.min(0, value),
-            max = hasMaximum ? parseFloat(schema.max) : Math.max(100, value * 2, 1),
+            min = hasMinimum ? parseNumericText(schema.min) : Math.min(0, value),
+            max = hasMaximum ? parseNumericText(schema.max) : Math.max(100, value * 2, 1),
             stepsControl = isStepsControl(schema);
         if ((!hasMinimum || !hasMaximum) && !preferredSlider) {
             return addNumericEditControl(parent, schema, storedValue, integer);
@@ -3468,7 +3487,7 @@ function UI() {
             if (max <= min) min = Math.min(min, 99);
         }
         var explicitStep = hasExplicitNumericStep(schema),
-            rawStep = explicitStep ? parseFloat(schema.step) : null,
+            rawStep = explicitStep ? parseNumericText(schema.step) : null,
             step = numericControlStep(schema, integer),
             precision = integer ? 0 : numberPrecision(step),
             // Для Comfy большие диапазоны с единичным либо неуказанным шагом
@@ -3533,31 +3552,38 @@ function UI() {
         edit.onChange = function () { readValue(true); };
         function readValue(updateText) {
             var text = normalizeNumericEditText(edit.text, integer),
-                fallback = parseFloat(schema.value),
-                value;
+                fallback = parseNumericText(schema.value),
+                value, rawInteger = integer && /^[+-]?\d+$/.test(text) ? text : "";
+            // Generic PrimitiveInt may expose a 64-bit range. Keep integers above
+            // JavaScript's exact range as text and let Python validate them.
+            if (rawInteger && !isSafeIntegerText(rawInteger)) {
+                if (updateText) edit.text = rawInteger;
+                return rawInteger;
+            }
             if (text == "" || text == "-" || text == "." || text == "-.") {
                 value = isNaN(fallback) ? 0 : fallback;
             } else {
-                value = integer ? parseInt(text, 10) : parseFloat(text);
+                value = parseNumericText(text);
                 if (isNaN(value)) value = isNaN(fallback) ? 0 : fallback;
             }
             var hasMinimum = hasNumericSchemaValue(schema.min),
                 hasMaximum = hasNumericSchemaValue(schema.max),
-                min = hasMinimum ? parseFloat(schema.min) : null,
-                max = hasMaximum ? parseFloat(schema.max) : null,
+                min = hasMinimum ? parseNumericText(schema.min) : null,
+                max = hasMaximum ? parseNumericText(schema.max) : null,
                 explicitStep = hasExplicitNumericStep(schema),
                 step = explicitStep || integer ? numericControlStep(schema, integer) : null,
                 origin = hasMinimum && !isNaN(min) ? min : 0;
             if (hasMinimum && !isNaN(min)) value = Math.max(min, value);
             if (hasMaximum && !isNaN(max)) value = Math.min(max, value);
-            // FLOAT без явного step не округляется искусственно до 0.01:
-            // Comfy принимает введённое число, а Python повторно проверяет его.
-            if (step !== null) value = roundByStep(value, step, origin);
+            // step=1 for an integer needs no rounding. Avoid any step calculation
+            // when a huge min/max would exceed exact IEEE-754 integer arithmetic:
+            // this was able to turn a small PrimitiveInt value such as 20 into 0.
+            if (step !== null && (!integer || step > 1) && canRoundNumericValue(value, step, origin))
+                value = roundByStep(value, step, origin);
             if (hasMinimum && !isNaN(min)) value = Math.max(min, value);
             if (hasMaximum && !isNaN(max)) value = Math.min(max, value);
             if (integer) {
                 value = Math.round(value);
-                if (Math.abs(value) > 9007199254740991) return text;
                 if (updateText) edit.text = String(value);
                 return String(value);
             }
@@ -3580,16 +3606,15 @@ function UI() {
         if (edit.text != normalized) edit.text = normalized;
     }
     function normalizeNumericEditText(value, integer) {
-        var text = String(value === undefined || value === null ? "" : value).replace(/,/g, "."),
+        var text = String(value === undefined || value === null ? "" : value)
+                .replace(/^\s+|\s+$/g, "").replace(/,/g, "."),
             negative = text.charAt(0) == "-";
-        text = text.replace(/-/g, "");
-        if (integer) {
-            text = text.replace(/[^0-9]/g, "");
-        } else {
-            text = text.replace(/[^0-9.]/g, "");
-            var dot = text.indexOf(".");
-            if (dot >= 0) text = text.substring(0, dot + 1) + text.substring(dot + 1).replace(/\./g, "");
-        }
+        // Keep one decimal separator even for integer fields while the user is
+        // typing. On commit integer values are rounded; this avoids turning
+        // locale input such as 20,0 into the unrelated integer 200.
+        text = text.replace(/-/g, "").replace(/[^0-9.]/g, "");
+        var dot = text.indexOf(".");
+        if (dot >= 0) text = text.substring(0, dot + 1) + text.substring(dot + 1).replace(/\./g, "");
         return (negative ? "-" : "") + text;
     }
     function isDenoiseNumericSchema(schema) {
@@ -3607,7 +3632,7 @@ function UI() {
         var keys = ["value", "min", "max", "step"];
         for (var i = 0; i < keys.length; i++) {
             var raw = schema ? schema[keys[i]] : null,
-                number = parseFloat(raw);
+                number = parseNumericText(raw);
             if (raw !== undefined && raw !== null && String(raw) != "" &&
                 !isNaN(number) && Math.abs(number - Math.round(number)) > 0.000000001)
                 return false;
@@ -3616,16 +3641,16 @@ function UI() {
         // old cache labelled the current literal 1 as integer.
         if (isDenoiseNumericSchema(schema) &&
             hasNumericSchemaValue(schema.min) && hasNumericSchemaValue(schema.max) &&
-            parseFloat(schema.max) - parseFloat(schema.min) <= 1.000000001)
+            parseNumericText(schema.max) - parseNumericText(schema.min) <= 1.000000001)
             return false;
         return true;
     }
     function hasNumericSchemaValue(value) {
-        return value !== undefined && value !== null && String(value) != "" && !isNaN(parseFloat(value));
+        return value !== undefined && value !== null && String(value) != "" && !isNaN(parseNumericText(value));
     }
     function hasExplicitNumericStep(schema) {
         return schema && schema.step !== undefined && schema.step !== null &&
-            String(schema.step) != "" && !isNaN(parseFloat(schema.step));
+            String(schema.step) != "" && !isNaN(parseNumericText(schema.step));
     }
     function isStepsControl(schema) {
         return startsWithSemantic(String(schema.id || ""), "steps") || String(schema.input || "").toLowerCase() == "steps";
@@ -3639,7 +3664,7 @@ function UI() {
             input == "distilled_cfg" || input == "distilled_cfg_scale";
     }
     function numericControlStep(schema, integer) {
-        var step = schema.step !== undefined ? parseFloat(schema.step) : (integer ? 1 : 0.01);
+        var step = schema.step !== undefined ? parseNumericText(schema.step) : (integer ? 1 : 0.01);
         if (isNaN(step) || step <= 0) step = integer ? 1 : 0.01;
         if (!integer && isCoarseHalfStepControl(schema)) step = 0.5;
         // ScriptUI использует целочисленную шкалу после масштабирования.
@@ -3648,8 +3673,8 @@ function UI() {
         // UI-описанием и заменяется сотой частью диапазона.
         if (!integer && isDenoiseNumericSchema(schema) &&
             hasNumericSchemaValue(schema.min) && hasNumericSchemaValue(schema.max)) {
-            var min = parseFloat(schema.min),
-                max = parseFloat(schema.max),
+            var min = parseNumericText(schema.min),
+                max = parseNumericText(schema.max),
                 span = max - min;
             if (span > 0 && span <= 1.000000001 && step >= span)
                 step = span / 100;
