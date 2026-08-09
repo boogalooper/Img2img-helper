@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.149",
+    VER = "0.15",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -90,17 +90,18 @@ var APP = {
     keyboardState = ScriptUI.environment.keyboardState;
 // ============================================================================
 // ТОЧКА ВХОДА И ОБЩАЯ ОБРАБОТКА ОШИБОК
-// Shift и аргумент dialog/ui принудительно показывают окно. Остальные решения
-// о тихом запуске принимаются внутри init() с учётом режима Photoshop Action.
+// Shift всегда принудительно показывает окно только для текущего запуска.
+// Аргумент dialog/ui учитывается обычным запуском. Тихий шаг Photoshop Action
+// игнорирует обычный dialog-флаг. Shift остаётся одноразовым ручным
+// исключением; ошибки сами прерывают Action и не влияют на следующий запуск.
 // ============================================================================
-if (keyboardState.shiftKey && action.getPlaybackParameterCount() != 1) $.setenv(APP.dialogEnvKey, "true");
-if (action.hasInterfaceArgument()) $.setenv(APP.dialogEnvKey, "true");
 try { init(); }
 catch (e) {
     if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
     if (String(e.message) == APP.cancelToken) {
         api.interrupt(generationProgress.getRequestId());
         isCancelled = true;
+        $.setenv(APP.dialogEnvKey, "true");
     } else {
         // После успешного placeResult повторное сохранение настроек не
         // запускаем: ошибка финализации не должна затрагивать уже созданный
@@ -112,8 +113,8 @@ catch (e) {
             "\n" + settingsSaveError;
         ui.showErrorMessage(errorText, APP.name);
         isCancelled = false;
+        $.setenv(APP.dialogEnvKey, "true");
     }
-    $.setenv(APP.dialogEnvKey, "true");
 }
 finally {
     // checkSelection() может выйти из Quick Mask ещё до открытия главного
@@ -134,9 +135,9 @@ function init() {
     initialState = app.activeDocument.activeHistoryState;
     if (doc.getProperty("mode").value != "RGBColor") throw new Error(str.errMode);
     var playbackCount = action.getPlaybackParameterCount(),
-        forceDialog = action.hasInterfaceArgument(),
         settingsWarnings = [];
     actionPlaybackMode = action.isPlayback(playbackCount);
+    var forceDialog = keyboardState.shiftKey || (!actionPlaybackMode && action.hasInterfaceArgument());
     if (actionPlaybackMode) {
         var actionSettingsMode = action.getRecordedSettingsMode();
         if (actionSettingsMode === false) {
@@ -160,14 +161,13 @@ function init() {
     settingsReady = true;
     cfg.cleanReferenceHistory();
     var environmentMode = DEBUG_FIRST_LAUNCH_WITH_INTERFACE ? null : $.getenv(APP.dialogEnvKey),
-        // Значение "true" является общим требованием показать окно после
-        // ошибки, отмены или закрытия предыдущего диалога. Оно должно иметь
-        // приоритет и при воспроизведении Photoshop Action; иначе Action снова
-        // запускает те же ошибочные параметры в тихом режиме.
-        showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || forceDialog ||
-            environmentMode == "true" || (actionPlaybackMode
-                ? app.playbackDisplayDialogs == DialogModes.ALL
-                : environmentMode == null);
+        // В Action обычный dialog-флаг не наследуется между итерациями.
+        // Shift и Photoshop dialog mode действуют только на текущий запуск.
+        // Ошибка сама прерывает Action и не заставляет следующую итерацию
+        // открывать интерфейс.
+        showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
+            ? forceDialog || app.playbackDisplayDialogs == DialogModes.ALL
+            : forceDialog || environmentMode == "true" || environmentMode == null);
     var selection = {
         result: false,
         bounds: null,
@@ -221,6 +221,7 @@ function init() {
         var silentProfile = backend.schemaProfile(initial.schema),
             silentValues = backend.profileValues(initial.schema, silentProfile);
         if (!actionPlaybackMode) cfg.saveToAction();
+        $.setenv(APP.dialogEnvKey, "false");
         generation.run(selection, initial.schema, silentValues);
     } finally {
         if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
