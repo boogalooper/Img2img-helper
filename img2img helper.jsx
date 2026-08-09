@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.147",
+    VER = "0.148",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -238,6 +238,12 @@ function errorMessageText(value) {
     if (value.message !== undefined) return String(value.message);
     return String(value);
 }
+function itemData(source) {
+    var objectItem = source && typeof source == "object",
+        label = objectItem ? (source.label !== undefined ? source.label : source.value) : source,
+        value = objectItem && source.value !== undefined ? source.value : label;
+    return { label: String(label === undefined ? "" : label), value: value === undefined ? "" : value };
+}
 // Ищет именно обычный CFG Scale. Guidance и Distilled CFG — самостоятельные
 // параметры и не должны управлять доступностью Negative prompt.
 function findForgeCfgControlId(schema) {
@@ -398,19 +404,14 @@ function mainDialog(selection, initial, responseSeconds) {
         ui.setFixedWidth(tWH, textWidth);
         try { gGlobal.layout.layout(true); } catch (_) { }
     }
-    function noticeMessage(notice) {
-        if (notice === undefined || notice === null) return "";
-        if (notice.message !== undefined) return String(notice.message);
-        return String(notice);
-    }
     function noticeKey(notice) {
         if (notice && notice.key !== undefined) return String(notice.key);
-        return noticeMessage(notice);
+        return errorMessageText(notice);
     }
     function appendNotices(items) {
         items = items instanceof Array ? items : [];
         for (var i = 0; i < items.length; i++) {
-            var msg = noticeMessage(items[i]), key = noticeKey(items[i]), duplicate = false;
+            var msg = errorMessageText(items[i]), key = noticeKey(items[i]), duplicate = false;
             if (!msg || state.noticeKeysShown[key]) continue;
             for (var j = 0; j < state.notices.length; j++)
                 if (noticeKey(state.notices[j]) == key) { duplicate = true; break; }
@@ -421,7 +422,7 @@ function mainDialog(selection, initial, responseSeconds) {
         if (!state.notices.length) return;
         var lines = [];
         for (var i = 0; i < state.notices.length; i++) {
-            var msg = noticeMessage(state.notices[i]), key = noticeKey(state.notices[i]);
+            var msg = errorMessageText(state.notices[i]), key = noticeKey(state.notices[i]);
             if (!msg || state.noticeKeysShown[key]) continue;
             state.noticeKeysShown[key] = true;
             lines.push(msg);
@@ -755,19 +756,11 @@ function mainDialog(selection, initial, responseSeconds) {
     function sameFsPath(left, right) {
         return !!left && !!right && normalizedFsPath(left) == normalizedFsPath(right);
     }
-    function findWorkflowBySavedPath(items, savedPath) {
-        var root = new Folder(cfg.workflowsFolder || "");
+    function findBySavedPath(items, savedPath, rootPath, pathKey) {
+        var root = new Folder(rootPath || "");
         for (var i = 0; i < items.length; i++) {
-            var relativePath = String(items[i].relative_path || "").replace(/\\/g, "/"),
+            var relativePath = String(items[i][pathKey] || "").replace(/\\/g, "/"),
                 candidate = new File(root.fsName + "/" + relativePath);
-            if (sameFsPath(candidate, savedPath)) return items[i];
-        }
-        return null;
-    }
-    function findForgeSchemaBySavedPath(items, savedPath) {
-        var root = new Folder(cfg.forgeSchemasFolder || backend.defaultForgeFolder() || "");
-        for (var i = 0; i < items.length; i++) {
-            var candidate = new File(root.fsName + "/" + String(items[i].file || ""));
             if (sameFsPath(candidate, savedPath)) return items[i];
         }
         return null;
@@ -830,7 +823,7 @@ function mainDialog(selection, initial, responseSeconds) {
                         progress
                     );
                     state.workflows = backend.refreshWorkflows(progress);
-                    var savedWorkflow = findWorkflowBySavedPath(state.workflows, saved.path);
+                    var savedWorkflow = findBySavedPath(state.workflows, saved.path, cfg.workflowsFolder, "relative_path");
                     if (savedWorkflow) {
                         cfg.selectedWorkflow = cfg.data.selectedWorkflow = savedWorkflow.id;
                         reloadSelectedWorkflow(true, progress, true);
@@ -905,7 +898,7 @@ function mainDialog(selection, initial, responseSeconds) {
                 ui.runWithPaletteProgress(str.progressSaveJson, function (progress) {
                     var saved = api.forgeSchemaSaveValues(schemaId, values, target.fsName, profile.selectedLoras || [], progress);
                     state.forgePresets = backend.refreshForgeSchemas(progress);
-                    var savedSchema = findForgeSchemaBySavedPath(state.forgePresets, saved.path);
+                    var savedSchema = findBySavedPath(state.forgePresets, saved.path, cfg.forgeSchemasFolder || backend.defaultForgeFolder(), "file");
                     if (savedSchema) {
                         cfg.selectedForgePreset = cfg.data.selectedForgePreset = savedSchema.id;
                         loadForgeSchemaState(savedSchema.id, progress, false);
@@ -2517,15 +2510,6 @@ function BackendRuntime() {
             );
         return cfg.getProfile(schema.workflow_id);
     }
-    function schemaItemData(source) {
-        var objectItem = source && typeof source == "object",
-            label = objectItem ? (source.label !== undefined ? source.label : source.value) : source,
-            value = objectItem && source.value !== undefined ? source.value : label;
-        return {
-            label: String(label === undefined ? "" : label),
-            value: value === undefined ? "" : value
-        };
-    }
     function validateSchemaSelections(schema, profile) {
         var res = { notices: [], emptyDropdownIds: [] };
         if (!schema || !profile) return res;
@@ -2556,9 +2540,9 @@ function BackendRuntime() {
                 cur = hasStored ? profile.values[id] : definition.value,
                 found = false;
             for (var j = 0; j < items.length; j++)
-                if (String(schemaItemData(items[j]).value) == String(cur)) { found = true; break; }
+                if (String(itemData(items[j]).value) == String(cur)) { found = true; break; }
             if (found) continue;
-            var replacement = schemaItemData(items[0]),
+            var replacement = itemData(items[0]),
                 previous = cur === undefined || cur === null ? "" : cur,
                 emptySchemaCheckpoint = cleanForgeProfile && !hasStored &&
                     startsWithSemantic(id, "checkpoint") &&
@@ -2722,19 +2706,13 @@ function UI() {
     this.translateButtonWidth = 76;
     this.sliderValueWidth = 65;
     this.autoResizeCheckboxWidth = 20;
-    function describe(source) {
-        var objectItem = source && typeof source == "object",
-            label = objectItem ? (source.label !== undefined ? source.label : source.value) : source,
-            value = objectItem && source.value !== undefined ? source.value : label;
-        return { label: String(label === undefined ? "" : label), value: value === undefined ? "" : value };
-    }
     function itemValue(item) {
         return item && item.controlValue !== undefined ? item.controlValue : (item ? item.text : "");
     }
     function populate(control, items) {
         items = items instanceof Array ? items : [];
         for (var i = 0; i < items.length; i++) {
-            var data = describe(items[i]), item = control.add("item", data.label);
+            var data = itemData(items[i]), item = control.add("item", data.label);
             item.controlValue = data.value;
         }
         return control;
@@ -2986,7 +2964,7 @@ function UI() {
         var items = schema && schema.items instanceof Array ? schema.items : [],
             savedValues = storedValue instanceof Array ? storedValue : [], res = [];
         for (var i = 0; i < items.length; i++) {
-            var value = describe(items[i]).value;
+            var value = itemData(items[i]).value;
             for (var j = 0; j < savedValues.length; j++) {
                 if (String(savedValues[j]) == String(value)) {
                     if (!arrayContains(res, value)) res.push(value);
@@ -3057,7 +3035,7 @@ function UI() {
             filter = String(filter || "").toLowerCase();
             list.removeAll();
             for (var i = 0; i < items.length; i++) {
-                var data = describe(items[i]);
+                var data = itemData(items[i]);
                 if (filter && data.label.toLowerCase().indexOf(filter) < 0) continue;
                 var item = list.add("item", data.label);
                 item.controlValue = data.value;
@@ -3083,7 +3061,7 @@ function UI() {
                 syncVisibleSelection();
                 res = [];
                 for (var i = 0; i < items.length; i++) {
-                    var data = describe(items[i]);
+                    var data = itemData(items[i]);
                     if (selectedMap[valueKey(data.value)]) res.push(data.value);
                 }
             } else {
@@ -3110,6 +3088,43 @@ function UI() {
         var id = String(schema.id || "");
         return id == "modules" || startsWithSemantic(id, "vae") || startsWithSemantic(id, "text_encoder");
     }
+    function addSelectorHost(parent, width, titleText, titleHelp, selectHelp, enabled) {
+        var group = self.addColumn(parent, 0, "top"),
+            header = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:0,margins:0}"),
+            title = header.add("statictext"),
+            add = header.add("button"),
+            selectedHost = group.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}");
+        self.setFixedWidth(group, width);
+        self.setFixedWidth(header, width);
+        title.alignment = ["fill", "center"];
+        title.minimumSize.width = 0;
+        title.text = titleText || "";
+        title.helpTip = titleHelp || "";
+        add.alignment = ["right", "center"];
+        self.setFixedWidth(add, self.presetButtonWidth);
+        add.text = str.presetAddButton;
+        add.helpTip = selectHelp || "";
+        add.enabled = !!enabled;
+        self.setFixedWidth(selectedHost, width);
+        return {
+            group: group,
+            add: add,
+            selectedHost: selectedHost,
+            relayout: function () {
+                try { selectedHost.layout.layout(true); } catch (_) { }
+                try { group.layout.layout(true); } catch (_) { }
+                try {
+                    var owner = group.window || group;
+                    while (owner && owner.parent) owner = owner.parent;
+                    if (owner && owner.layout) {
+                        owner.layout.layout(true);
+                        owner.layout.resize();
+                        if (owner.visible) owner.update();
+                    }
+                } catch (_) { }
+            }
+        };
+    }
     // Выбранные элементы отображаются набором statictext. Это надёжнее
     // listbox в динамически пересобираемом ScriptUI и не создаёт скрытого scroll.
     function addStaticMultiSelect(parent, options) {
@@ -3118,42 +3133,16 @@ function UI() {
             items = options.items instanceof Array ? options.items : [],
             normalize = options.normalize || function (value) { return value instanceof Array ? cloneObj(value) : []; },
             values = normalize(options.storedValue),
-            group = self.addColumn(parent, 0, "top"),
-            header = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:0,margins:0}"),
-            title = header.add("statictext"),
-            add = header.add("button"),
-            selectedHost = group.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}");
-        self.setFixedWidth(group, preferredWidth);
-        self.setFixedWidth(header, preferredWidth);
-        title.alignment = ["fill", "center"];
-        title.minimumSize.width = 0;
-        title.text = options.label || "";
-        title.helpTip = options.help || "";
-        add.alignment = ["right", "center"];
-        self.setFixedWidth(add, self.presetButtonWidth);
-        add.text = str.presetAddButton;
-        add.helpTip = options.selectHelp || "";
-        add.enabled = items.length > 0;
-        self.setFixedWidth(selectedHost, preferredWidth);
+            host = addSelectorHost(parent, preferredWidth, options.label, options.help, options.selectHelp, items.length),
+            group = host.group,
+            add = host.add,
+            selectedHost = host.selectedHost;
         function displayLabel(value) {
             for (var i = 0; i < items.length; i++) {
-                var data = describe(items[i]);
+                var data = itemData(items[i]);
                 if (String(data.value) == String(value)) return data.label;
             }
             return String(value === undefined || value === null ? "" : value);
-        }
-        function relayout() {
-            try { selectedHost.layout.layout(true); } catch (_) { }
-            try { group.layout.layout(true); } catch (_) { }
-            try {
-                var owner = group.window || group;
-                while (owner && owner.parent) owner = owner.parent;
-                if (owner && owner.layout) {
-                    owner.layout.layout(true);
-                    owner.layout.resize();
-                    if (owner.visible) owner.update();
-                }
-            } catch (_) { }
         }
         function openSelector() {
             if (!items.length) return;
@@ -3197,7 +3186,7 @@ function UI() {
                 try { control.visible = true; } catch (_) { }
             }
             try { selectedHost.visible = true; } catch (_) { }
-            relayout();
+            host.relayout();
         }
         add.onClick = openSelector;
         rebuildSelected();
@@ -3225,36 +3214,10 @@ function UI() {
         var normalizedItems = normalizeForgeLoraList(items),
             values = normalizeForgeLoraSelection(normalizedItems, storedValue),
             controlWidth = preferredWidth || self.contentWidth(),
-            group = self.addColumn(parent, 0, "top"),
-            header = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:0,margins:0}"),
-            title = header.add("statictext"),
-            add = header.add("button"),
-            selectedHost = group.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}");
-        self.setFixedWidth(group, controlWidth);
-        self.setFixedWidth(header, controlWidth);
-        title.alignment = ["fill", "center"];
-        title.minimumSize.width = 0;
-        title.text = str.lora;
-        title.helpTip = str.selectLora;
-        add.alignment = ["right", "center"];
-        self.setFixedWidth(add, self.presetButtonWidth);
-        add.text = str.presetAddButton;
-        add.helpTip = str.selectLora;
-        add.enabled = normalizedItems.length > 0;
-        self.setFixedWidth(selectedHost, controlWidth);
-        function relayout() {
-            try { selectedHost.layout.layout(true); } catch (_) { }
-            try { group.layout.layout(true); } catch (_) { }
-            try {
-                var owner = group.window || group;
-                while (owner && owner.parent) owner = owner.parent;
-                if (owner && owner.layout) {
-                    owner.layout.layout(true);
-                    owner.layout.resize();
-                    if (owner.visible) owner.update();
-                }
-            } catch (_) { }
-        }
+            host = addSelectorHost(parent, controlWidth, str.lora, str.selectLora, str.selectLora, normalizedItems.length),
+            group = host.group,
+            add = host.add,
+            selectedHost = host.selectedHost;
         function selectionNames() {
             var names = [];
             for (var i = 0; i < values.length; i++) {
@@ -3328,7 +3291,7 @@ function UI() {
                 }
             }
             try { selectedHost.visible = true; } catch (_) { }
-            relayout();
+            host.relayout();
         }
         add.onClick = openSelector;
         rebuildSelected();
@@ -4455,13 +4418,7 @@ function BridgeApi() {
     }
     function waitForAnswerAfterAck(options) {
         options = options || {};
-        var listener = new Socket();
-        if (!listener.listen(API_PORT_LISTEN, "UTF-8")) throw new Error(str.errListenerPort + API_PORT_LISTEN + ".");
-        try {
-            fire(makeCommand("ack", {}, options.requestId));
-            options.expectedRequestId = options.requestId;
-            return pollListener(listener, options);
-        } finally { try { listener.close(); } catch (_) { } }
+        return requestWithOptions(makeCommand("ack", {}, options.requestId), options);
     }
     function fire(command) { sendCommand(command); }
     function sendCommand(command) {
@@ -5343,18 +5300,14 @@ function AM(target, order) {
         var desc = new AD(); desc.putReference(s2t("null"), ref);
         executeAction(s2t("select"), desc, DialogModes.NO);
     };
-    this.hideSelectedLayers = function () {
+    function setSelectedLayersVisibility(actionName) {
         var ref = new AR(); ref.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
         var list = new ActionList(); list.putReference(ref);
         var desc = new AD(); desc.putList(s2t("null"), list);
-        executeAction(s2t("hide"), desc, DialogModes.NO);
-    };
-    this.showSelectedLayers = function () {
-        var ref = new AR(); ref.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
-        var list = new ActionList(); list.putReference(ref);
-        var desc = new AD(); desc.putList(s2t("null"), list);
-        executeAction(s2t("show"), desc, DialogModes.NO);
-    };
+        executeAction(s2t(actionName), desc, DialogModes.NO);
+    }
+    this.hideSelectedLayers = function () { setSelectedLayersVisibility("hide"); };
+    this.showSelectedLayers = function () { setSelectedLayersVisibility("show"); };
     this.setName = function (name) {
         var ref = new AR(); ref.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
         var desc = new AD(); desc.putReference(s2t("null"), ref);
