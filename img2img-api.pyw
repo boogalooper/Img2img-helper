@@ -44,7 +44,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.17"
+VERSION = "0.171"
 
 # Единый объект идентичности приложения. Пользовательские каталоги, имена
 # служебных файлов и расположение поставляемых схем вычисляются только отсюда.
@@ -447,6 +447,63 @@ def format_http_error_body(raw_body: str, limit: int = 12000) -> str:
     if len(formatted) > limit:
         formatted = formatted[:limit].rstrip() + "\n\n… message truncated"
     return formatted
+
+
+def normalize_output_format(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text == "jpeg":
+        text = "jpg"
+    return "png" if text == "png" else "jpg"
+
+
+def _detect_image_suffix(content: bytes) -> str:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if content[:2] == b"\xff\xd8":
+        return ".jpg"
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return ".webp"
+    return ".bin"
+
+
+def _save_image_content_for_photoshop(
+    content: bytes,
+    destination_without_suffix: Path,
+    output_format: Any,
+) -> Path:
+    requested = normalize_output_format(output_format)
+    detected_suffix = _detect_image_suffix(content)
+    target_suffix = ".png" if requested == "png" else ".jpg"
+    destination = destination_without_suffix.with_suffix(target_suffix)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if detected_suffix == target_suffix:
+        destination.write_bytes(content)
+        return destination
+    image_module = PIL_IMAGE_MODULE
+    image_ops_module = PIL_IMAGE_OPS_MODULE
+    if image_module is None or image_ops_module is None:
+        raise UserVisibleError(
+            "Pillow was not initialized during Python startup. "
+            f"Restart {APP_NAME}. Log: {LOG_FILE}"
+        )
+    try:
+        with image_module.open(io.BytesIO(content)) as source:
+            source.load()
+            image = image_ops_module.exif_transpose(source)
+            if requested == "png":
+                bands = image.getbands()
+                if "A" in bands or image.mode in {"P", "LA"}:
+                    image = image.convert("RGBA")
+                else:
+                    image = image.convert("RGB")
+                image.save(str(destination), format="PNG", compress_level=6)
+            else:
+                if image.mode not in {"RGB", "L"}:
+                    image = image.convert("RGB")
+                image.save(str(destination), format="JPEG", quality=95)
+    except Exception as exc:
+        raise UserVisibleError("Could not convert the generated image for Photoshop.") from exc
+    return destination
 
 
 def is_link(value: Any) -> bool:
@@ -1001,20 +1058,34 @@ class ComfyClient:
         image_info: Dict[str, Any],
         destination: Path,
         quality: int = 95,
+        output_format: Any = "jpg",
     ) -> Path:
-        """Скачивает output в формате, который Photoshop сможет разместить.
+        """Скачивает output в формате, удобном для размещения в Photoshop.
 
-        Сначала используется быстрый ``preview=jpeg``. Если preview-конвертация
-        отсутствует, запрашивается RGB PNG; последним fallback скачивается
-        исходный PNG/JPEG/WebP. Pillow для этого не требуется.
+        ``jpg`` использует быстрый ``preview=jpeg`` и при необходимости
+        локально конвертирует fallback PNG/WebP. ``png`` скачивает исходный
+        output, чтобы по возможности сохранить transparency.
         """
 
         quality = max(1, min(100, int(quality)))
+        requested_format = normalize_output_format(output_format)
         base_query = {
             "filename": image_info.get("filename", ""),
             "subfolder": image_info.get("subfolder", ""),
             "type": image_info.get("type", "output"),
         }
+
+        if requested_format == "png":
+            raw = self._request(
+                "GET",
+                "/view?" + urllib.parse.urlencode(base_query),
+                timeout=120,
+            )
+            if _detect_image_suffix(raw) == ".bin":
+                raise UserVisibleError(
+                    "ComfyUI returned an unknown image format through /view."
+                )
+            return _save_image_content_for_photoshop(raw, destination, "png")
 
         preview_raw: Optional[bytes] = None
         preview_query = dict(base_query)
@@ -1026,7 +1097,6 @@ class ComfyClient:
                 timeout=120,
             )
         except UserVisibleError:
-            # Fallback ниже запросит оригинальный файл.
             preview_raw = None
 
         if preview_raw and preview_raw[:2] == b"\xff\xd8":
@@ -1035,9 +1105,6 @@ class ComfyClient:
             destination.write_bytes(preview_raw)
             return destination
 
-        # Если preview-конвертация отсутствует, сначала просим RGB-версию.
-        # Совместимые серверы обычно возвращают PNG, который поддерживается
-        # даже старыми Photoshop лучше, чем WebP.
         rgb_raw: Optional[bytes] = None
         rgb_query = dict(base_query)
         rgb_query["channel"] = "rgb"
@@ -1050,33 +1117,24 @@ class ComfyClient:
         except UserVisibleError:
             rgb_raw = None
 
-        if rgb_raw and rgb_raw.startswith(b"\x89PNG\r\n\x1a\n"):
-            raw, suffix = rgb_raw, ".png"
-        elif rgb_raw and rgb_raw[:2] == b"\xff\xd8":
-            raw, suffix = rgb_raw, ".jpg"
-        else:
-            raw = self._request(
-                "GET",
-                "/view?" + urllib.parse.urlencode(base_query),
-                timeout=120,
-            )
-            if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-                suffix = ".png"
-            elif raw[:2] == b"\xff\xd8":
-                suffix = ".jpg"
-            elif raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
-                suffix = ".webp"
-            else:
+        if rgb_raw:
+            if _detect_image_suffix(rgb_raw) == ".bin":
                 raise UserVisibleError(
                     "ComfyUI returned an unknown image format through /view."
                 )
+            return _save_image_content_for_photoshop(rgb_raw, destination, "jpg")
 
-        destination = destination.with_suffix(suffix)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(raw)
-        return destination
+        raw = self._request(
+            "GET",
+            "/view?" + urllib.parse.urlencode(base_query),
+            timeout=120,
+        )
+        if _detect_image_suffix(raw) == ".bin":
+            raise UserVisibleError(
+                "ComfyUI returned an unknown image format through /view."
+            )
+        return _save_image_content_for_photoshop(raw, destination, "jpg")
 
-    @staticmethod
     def format_node_errors(node_errors: Any) -> str:
         if not isinstance(node_errors, dict):
             return f"Workflow validation error: {node_errors}"
@@ -5379,11 +5437,14 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         raise UserVisibleError("ComfyUI completed the task, but history was not found.")
 
     image_info = select_output_image(history_entry, analysis["bindings"]["output_image"])
-    # /view конвертирует стандартный PNG/WebP output ComfyUI в JPEG на
-    # лету. Обычно Photoshop получает небольшой .jpg; fallback возвращает PNG
-    # или исходный формат, если preview-конвертация недоступна.
-    destination = output_dir / f"{now_timestamp()}-{safe_filename(workflow_file.name)}.jpg"
-    destination = client.download_image_for_photoshop(image_info, destination, quality=95)
+    output_format = normalize_output_format(message.get("output_format"))
+    destination = output_dir / f"{now_timestamp()}-{safe_filename(workflow_file.name)}.{output_format}"
+    destination = client.download_image_for_photoshop(
+        image_info,
+        destination,
+        quality=95,
+        output_format=output_format,
+    )
 
     # init/ACK уже выполнен либо при переходе prompt в queue_running, либо в
     # fast-completion ветке выше. Поэтому итоговый путь всегда относится ко

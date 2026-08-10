@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.154",
+    VER = "0.155",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -466,7 +466,7 @@ function mainDialog(selection, initial, responseSeconds) {
         if (!workflow) return false;
         cfg.selectedWorkflow = cfg.data.selectedWorkflow = workflow.id;
         var profile = cfg.getProfile(workflow.id), previous = cloneObj(profile.bindingOverrides);
-        applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "resize", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles"]);
+        applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "resize", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat"]);
         if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" };
         if (profile.bindingOverrides.mask === undefined) profile.bindingOverrides.mask = "";
         if (!(profile.bindingOverrides.references instanceof Array)) profile.bindingOverrides.references = [];
@@ -1098,6 +1098,12 @@ function mainDialog(selection, initial, responseSeconds) {
                 noneText: str.none,
                 sizeLabel: str.sizeMultiple,
                 sizeValue: profile.sizeMultiple || cfg.sizeMultiple,
+                outputFormatLabel: str.outputImageFormat,
+                outputFormatValue: profile.outputFormat,
+                outputFormatItems: [
+                    { label: "JPG", value: "jpg" },
+                    { label: "PNG", value: "png" }
+                ],
                 // Для generic Comfy controls пользователю полезнее видеть
                 // понятное имя ноды и стабильный internal control id, который
                 // используется в binding. Хвост вида "[#170:168]: value" здесь
@@ -1112,6 +1118,8 @@ function mainDialog(selection, initial, responseSeconds) {
                 if (!bindings.apply()) return false;
                 profile.visibleControls = editor.selectedIds();
                 profile.sizeMultiple = clamp(parseInt(editor.multiple.text, 10) || cfg.sizeMultiple, 1, 256);
+                profile.outputFormat = normalizeOutputFormat(editor.outputFormat && editor.outputFormat.selection
+                    ? editor.outputFormat.selection.controlValue : "jpg");
                 return true;
             }
         });
@@ -1772,6 +1780,7 @@ function GenerationRuntime() {
                     values: values,
                     references: collectReferenceFiles(schema, profile),
                     binding_overrides: profile.bindingOverrides,
+                    output_format: normalizeOutputFormat(profile.outputFormat),
                     timeout: cfg.generationTimeout
                 };
             }
@@ -1805,6 +1814,18 @@ function GenerationRuntime() {
             // Метаданные записывают именно отправленные значения и профиль
             // размещения. LOAD может затем воспроизвести состояние независимо
             // от текущих настроек главного окна.
+            var metadataProfile = {
+                autoResize: profile.autoResize,
+                resizePreset: profile.resizePreset,
+                resize: profile.resize,
+                manualScale: profile.manualScale,
+                sizeMultiple: resolveProfileSizeMultiple(schema, profile),
+                selectedLoras: currentBackend == BACKEND_FORGE ? cloneObj(profile.selectedLoras) : [],
+                bindingOverrides: currentBackend == BACKEND_COMFY ? cloneObj(profile.bindingOverrides) : {},
+                referenceFiles: currentBackend == BACKEND_COMFY ? cloneObj(profile.referenceFiles) : {},
+                imageStitchInputs: currentBackend == BACKEND_FORGE ? cloneObj(profile.imageStitchInputs) : []
+            };
+            if (currentBackend == BACKEND_COMFY) metadataProfile.outputFormat = normalizeOutputFormat(profile.outputFormat);
             layerMetadata.set({
                 backend: currentBackend,
                 workspace_id: currentBackend == BACKEND_FORGE
@@ -1816,17 +1837,7 @@ function GenerationRuntime() {
                 prompt_id: typeof answer == "object" ? answer.prompt_id || "" : "",
                 values: values,
                 generated_seeds: typeof answer == "object" ? answer.generated_seeds || {} : {},
-                profile: {
-                    autoResize: profile.autoResize,
-                    resizePreset: profile.resizePreset,
-                    resize: profile.resize,
-                    manualScale: profile.manualScale,
-                    sizeMultiple: resolveProfileSizeMultiple(schema, profile),
-                    selectedLoras: currentBackend == BACKEND_FORGE ? cloneObj(profile.selectedLoras) : [],
-                    bindingOverrides: currentBackend == BACKEND_COMFY ? cloneObj(profile.bindingOverrides) : {},
-                    referenceFiles: currentBackend == BACKEND_COMFY ? cloneObj(profile.referenceFiles) : {},
-                    imageStitchInputs: currentBackend == BACKEND_FORGE ? cloneObj(profile.imageStitchInputs) : []
-                },
+                profile: metadataProfile,
                 width: width,
                 height: height
             });
@@ -2825,14 +2836,30 @@ function UI() {
         recommended.onClick = function () { applySelection("recommended"); };
         all.onClick = function () { applySelection("all"); };
         none.onClick = function () { applySelection("none"); };
-        var multipleRow = parent.add("group{orientation:'row',alignChildren:['left','center'],spacing:5,margins:0}"),
-            multipleTitle = multipleRow.add("statictext{preferredSize:[175,-1]}"),
-            multiple = multipleRow.add("edittext{preferredSize:[80,-1]}");
+        var fieldLabelWidth = 175,
+            fieldControlWidth = 80,
+            multipleRow = parent.add("group{orientation:'row',alignChildren:['left','center'],spacing:5,margins:0}"),
+            multipleTitle = multipleRow.add("statictext"),
+            multiple = multipleRow.add("edittext"),
+            outputFormat = null;
+        self.setFixedWidth(multipleTitle, fieldLabelWidth);
+        self.setFixedWidth(multiple, fieldControlWidth);
         multipleTitle.text = options.sizeLabel || "";
         multiple.text = String(options.sizeValue === undefined ? "" : options.sizeValue);
+        if (options.outputFormatLabel) {
+            var formatRow = parent.add("group{orientation:'row',alignChildren:['left','center'],spacing:5,margins:0}"),
+                formatTitle = formatRow.add("statictext");
+            outputFormat = formatRow.add("dropdownlist");
+            self.setFixedWidth(formatTitle, fieldLabelWidth);
+            self.setFixedWidth(outputFormat, fieldControlWidth);
+            formatTitle.text = options.outputFormatLabel;
+            populate(outputFormat, options.outputFormatItems || []);
+            restore(outputFormat, normalizeOutputFormat(options.outputFormatValue), false, 0);
+        }
         return {
             list: list,
             multiple: multiple,
+            outputFormat: outputFormat,
             selectedIds: function () {
                 var res = [];
                 for (var j = 0; j < list.items.length; j++)
@@ -5001,7 +5028,7 @@ function Config() {
             bindingOverrides: { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" },
             referenceFiles: {}, sizeMultiple: self.sizeMultiple,
             autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
-            resize: 1, manualScale: 1,
+            outputFormat: "jpg", resize: 1, manualScale: 1,
             schemaCache: null, schemaCacheStamp: null, schemaCacheVersion: 0
         };
         normalizeBaseProfile(profile);
@@ -5015,6 +5042,7 @@ function Config() {
         if (bindings.sizeMode !== "source_image" && bindings.sizeMode !== "binding") bindings.sizeMode = "auto";
         if (bindings.size === undefined || bindings.sizeMode != "binding") bindings.size = "";
         if (!isObjectMap(profile.referenceFiles)) profile.referenceFiles = {};
+        profile.outputFormat = normalizeOutputFormat(profile.outputFormat);
         if (profile.sizeMultiple === undefined) profile.sizeMultiple = self.sizeMultiple;
         profile.sizeMultiple = clamp(parseInt(profile.sizeMultiple, 10) || self.sizeMultiple, 1, 256);
         return profile;
@@ -5520,6 +5548,9 @@ function Locale() {
         scriptSettings: ["Настройки скрипта", "Script settings"],
         sizeFromInput: ["В workflow нет width/height: итоговый размер задаётся загруженным JPEG.", "The workflow has no width/height: size is defined by the uploaded JPEG."],
         sizeMultiple: ["Кратность width/height:", "Width/height multiple:"],
+        outputImageFormat: ["Формат результата:", "Output format:"],
+        outputFormatJpg: ["JPG (быстрее, без прозрачности)", "JPG (faster, no transparency)"],
+        outputFormatPng: ["PNG (с прозрачностью, медленнее)", "PNG (with transparency, slower)"],
         sizeWorkflowBinding: ["Размер будет записан в обнаруженные поля workflow.", "Size will be written to the detected workflow fields."], secondsShort: ["с", "s"],
         visibleParameters: ["Параметры главного окна", "Main-window parameters"], workflowFolder: ["Папка API-workflow:", "API workflow folder:"],
         forgeSchemaFolder: ["Папка схем Forge:", "Forge schema folder:"], workflowSettings: ["Настройки workflow", "Workflow settings"],
@@ -5676,6 +5707,11 @@ function numberPrecision(value) {
 }
 function formatNumber(value, integer, precision) {
     return integer ? String(Math.round(value)) : Number(value).toFixed(precision === undefined ? 2 : precision);
+}
+function normalizeOutputFormat(value) {
+    var format = String(value || "").toLowerCase();
+    if (format == "jpeg") format = "jpg";
+    return format == "png" ? "png" : "jpg";
 }
 function arrayContains(array, value) { if (!array) return false; for (var i = 0; i < array.length; i++) if (array[i] == value) return true; return false; }
 function normalizedBindingOverrides(value) {
