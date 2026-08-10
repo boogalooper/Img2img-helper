@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import base64
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import importlib
@@ -44,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.173"
+VERSION = "0.172"
 
 # Единый объект идентичности приложения. Пользовательские каталоги, имена
 # служебных файлов и расположение поставляемых схем вычисляются только отсюда.
@@ -243,6 +244,10 @@ if not LOGGER.handlers:
 
 STARTUP_PROCESS_STARTED_AT = time.time()
 STARTUP_STATUS_LOCK = threading.Lock()
+STARTUP_STATUS: Dict[str, Any] = {
+    "status": "starting",
+    "message": "Starting Python API",
+}
 
 
 def write_startup_status(status: str, message: str = "") -> None:
@@ -263,6 +268,8 @@ def write_startup_status(status: str, message: str = "") -> None:
     )
     try:
         with STARTUP_STATUS_LOCK:
+            STARTUP_STATUS.clear()
+            STARTUP_STATUS.update(payload)
             temp_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -274,6 +281,11 @@ def write_startup_status(status: str, message: str = "") -> None:
         except OSError:
             pass
         LOGGER.warning("Could not write Python startup status: %s", STARTUP_FILE)
+
+
+def startup_status_snapshot() -> Dict[str, Any]:
+    with STARTUP_STATUS_LOCK:
+        return copy.deepcopy(STARTUP_STATUS)
 
 
 def remove_startup_status() -> None:
@@ -327,7 +339,9 @@ def ensure_python_module(import_name: str, package_name: str = "") -> Any:
 
     package = package_name or import_name
     LOGGER.info("Module %s was not found; starting automatic installation of %s", import_name, package)
-    write_startup_status("installing", f"Installing Python module: {package}")
+    # Состояние installing публикуется только после реального ImportError.
+    # Обычный запуск с уже установленным модулем не показывает этот этап JSX.
+    write_startup_status("installing", package)
 
     if not _run_python_module(["pip", "--version"], timeout=60):
         LOGGER.info("pip is unavailable; running ensurepip")
@@ -370,10 +384,9 @@ PIL_IMAGE_OPS_MODULE: Any = None
 def prepare_required_modules() -> None:
     """Checks and installs all third-party modules required by the helper.
 
-    Dependency preparation happens before the local API socket is opened, so a
-    successfully started server is immediately ready for both prompt
-    translation and Forge ImageStitch. Internet is only required when one of
-    the packages is absent and pip must download it.
+    The local API socket is already open while this function runs. JSX polls
+    the lightweight ping command and receives installing only after a real
+    ImportError. Other API commands remain gated until the state becomes ready.
     """
 
     global DEEP_TRANSLATOR_MODULE, PIL_IMAGE_MODULE, PIL_IMAGE_OPS_MODULE
@@ -3476,14 +3489,22 @@ def resolve_forge_schema_dir(schema_folder: Any = "") -> Path:
     raise UserVisibleError("Forge schema folder was not found. Select it in the script settings.")
 
 
-def _read_forge_schema_file(path: Path, schema_dir: Path, stack: Optional[Set[str]] = None) -> Dict[str, Any]:
+def _read_forge_schema_file(
+    path: Path,
+    schema_dir: Path,
+    stack: Optional[Set[str]] = None,
+    source: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     stack = set(stack or set())
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except OSError as exc:
-        raise UserVisibleError(f"Could not read Forge schema: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise UserVisibleError(f"Invalid Forge schema JSON {path.name}: {exc}") from exc
+    if source is None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except OSError as exc:
+            raise UserVisibleError(f"Could not read Forge schema: {path}") from exc
+        except json.JSONDecodeError as exc:
+            raise UserVisibleError(f"Invalid Forge schema JSON {path.name}: {exc}") from exc
+    else:
+        data = copy.deepcopy(source)
     if not isinstance(data, dict):
         raise UserVisibleError(f"Forge schema {path.name} must be a JSON object.")
     if data.get("kind") != FORGE_SCHEMA_KIND or str(data.get("backend")) != "forge":
@@ -3547,7 +3568,7 @@ def list_forge_schemas(
             # Validate abstract base schemas too. They are not shown in the UI,
             # but a broken base would otherwise make all derived presets vanish
             # later with a less useful error.
-            _read_forge_schema_file(path, schema_dir)
+            _read_forge_schema_file(path, schema_dir, source=raw)
             if raw.get("abstract"):
                 continue
             # Runtime/profile identity is the JSON filename, not the optional
@@ -3572,54 +3593,65 @@ def list_forge_schemas(
 
 def get_forge_schema(schema_id: str, schema_folder: Any = "") -> Dict[str, Any]:
     schema_id = str(schema_id or "").strip()
-    items, schema_dir, _invalid_schemas = list_forge_schemas(schema_folder)
-    for item in items:
-        if item["id"] != schema_id:
-            continue
-        schema = _read_forge_schema_file(schema_dir / item["file"], schema_dir)
-        schema["workspace_id"] = schema_id
-        schema["workflow_id"] = "forge:" + schema_id
-        schema["workflow_name"] = str(schema.get("label") or schema_id)
-        schema["relative_path"] = item["file"]
-        schema["valid"] = True
-        schema["diagnostics"] = []
-        default_size_multiple = 16
-        try:
-            size_multiple = int(schema.get("size_multiple", default_size_multiple))
-        except (TypeError, ValueError):
-            size_multiple = default_size_multiple
-        schema["size_multiple"] = max(1, min(256, size_multiple))
-        controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
-        # Для Forge список полей главного окна полностью определяется visible
-        # в JSON-схеме. ComfyUI по-прежнему формирует рекомендации анализатором.
-        schema["recommended_controls"] = [
-            str(control.get("id"))
-            for control in controls
-            if isinstance(control, dict)
-            and control.get("id")
-            and (bool(control.get("visible")) or bool(control.get("required_visible")))
-        ]
-        capabilities = schema.get("capabilities") if isinstance(schema.get("capabilities"), dict) else {}
-        generation = schema.get("generation") if isinstance(schema.get("generation"), dict) else {}
-        input_mode = str(generation.get("input_mode") or "img2img").strip().lower()
-        image_stitch = schema.get("image_stitch") if isinstance(schema.get("image_stitch"), dict) else {}
-        stitch_supported = _forge_bool(capabilities.get("image_stitch")) and input_mode != "single_image"
-        capabilities["image_stitch"] = stitch_supported
-        capabilities["max_image_inputs"] = _forge_image_stitch_limit(capabilities)
-        schema["capabilities"] = capabilities
-        if (
-            stitch_supported
-            and _forge_bool(image_stitch.get("visible"))
-            and "image_stitch" not in schema["recommended_controls"]
-        ):
-            schema["recommended_controls"].append("image_stitch")
-        schema["image_stitch_default"] = (
-            _forge_bool(schema.get("image_stitch_default", False))
-            if stitch_supported else False
-        )
-        schema.setdefault("bindings", {"reference_images": []})
-        return schema
-    raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
+    schema_dir = resolve_forge_schema_dir(schema_folder)
+    if not schema_id or Path(schema_id).name != schema_id or schema_id in {".", ".."}:
+        raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
+    path = (schema_dir / f"{schema_id}.json").resolve()
+    if path.parent != schema_dir or not path.is_file():
+        raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except OSError as exc:
+        raise UserVisibleError(f"Could not read Forge schema: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise UserVisibleError(f"Invalid Forge schema JSON {path.name}: {exc}") from exc
+    if not isinstance(raw, dict) or raw.get("kind") != FORGE_SCHEMA_KIND or raw.get("backend") != "forge":
+        raise UserVisibleError(f"File {path.name} is not an {APP_NAME} Forge schema.")
+    if raw.get("abstract"):
+        raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
+    schema = _read_forge_schema_file(path, schema_dir, source=raw)
+    schema["workspace_id"] = schema_id
+    schema["workflow_id"] = "forge:" + schema_id
+    schema["workflow_name"] = str(schema.get("label") or schema_id)
+    schema["relative_path"] = path.name
+    schema["valid"] = True
+    schema["diagnostics"] = []
+    default_size_multiple = 16
+    try:
+        size_multiple = int(schema.get("size_multiple", default_size_multiple))
+    except (TypeError, ValueError):
+        size_multiple = default_size_multiple
+    schema["size_multiple"] = max(1, min(256, size_multiple))
+    controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
+    # Для Forge список полей главного окна полностью определяется visible
+    # в JSON-схеме. ComfyUI по-прежнему формирует рекомендации анализатором.
+    schema["recommended_controls"] = [
+        str(control.get("id"))
+        for control in controls
+        if isinstance(control, dict)
+        and control.get("id")
+        and (bool(control.get("visible")) or bool(control.get("required_visible")))
+    ]
+    capabilities = schema.get("capabilities") if isinstance(schema.get("capabilities"), dict) else {}
+    generation = schema.get("generation") if isinstance(schema.get("generation"), dict) else {}
+    input_mode = str(generation.get("input_mode") or "img2img").strip().lower()
+    image_stitch = schema.get("image_stitch") if isinstance(schema.get("image_stitch"), dict) else {}
+    stitch_supported = _forge_bool(capabilities.get("image_stitch")) and input_mode != "single_image"
+    capabilities["image_stitch"] = stitch_supported
+    capabilities["max_image_inputs"] = _forge_image_stitch_limit(capabilities)
+    schema["capabilities"] = capabilities
+    if (
+        stitch_supported
+        and _forge_bool(image_stitch.get("visible"))
+        and "image_stitch" not in schema["recommended_controls"]
+    ):
+        schema["recommended_controls"].append("image_stitch")
+    schema["image_stitch_default"] = (
+        _forge_bool(schema.get("image_stitch_default", False))
+        if stitch_supported else False
+    )
+    schema.setdefault("bindings", {"reference_images": []})
+    return schema
 
 
 FORGE_CATALOG_SOURCES = {
@@ -5627,8 +5659,15 @@ def probe_backends(host: str, comfy_port: int, forge_port: int, *,
     """
 
     normalized_host = normalize_comfy_host(host)
-    comfy = _probe_comfy(normalized_host, int(comfy_port), update_runtime=update_runtime)
-    forge = _probe_forge(normalized_host, int(forge_port))
+    # Оба HTTP-probe независимы. Параллельный запуск сохраняет полную проверку,
+    # но её длительность определяется более медленным backend, а не их суммой.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="BackendProbe") as executor:
+        comfy_future = executor.submit(
+            _probe_comfy, normalized_host, int(comfy_port), update_runtime=update_runtime
+        )
+        forge_future = executor.submit(_probe_forge, normalized_host, int(forge_port))
+        comfy = comfy_future.result()
+        forge = forge_future.result()
     return _compose_backend_status(comfy, forge)
 
 
@@ -5671,6 +5710,10 @@ def detect_backends(*, force_full: bool = False) -> Dict[str, Any]:
 
     host, comfy_port, forge_port = endpoints
     previous_backends = cached.get("backends") if isinstance(cached.get("backends"), dict) else {}
+    if "comfy" in cached_available and "forge" in cached_available:
+        return _store_backend_status(
+            probe_backends(host, comfy_port, forge_port, update_runtime=True), endpoints
+        )
     if "comfy" in cached_available:
         comfy = _probe_comfy(host, comfy_port, update_runtime=True)
     else:
@@ -5777,8 +5820,34 @@ def handle_command(command: Dict[str, Any]) -> None:
             )
 
         if command_type == "ping":
-            answer({"ok": True, "version": VERSION, "protocol": API_PROTOCOL}, request_id)
+            startup = startup_status_snapshot()
+            answer({
+                "ok": True,
+                "version": VERSION,
+                "protocol": API_PROTOCOL,
+                "startup_status": str(startup.get("status") or "starting"),
+                "startup_message": str(startup.get("message") or ""),
+                "startup_log_file": str(startup.get("log_file") or LOG_FILE),
+            }, request_id)
+            # После передачи startup-ошибки завершаем этот процесс, чтобы
+            # следующий запуск JSX мог повторить подготовку зависимостей.
+            if str(startup.get("status") or "") == "error":
+                WORKER_STOP.set()
+                try:
+                    with socket.create_connection((API_HOST, API_RECEIVE_PORT), timeout=1):
+                        pass
+                except OSError:
+                    pass
             return
+
+        startup = startup_status_snapshot()
+        startup_state = str(startup.get("status") or "starting")
+        if startup_state != "ready":
+            if startup_state == "error":
+                raise UserVisibleError(
+                    str(startup.get("message") or "Python API startup failed.")
+                )
+            raise UserVisibleError("Python API is still initializing.")
 
         if command_type == "handshake":
             answer(apply_handshake(message), request_id)
@@ -6048,15 +6117,28 @@ def load_runtime_file() -> None:
         LOGGER.warning("Could not read runtime.json")
 
 
+def initialize_server_runtime() -> None:
+    """Prepare optional dependencies while the lightweight API is responsive."""
+
+    try:
+        prepare_required_modules()
+        load_runtime_file()
+    except Exception as exc:
+        log_exception("Critical Python initialization error")
+        write_startup_status("error", str(exc) or exc.__class__.__name__)
+        return
+    write_startup_status("ready", "Python API is ready")
+    # Очистка не влияет на готовность API и выполняется в уже существующем
+    # InitializationWorker после публикации ready. Файлы текущих запросов моложе
+    # TEMP_MAX_AGE_SECONDS, поэтому параллельная генерация с ней не конфликтует.
+    try:
+        cleanup_old_temp_files()
+    except Exception:
+        log_exception("Background temporary-file cleanup failed")
+
+
 # Создаёт lock/runtime-файлы, запускает workers и принимает команды до idle timeout.
 def start_local_server() -> None:
-    # Проверяем и при необходимости устанавливаем зависимости до открытия
-    # локального API. После успешного старта translate и ImageStitch больше не
-    # запускают pip посреди пользовательской операции.
-    prepare_required_modules()
-    cleanup_old_temp_files()
-    load_runtime_file()
-
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -6078,16 +6160,24 @@ def start_local_server() -> None:
     write_lock_file()
     atexit.register(remove_lock_file)
 
+    server.listen(8)
+    server.settimeout(1.0)
+    write_startup_status("starting", "Preparing Python API")
+
+    initialization_thread = threading.Thread(
+        target=initialize_server_runtime,
+        name="InitializationWorker",
+        daemon=True,
+    )
+    initialization_thread.start()
+
     worker_thread = threading.Thread(target=generation_worker, name="GenerationWorker", daemon=True)
     worker_thread.start()
     watcher_thread = threading.Thread(target=idle_watcher, name="IdleWatcher", daemon=True)
     watcher_thread.start()
 
-    server.listen(8)
-    server.settimeout(1.0)
-    write_startup_status("ready", "Python API is ready")
     LOGGER.info(
-        "%s %s started. API %s:%s, host %s, ComfyUI port %s, log=%s",
+        "%s %s listener started. API %s:%s, host %s, ComfyUI port %s, log=%s",
         APP_NAME,
         VERSION,
         API_HOST,

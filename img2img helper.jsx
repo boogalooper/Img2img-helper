@@ -21,6 +21,7 @@ var APP = {
     uuid: "5f6f57dc-80c8-49b4-9ea9-405d132b7b30",
     settingsFile: "img2img helper.desc",
     tempFolder: "img2img helper",
+    startupFile: "state/startup.json",
     generatedLayerName: "generated image",
     dialogEnvKey: "img2imgHelperDialogMode",
     cancelToken: "__IMG2IMG_HELPER_CANCELLED__",
@@ -199,14 +200,37 @@ function init() {
             backendChangedAtStartup = backend.normalizeActiveBackend();
             if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
         }
-        var initial = backend.loadInitialData(startupProgress),
-            responseSeconds = Math.round((((new Date()).getTime() - startupStartedAt) / 1000) * 100) / 100;
+        // Полный каталог нужен интерфейсу, но не тихой генерации с уже
+        // сохранённым workflow/preset. При предупреждениях или смене backend
+        // сразу используем полный путь, поскольку окно всё равно будет открыто.
+        var allowFastInitialLoad = !showInterface && !backendChangedAtStartup && !settingsWarnings.length,
+            initial = backend.loadInitialData(startupProgress, allowFastInitialLoad);
         initial.notices = settingsWarnings.concat(initial.notices instanceof Array ? initial.notices : []);
         if (backendChangedAtStartup || initial.forceDialog || initial.notices.length ||
             (initial.emptyDropdownIds instanceof Array && initial.emptyDropdownIds.length)) {
             showInterface = true;
             $.setenv(APP.dialogEnvKey, "true");
         }
+        // Быстрый путь мог сам обнаружить причину для показа окна (например,
+        // исчезнувшее значение dropdown). Перед созданием UI один раз получаем
+        // актуальный полный список, сохраняя уже сформированные уведомления.
+        if (showInterface && initial.fastPath) {
+            var fastNotices = initial.notices instanceof Array ? initial.notices : [],
+                fullInitial = backend.loadInitialData(startupProgress, false),
+                fullNotices = fullInitial.notices instanceof Array ? fullInitial.notices : [],
+                seenNotices = {}, mergedNotices = [], notice, noticeKey, ni;
+            for (ni = 0; ni < fastNotices.length + fullNotices.length; ni++) {
+                notice = ni < fastNotices.length ? fastNotices[ni] : fullNotices[ni - fastNotices.length];
+                noticeKey = String(notice && (notice.key || notice.message) || "");
+                if (noticeKey && seenNotices[noticeKey]) continue;
+                if (noticeKey) seenNotices[noticeKey] = true;
+                mergedNotices.push(notice);
+            }
+            initial = fullInitial;
+            initial.notices = mergedNotices;
+            initial.forceDialog = true;
+        }
+        var responseSeconds = Math.round((((new Date()).getTime() - startupStartedAt) / 1000) * 100) / 100;
         if (startupProgress) {
             startupProgress.complete(); startupProgress.close(); startupProgress = null;
         }
@@ -2401,6 +2425,23 @@ function BackendRuntime() {
         return chooseItem(workflows, cfg.selectedWorkflow, str.workflow, workflowLabel, "workflow");
     }
     function findWorkflow(workflows, workflowId) { return findItem(workflows, workflowId); }
+    function fastWorkflowSelection() {
+        var workflowId = String(cfg.selectedWorkflow || ""),
+            items = cfg.workflowCatalog instanceof Array ? cfg.workflowCatalog : [],
+            selected = findWorkflow(items, workflowId),
+            profile = workflowId ? cfg.getProfile(workflowId) : null,
+            relativePath = String(selected && selected.relative_path || profile && profile.relativePath || "");
+        if (!workflowId || !relativePath || !comfyFolderReady()) return null;
+        var file = new File(cfg.workflowsFolder + "/" + relativePath);
+        if (!file.exists) return null;
+        if (!selected) {
+            selected = { id: workflowId, name: file.displayName || file.name, relative_path: relativePath };
+            // Каталоги не записываются в Action, поэтому для его тихого запуска
+            // достаточно единственного синтетического элемента выбранного файла.
+            items = [selected];
+        }
+        return { items: items, selected: selected };
+    }
     function refreshForgeSchemas(progress) {
         if (!ensureForgeFolder(true)) {
             cfg.forgeCatalog = cfg.data.forgeCatalog = [];
@@ -2428,6 +2469,20 @@ function BackendRuntime() {
     // Runtime identity is always the JSON filename supplied as item.id.
     // Copies with the same internal schema id therefore have separate profiles.
     function findForgeSchema(items, presetId) { return findItem(items, presetId); }
+    function fastForgeSelection() {
+        var presetId = String(cfg.selectedForgePreset || ""),
+            items = cfg.forgeCatalog instanceof Array ? cfg.forgeCatalog : [],
+            selected = findForgeSchema(items, presetId);
+        if (!presetId || !ensureForgeFolder(false)) return null;
+        var fileName = String(selected && selected.file || presetId + ".json"),
+            file = new File(cfg.forgeSchemasFolder + "/" + fileName);
+        if (!file.exists) return null;
+        if (!selected) {
+            selected = { id: presetId, label: presetId, file: fileName };
+            items = [selected];
+        }
+        return { items: items, selected: selected };
+    }
     function forgeLoraNoticeList(names) {
         var parts = [];
         for (var i = 0; i < names.length; i++) parts.push(String(names[i] || ""));
@@ -2672,17 +2727,40 @@ function BackendRuntime() {
         res.forceDialog = !!(res.notices.length || res.emptyDropdownIds.length);
         return res;
     }
-    this.loadInitialData = function (progress) {
-        var res = { backend: cfg.activeBackend, workflows: [], forgePresets: [], forgeCatalog: null, schema: null };
+    this.loadInitialData = function (progress, allowFastPath) {
+        var res = { backend: cfg.activeBackend, workflows: [], forgePresets: [], forgeCatalog: null, schema: null, fastPath: false };
         if (cfg.activeBackend == BACKEND_FORGE) {
-            if (progress) progress.setStage(str.progressForgePresets, 42);
-            res.forgePresets = refreshForgeSchemas(progress);
-            cfg.selectedForgePreset = cfg.data.selectedForgePreset = chooseForgeSchema(res.forgePresets);
+            var fastForge = allowFastPath ? fastForgeSelection() : null;
+            if (fastForge) {
+                res.forgePresets = fastForge.items;
+                res.fastPath = true;
+            } else {
+                if (progress) progress.setStage(str.progressForgePresets, 42);
+                res.forgePresets = refreshForgeSchemas(progress);
+                cfg.selectedForgePreset = cfg.data.selectedForgePreset = chooseForgeSchema(res.forgePresets);
+            }
             res.forgeCatalog = {};
             if (cfg.selectedForgePreset) {
-                var loadedForge = loadForgeSchema(cfg.selectedForgePreset, res.forgeCatalog, progress, false);
-                res.forgeCatalog = loadedForge.catalog;
-                res.schema = loadedForge.schema;
+                var loadedForge;
+                try {
+                    loadedForge = loadForgeSchema(cfg.selectedForgePreset, res.forgeCatalog, progress, false);
+                } catch (fastForgeError) {
+                    if (!res.fastPath) throw fastForgeError;
+                    // Повреждённая или удалённая выбранная схема не должна
+                    // превращать тихий запуск в тупиковую ошибку: полный список
+                    // найдёт валидную замену и откроет окно с уведомлением.
+                    if (progress) progress.setStage(str.progressForgePresets, 42);
+                    res.forgePresets = refreshForgeSchemas(progress);
+                    if (findForgeSchema(res.forgePresets, cfg.selectedForgePreset)) throw fastForgeError;
+                    cfg.selectedForgePreset = cfg.data.selectedForgePreset = chooseForgeSchema(res.forgePresets);
+                    res.fastPath = false;
+                    if (cfg.selectedForgePreset)
+                        loadedForge = loadForgeSchema(cfg.selectedForgePreset, res.forgeCatalog, progress, false);
+                }
+                if (loadedForge) {
+                    res.forgeCatalog = loadedForge.catalog;
+                    res.schema = loadedForge.schema;
+                }
             }
             return finalizeInitialData(res);
         }
@@ -2690,9 +2768,15 @@ function BackendRuntime() {
             cfg.selectedWorkflow = cfg.data.selectedWorkflow = "";
             return finalizeInitialData(res);
         }
-        if (progress) progress.setStage(str.progressWorkflows, 42);
-        res.workflows = refreshWorkflows(progress);
-        cfg.selectedWorkflow = cfg.data.selectedWorkflow = chooseWorkflow(res.workflows);
+        var fastWorkflow = allowFastPath ? fastWorkflowSelection() : null;
+        if (fastWorkflow) {
+            res.workflows = fastWorkflow.items;
+            res.fastPath = true;
+        } else {
+            if (progress) progress.setStage(str.progressWorkflows, 42);
+            res.workflows = refreshWorkflows(progress);
+            cfg.selectedWorkflow = cfg.data.selectedWorkflow = chooseWorkflow(res.workflows);
+        }
         if (res.workflows.length) {
             var sel = findWorkflow(res.workflows, cfg.selectedWorkflow);
             if (!sel) throw new Error(str.errSelectedWorkflowMissing);
@@ -4317,7 +4401,8 @@ function BridgeApi() {
         // init() уже делает TCP-check, чтобы решить, показывать ли progress. Не
         // повторяем его на обычном тёплом запуске и не ищем Python-файл, пока
         // действительно не понадобится запуск нового процесса.
-        var running = knownRunning === undefined ? self.isRunning() : !!knownRunning,
+        var deadline = (new Date()).getTime() + START_TIMEOUT,
+            running = knownRunning === undefined ? self.isRunning() : !!knownRunning,
             runningInfo = null;
         if (running) {
             try { runningInfo = self.ping(progress); }
@@ -4328,23 +4413,30 @@ function BridgeApi() {
                 running = false;
             }
             if (running) {
-                if (String(runningInfo.protocol) != String(API_PROTOCOL)) {
-                    throw new Error(localize(str.errApiProtocolA) + runningInfo.protocol + localize(str.errApiProtocolB) + API_PROTOCOL + ".");
-                }
+                validatePythonProtocol(runningInfo);
+                progress = waitForPythonReady(runningInfo, progress, deadline);
                 return true;
             }
         }
         var pythonFile = findPythonModule();
         if (!pythonFile) throw new Error(str.errPythonMissingA + API_FILE + str.errPythonMissingB);
         if (progress) progress.setStage(str.progressStartPython, 3);
-        pythonFile.execute();
-        if (!waitForConnection(START_TIMEOUT, progress)) {
-            throw new Error(str.errPythonStartA + API_HOST + ":" + API_PORT_SEND + str.errPythonStartB);
+        clearStartupStatus();
+        var launchStartedAt = (new Date()).getTime();
+        if (pythonFile.execute() === false) throw new Error(str.errPythonExecute + "\n" + pythonFile.fsName);
+        var startupState = waitForConnection(Math.max(1, deadline - (new Date()).getTime()), progress, launchStartedAt);
+        if (startupState !== true) {
+            var logPath = startupState && startupState.log_file ? String(startupState.log_file) : startupLogPath();
+            if (startupState && startupState.status == "installing")
+                throw new Error(str.errPythonInstallTimeout +
+                    (startupState.message ? "\n\n" + startupState.message : "") +
+                    (logPath ? "\n\n" + str.pythonLog + logPath : ""));
+            throw new Error(str.errPythonStartA + API_HOST + ":" + API_PORT_SEND + str.errPythonStartB +
+                (logPath ? "\n\n" + str.pythonLog + logPath : ""));
         }
         var started = self.ping(progress);
-        if (String(started.protocol) != String(API_PROTOCOL)) {
-            throw new Error(localize(str.errApiProtocolA) + started.protocol + localize(str.errApiProtocolB) + API_PROTOCOL + ".");
-        }
+        validatePythonProtocol(started);
+        waitForPythonReady(started, progress, deadline);
         return true;
     };
     this.ping = function (progress, timeout) { return call("ping", null, timeout || SHORT_TIMEOUT, progress); };
@@ -4557,14 +4649,128 @@ function BridgeApi() {
         for (var i = 0; i < candidates.length; i++) if (candidates[i].exists) return candidates[i];
         return null;
     }
-    function waitForConnection(timeout, startup) {
-        var started = (new Date()).getTime();
+    function waitForConnection(timeout, startup, launchStartedAt) {
+        var started = (new Date()).getTime(), lastStatus = null, lastStage = "";
         while ((new Date()).getTime() - started < timeout) {
-            if (checkConnection(API_HOST, API_PORT_SEND)) return true;
+            if (checkConnection(API_HOST, API_PORT_SEND)) {
+                clearStartupStatus();
+                return true;
+            }
+            var status = consumeStartupStatus(launchStartedAt);
+            if (status) {
+                lastStatus = status;
+                if (status.status == "error")
+                    throw new Error(str.errPythonStartupDetails +
+                        (status.message ? "\n\n" + status.message : "") +
+                        (status.log_file ? "\n\n" + str.pythonLog + status.log_file : ""));
+                var stage = status.status == "installing"
+                    ? str.progressInstallPython + (status.message ? " " + status.message : "")
+                    : str.progressStartPython;
+                if (startup && stage != lastStage) { startup.setStage(stage, 3); lastStage = stage; }
+            }
             if (startup) startup.pulse();
             $.sleep(25);
         }
-        return false;
+        clearStartupStatus();
+        return lastStatus || false;
+    }
+    function validatePythonProtocol(info) {
+        if (String(info && info.protocol) != String(API_PROTOCOL))
+            throw new Error(localize(str.errApiProtocolA) + (info ? info.protocol : "") +
+                localize(str.errApiProtocolB) + API_PROTOCOL + ".");
+    }
+    function ensureStartupProgress(progress) {
+        if (progress) return progress;
+        startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT + ANALYZE_TIMEOUT);
+        startupProgress.show();
+        return startupProgress;
+    }
+    function waitForPythonReady(info, progress, deadline) {
+        var lastStage = "";
+        for (; ;) {
+            validatePythonProtocol(info);
+            clearStartupStatus();
+            var status = String(info.startup_status || "ready").toLowerCase(),
+                message = String(info.startup_message || ""),
+                logPath = String(info.startup_log_file || startupLogPath() || "");
+            if (status == "ready") return progress;
+            if (status == "error")
+                throw new Error(str.errPythonStartupDetails +
+                    (message ? "\n\n" + message : "") +
+                    (logPath ? "\n\n" + str.pythonLog + logPath : ""));
+            progress = ensureStartupProgress(progress);
+            var stage = status == "installing"
+                ? str.progressInstallPython + (message ? " " + message : "")
+                : str.progressStartPython;
+            if (stage != lastStage) { progress.setStage(stage, 3); lastStage = stage; }
+            if ((new Date()).getTime() >= deadline) {
+                if (status == "installing")
+                    throw new Error(str.errPythonInstallTimeout +
+                        (message ? "\n\n" + message : "") +
+                        (logPath ? "\n\n" + str.pythonLog + logPath : ""));
+                throw new Error(str.errPythonStartA + API_HOST + ":" + API_PORT_SEND + str.errPythonStartB +
+                    (logPath ? "\n\n" + str.pythonLog + logPath : ""));
+            }
+            progress.pulse();
+            $.sleep(500);
+            info = self.ping(progress, Math.min(SHORT_TIMEOUT, Math.max(1, deadline - (new Date()).getTime())));
+        }
+    }
+    function startupStatusFile() {
+        var root = "";
+        try { root = String($.getenv("LOCALAPPDATA") || ""); } catch (_) { }
+        return root ? new File(root + "/" + APP.tempFolder + "/" + APP.startupFile) : null;
+    }
+    function startupLogPath() {
+        var statusFile = startupStatusFile();
+        return statusFile ? statusFile.parent.parent.fsName + "/" + API_FILE + ".log" : "";
+    }
+    function readUtf8File(file) {
+        if (!file || !file.exists) return null;
+        var opened = false;
+        try {
+            file.encoding = "UTF-8";
+            if (!file.open("r")) return null;
+            opened = true;
+            var value = file.read();
+            file.close(); opened = false;
+            return value;
+        } catch (_) { return null; }
+        finally { if (opened) try { file.close(); } catch (_) { } }
+    }
+    function clearStartupStatus() {
+        var file = startupStatusFile();
+        discardStartupStatusFile(file);
+    }
+    function discardStartupStatusFile(file) {
+        if (!file || !file.exists) return;
+        try { if (file.remove()) return; } catch (_) { }
+        // Если Windows временно не разрешил удалить файл, очищаем содержимое,
+        // чтобы прочитанный status не мог повлиять на следующий запуск.
+        var opened = false;
+        try {
+            file.encoding = "UTF-8";
+            if (!file.open("w")) return;
+            opened = true;
+            file.write("");
+            file.close(); opened = false;
+        } catch (_) { }
+        finally { if (opened) try { file.close(); } catch (_) { } }
+    }
+    function consumeStartupStatus(launchStartedAt) {
+        var file = startupStatusFile(), source = readUtf8File(file);
+        if (source === null) return null;
+        var status = null;
+        try { status = jsonParse(source); } catch (_) { status = null; }
+        // Не удаляем более новую запись, если Python успел атомарно заменить
+        // status-файл между первым чтением и подтверждением содержимого.
+        var current = readUtf8File(file);
+        if (current === source) discardStartupStatusFile(file);
+        if (!status || typeof status != "object") return null;
+        var startedAt = Number(status.started_at || 0) * 1000;
+        if (launchStartedAt && startedAt && startedAt < launchStartedAt - 5000) return null;
+        status.status = String(status.status || "").toLowerCase();
+        return status;
     }
     function checkConnection(host, port) {
         var socket = new Socket();
@@ -5481,6 +5687,10 @@ function Locale() {
         errFlattenedSourceMissing: ["Не удалось определить объединённый слой для экспорта.", "Could not determine the merged layer for export."],
         errPythonMissingA: ["Не найден ", "Could not find "],
         errPythonMissingB: [".pyw или .py рядом с JSX либо в подпапке lib.", ".pyw or .py next to JSX or in the lib subfolder."],
+        errPythonExecute: ["Windows не смог запустить файл Python. Проверьте установку Python и ассоциацию файлов .pyw/.py:", "Windows could not launch the Python file. Check the Python installation and .pyw/.py file association:"],
+        errPythonInstallTimeout: ["Установка зависимостей Python не завершилась за две минуты. Python может продолжать установку в фоне; повторите запуск скрипта позже.", "Python dependency installation did not finish within two minutes. Python may continue installing in the background; run the script again later."],
+        errPythonStartupDetails: ["Python API завершил запуск с ошибкой.", "Python API startup failed."],
+        pythonLog: ["Лог: ", "Log: "],
         errPythonStartA: ["Python API не запустился на ", "Python API did not start on "], errResultFile: ["Файл результата не найден:", "Result file not found:"],
         errSaveJpeg: ["Photoshop не смог сохранить временный JPEG.", "Photoshop could not save the temporary JPEG."],
         errSavePng: ["Photoshop не смог сохранить временный PNG с маской.", "Photoshop could not save the temporary PNG with a mask."],
@@ -5539,6 +5749,7 @@ function Locale() {
         progressSaveJson: ["Сохранение значений в JSON…", "Saving values to JSON…"], progressGenerate: ["Генерация изображения… ", "Generating image… "],
         progressPrepare: ["Инициализация модели… ", "Initializing model… "], progressInitializeAction: ["инициализация", "initializing"],
         progressGenerateAction: ["генерация изображения", "generating image"], progressStartPython: ["Запуск Python-сервера…", "Starting Python server…"],
+        progressInstallPython: ["Установка зависимостей Python…", "Installing Python dependencies…"],
         progressInitializing: ["Инициализация " + APP.name + "… ", "Initializing " + APP.name + "… "],
         progressHandshake: ["Подключение к Python API…", "Connecting to Python API…"], progressWorkflows: ["Загрузка списка workflow…", "Loading workflow list…"],
         progressReady: ["Подготовка интерфейса завершена", "Interface data is ready"], flatten: ["Объединять слои перед генерацией", "Flatten layers before generation"],
