@@ -36,7 +36,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.157",
+    VER = "0.158",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -45,7 +45,7 @@ var APP = {
     API_PORT_SEND = 6370,
     API_PORT_LISTEN = 6371,
     API_PROTOCOL = 1,
-    // Первый запуск Python может устанавливать deep-translator и Pillow.
+    // Первый запуск Python может устанавливать deep-translator, Pillow и websocket-client.
     // Если API не открыл порт за две минуты, запуск считается неудачным.
     START_TIMEOUT = 2 * 60 * 1000,
     SHORT_TIMEOUT = 8000,
@@ -4282,7 +4282,11 @@ function GenerationProgress() {
         return true;
     };
     this.stageOne = function () {
-        var prepareTimeout = payload && payload.type == "forge_generate" ? 5 * 60 * 1000 : 120000,
+        // Comfy остаётся на первом сегменте до реального начала sampler, а
+        // загрузка крупной модели может занимать больше прежних двух минут.
+        var prepareTimeout = payload && payload.type == "forge_generate"
+                ? 5 * 60 * 1000
+                : cfg.generationTimeout * 1000,
             answer = api.startGeneration({
                 command: payload,
                 timeout: prepareTimeout,

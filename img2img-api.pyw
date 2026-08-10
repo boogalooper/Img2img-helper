@@ -46,7 +46,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.173"
+VERSION = "0.174"
 
 # Единый объект идентичности приложения. Пользовательские каталоги, имена
 # служебных файлов и расположение поставляемых схем вычисляются только отсюда.
@@ -388,6 +388,7 @@ def ensure_python_module(import_name: str, package_name: str = "") -> Any:
 DEEP_TRANSLATOR_MODULE: Any = None
 PIL_IMAGE_MODULE: Any = None
 PIL_IMAGE_OPS_MODULE: Any = None
+WEBSOCKET_MODULE: Any = None
 
 
 def prepare_required_modules() -> None:
@@ -399,6 +400,7 @@ def prepare_required_modules() -> None:
     """
 
     global DEEP_TRANSLATOR_MODULE, PIL_IMAGE_MODULE, PIL_IMAGE_OPS_MODULE
+    global WEBSOCKET_MODULE
 
     errors: List[str] = []
 
@@ -418,6 +420,21 @@ def prepare_required_modules() -> None:
     except Exception as exc:
         errors.append(f"Pillow: {exc}")
 
+    # WebSocket улучшает только определение момента начала sampling. Если его
+    # установить не удалось, генерация сохраняет полностью рабочий HTTP-путь.
+    try:
+        WEBSOCKET_MODULE = ensure_python_module("websocket", "websocket-client")
+        if not hasattr(WEBSOCKET_MODULE, "create_connection"):
+            raise UserVisibleError(
+                "The installed websocket module is not websocket-client."
+            )
+    except Exception as exc:
+        WEBSOCKET_MODULE = None
+        LOGGER.warning(
+            "websocket-client is unavailable; Comfy progress will use HTTP fallback: %s",
+            exc,
+        )
+
     if errors:
         raise UserVisibleError(
             "Could not prepare required Python modules:\n"
@@ -425,7 +442,10 @@ def prepare_required_modules() -> None:
             + f"\n\nDetails: {LOG_FILE}"
         )
 
-    LOGGER.info("Required Python modules are ready: deep-translator, Pillow")
+    LOGGER.info(
+        "Required Python modules are ready: deep-translator, Pillow%s",
+        ", websocket-client" if WEBSOCKET_MODULE is not None else "",
+    )
 
 
 def now_timestamp() -> str:
@@ -1287,6 +1307,131 @@ class ComfyClient:
             details = error.get("details")
             return str(message) + (f"\n{details}" if details else "")
         return str(error)
+
+
+class ComfyProgressWatcher:
+    """Observe sampler progress through ComfyUI WebSocket without owning result delivery."""
+
+    MAX_MESSAGES_PER_POLL = 32
+
+    def __init__(
+        self,
+        client: ComfyClient,
+        client_id: str,
+        sampler_node_ids: Sequence[Any],
+    ) -> None:
+        self.client = client
+        self.client_id = str(client_id)
+        self.sampler_node_ids = {
+            str(item) for item in sampler_node_ids if str(item)
+        }
+        self.socket: Any = None
+        self.sampler_entered: Optional[str] = None
+
+    @property
+    def can_track_sampling(self) -> bool:
+        return self.socket is not None and bool(self.sampler_node_ids)
+
+    def connect(self) -> bool:
+        module = WEBSOCKET_MODULE
+        if module is None or not self.sampler_node_ids:
+            return False
+        websocket_url = self.client.base_url.replace("http://", "ws://", 1)
+        websocket_url += "/ws?" + urllib.parse.urlencode(
+            {"clientId": self.client_id}
+        )
+        try:
+            self.socket = module.create_connection(
+                websocket_url,
+                timeout=3,
+                enable_multithread=False,
+            )
+            self.socket.settimeout(0.01)
+            LOGGER.info(
+                "Comfy progress WebSocket connected: samplers=%s",
+                ",".join(sorted(self.sampler_node_ids)),
+            )
+            return True
+        except Exception as exc:
+            self.socket = None
+            LOGGER.warning(
+                "Comfy progress WebSocket is unavailable; using HTTP fallback: %s",
+                exc,
+            )
+            return False
+
+    def _disable(self, reason: Any) -> None:
+        LOGGER.warning(
+            "Comfy progress WebSocket disconnected; using HTTP fallback: %s",
+            reason,
+        )
+        self.close()
+
+    def sampling_started(self, prompt_id: str) -> bool:
+        """Return true on sampler progress or after a non-reporting sampler exits."""
+
+        if not self.can_track_sampling:
+            return False
+        module = WEBSOCKET_MODULE
+        timeout_type = getattr(module, "WebSocketTimeoutException", ())
+        for _ in range(self.MAX_MESSAGES_PER_POLL):
+            try:
+                raw = self.socket.recv()
+            except Exception as exc:
+                if timeout_type and isinstance(exc, timeout_type):
+                    break
+                self._disable(exc)
+                return False
+            if raw in (None, ""):
+                self._disable("connection closed")
+                return False
+            if not isinstance(raw, str):
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            data = message.get("data")
+            if not isinstance(data, dict):
+                continue
+            event_prompt_id = str(data.get("prompt_id") or "")
+            if event_prompt_id and event_prompt_id != str(prompt_id):
+                continue
+            event_type = str(message.get("type") or "")
+            node_id = str(data.get("node") or "")
+            is_sampler_progress = node_id in self.sampler_node_ids or (
+                not node_id and self.sampler_entered is not None
+            )
+            if event_type == "progress" and is_sampler_progress:
+                try:
+                    progress_value = float(data.get("value") or 0)
+                except (TypeError, ValueError):
+                    progress_value = 0
+                if progress_value > 0:
+                    return True
+            elif event_type == "executing":
+                if node_id in self.sampler_node_ids:
+                    if self.sampler_entered and node_id != self.sampler_entered:
+                        return True
+                    self.sampler_entered = node_id
+                elif self.sampler_entered:
+                    # Custom sampler did not emit progress, but execution has
+                    # already moved to the following node.
+                    return True
+            elif event_type == "execution_success":
+                return True
+        return False
+
+    def close(self) -> None:
+        current = self.socket
+        self.socket = None
+        if current is not None:
+            try:
+                current.close()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -2982,6 +3127,7 @@ class WorkflowRuntimeCache:
         self._lock = threading.RLock()
         self._workflows: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
         self._analyses: "OrderedDict[Tuple[Any, ...], Tuple[Dict[str, Any], Dict[str, Any]]]" = OrderedDict()
+        self._sampler_nodes: "OrderedDict[Tuple[Any, ...], List[str]]" = OrderedDict()
 
     @staticmethod
     def _file_key(workflow_file: WorkflowFile) -> Tuple[Any, ...]:
@@ -3015,6 +3161,8 @@ class WorkflowRuntimeCache:
         ]
         for key in stale_analyses:
             self._analyses.pop(key, None)
+        for key in [key for key in self._sampler_nodes if key[1] == absolute and key != file_key]:
+            self._sampler_nodes.pop(key, None)
 
     def load_json(
         self, workflow_file: WorkflowFile, repository: WorkflowRepository
@@ -3040,7 +3188,26 @@ class WorkflowRuntimeCache:
                     key for key in self._analyses if key[0] == evicted_key
                 ]:
                     self._analyses.pop(analysis_key, None)
+                self._sampler_nodes.pop(evicted_key, None)
         return loaded
+
+    def get_sampler_node_ids(
+        self, workflow_file: WorkflowFile, workflow_data: Dict[str, Any]
+    ) -> List[str]:
+        file_key = self._file_key(workflow_file)
+        with self._lock:
+            cached = self._sampler_nodes.get(file_key)
+            if cached is not None:
+                self._sampler_nodes.move_to_end(file_key)
+                return list(cached)
+        detected = WorkflowAnalyzer(workflow_data, {}).sampler_nodes()
+        with self._lock:
+            self._discard_stale_path_locked(file_key)
+            self._sampler_nodes[file_key] = list(detected)
+            self._sampler_nodes.move_to_end(file_key)
+            while len(self._sampler_nodes) > self.MAX_WORKFLOWS:
+                self._sampler_nodes.popitem(last=False)
+        return list(detected)
 
     def get_analysis(
         self, workflow_file: WorkflowFile, overrides: Optional[Dict[str, Any]]
@@ -3075,6 +3242,8 @@ class WorkflowRuntimeCache:
                 self._workflows.pop(key, None)
             for key in [key for key in self._analyses if key[0][0] == workflow_id]:
                 self._analyses.pop(key, None)
+            for key in [key for key in self._sampler_nodes if key[0] == workflow_id]:
+                self._sampler_nodes.pop(key, None)
 
 
 class WorkflowPatcher:
@@ -4714,6 +4883,7 @@ class GenerationState:
     input_folder: Optional[Path] = None
     output_folder: Optional[Path] = None
     uploaded_images: List[Dict[str, Any]] = field(default_factory=list)
+    progress_watcher: Optional[ComfyProgressWatcher] = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     # JSX закрывает listener первой стадии и после ответа "init" открывает
     # listener финальной стадии. ACK подтверждает, что переключение началось.
@@ -4761,6 +4931,7 @@ def generation_context(task: Dict[str, Any], backend: str):
     GENERATION.input_folder = None
     GENERATION.output_folder = None
     GENERATION.uploaded_images = []
+    GENERATION.progress_watcher = None
     GENERATION.cancel_event.clear()
     GENERATION.ack_event.clear()
     GENERATION.active = True
@@ -4770,6 +4941,8 @@ def generation_context(task: Dict[str, Any], backend: str):
         yield request_id
     finally:
         try:
+            if GENERATION.progress_watcher is not None:
+                GENERATION.progress_watcher.close()
             cleanup_comfy_request_outputs(GENERATION.output_folder, request_id)
             cleanup_uploaded_images(GENERATION.input_folder, GENERATION.uploaded_images)
         finally:
@@ -4781,6 +4954,7 @@ def generation_context(task: Dict[str, Any], backend: str):
             GENERATION.input_folder = None
             GENERATION.output_folder = None
             GENERATION.uploaded_images = []
+            GENERATION.progress_watcher = None
             GENERATION.active = False
             GENERATION.queued = False
             GENERATION.cancel_event.clear()
@@ -5829,6 +6003,14 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     raise_if_generation_cancelled(request_id)
     client_id = "photoshop-" + uuid.uuid4().hex
     prompt_id = str(uuid.uuid4())
+    sampler_node_ids = WORKFLOW_RUNTIME_CACHE.get_sampler_node_ids(
+        workflow_file, workflow_data
+    )
+    progress_watcher = ComfyProgressWatcher(
+        client, client_id, sampler_node_ids
+    )
+    progress_watcher.connect()
+    GENERATION.progress_watcher = progress_watcher
 
     GENERATION.prompt_id = prompt_id
     GENERATION.queued = True
@@ -5840,10 +6022,10 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         cancel_current_generation(request_id)
         raise CancelledError("Generation was cancelled.")
 
-    # До фактического execution Photoshop остаётся в первом сегменте с текстом
-    # «Инициализация модели...». /queue сообщает, когда именно наш prompt стал
-    # running. Для очень быстрого cached workflow running можно не успеть
-    # увидеть; тогда init/ACK выполняется после появления completed history.
+    # WebSocket удерживает Photoshop на «Инициализации модели» до первого
+    # progress sampler-ноды. /queue используется как переключатель только если
+    # WebSocket недоступен или sampler не распознан. /history остаётся
+    # единственным источником истины об ошибке и завершении workflow.
     deadline = time.monotonic() + int(message.get("timeout") or RUNTIME.generation_timeout)
     history_entry: Optional[Dict[str, Any]] = None
     progress_stage_started = False
@@ -5851,6 +6033,18 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     while time.monotonic() < deadline:
         touch_activity()
         raise_if_generation_cancelled(request_id)
+
+        if (
+            not progress_stage_started
+            and progress_watcher.sampling_started(actual_prompt_id)
+        ):
+            # После определения границы WebSocket больше не нужен. Закрываем
+            # его до sampling, чтобы не накапливать бинарные latent preview.
+            progress_watcher.close()
+            notify_generation_progress_ready(
+                request_id, "comfy", actual_prompt_id
+            )
+            progress_stage_started = True
 
         history = client.get_history(actual_prompt_id)
         history_entry = extract_history_entry(history, actual_prompt_id)
@@ -5874,10 +6068,11 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
                     queue_state, "queue_running", actual_prompt_id
                 ):
                     GENERATION.queued = False
-                    notify_generation_progress_ready(
-                        request_id, "comfy", actual_prompt_id
-                    )
-                    progress_stage_started = True
+                    if not progress_watcher.can_track_sampling:
+                        notify_generation_progress_ready(
+                            request_id, "comfy", actual_prompt_id
+                        )
+                        progress_stage_started = True
             except UserVisibleError as exc:
                 # История остаётся источником истины. Временная ошибка /queue
                 # не должна прерывать уже поставленную генерацию.
