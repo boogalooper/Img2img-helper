@@ -37,7 +37,7 @@ var APP = {
         maxWorkflowSchemas: 6
     }
 },
-    VER = "0.159",
+    VER = "0.161",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -53,9 +53,13 @@ var APP = {
     STARTUP_PROGRESS_DELAY = 1000,
     TRANSLATE_TIMEOUT = 10 * 60 * 1000,
     ANALYZE_TIMEOUT = 90000,
-    GENERATION_PREPARE_SEGMENT = 30,
-    GENERATION_RUN_SEGMENT = 70,
-    PROGRESS_TASK_RANGE = 40,
+    GENERATION_PREPARE_SEGMENT = 1,
+    GENERATION_RUN_SEGMENT = 2,
+    GENERATION_TOTAL_SEGMENTS = 3,
+    // doProgressTask() получает долю ещё не использованного участка, а не
+    // процентные пункты. За ожидаемое время заполняем 95% сегмента, затем
+    // асимптотически приближаемся к его концу до ответа backend.
+    PROGRESS_STAGE_TARGET = 0.95,
     DESC_PROFILE_CLEANUP_INTERVAL = 500,
     BACKEND_COMFY = "comfy",
     BACKEND_FORGE = "forge",
@@ -1869,6 +1873,7 @@ function GenerationRuntime() {
                 command: command,
                 titles: progressTitles,
                 timingKey: timingKey,
+                prepareTimingMax: generationTimings.getDelay(timingKey + ":prepare"),
                 timingMax: generationTimings.getDelay(timingKey),
                 requestId: requestId
             });
@@ -4291,6 +4296,7 @@ function GenerationProgress() {
         prepareTitle = "",
         generateTitle = "",
         delayKey = "",
+        prepareDelayMax = 7500,
         delayMax = 7500,
         requestId = null;
     this.begin = function (options) {
@@ -4301,12 +4307,14 @@ function GenerationProgress() {
         prepareTitle = options.titles && options.titles.prepare ? options.titles.prepare : "";
         generateTitle = options.titles && options.titles.generate ? options.titles.generate : "";
         delayKey = options.timingKey || "";
+        prepareDelayMax = options.prepareTimingMax || 7500;
         delayMax = options.timingMax || 7500;
         requestId = options.requestId || (payload ? payload.request_id : null);
     };
     this.run = function () {
         if (!app.doProgressSegmentTask(
-            GENERATION_PREPARE_SEGMENT, 0, 100, "generationStageOne()"
+            GENERATION_PREPARE_SEGMENT, 0, GENERATION_TOTAL_SEGMENTS,
+            "generationStageOne()"
         )) {
             $.setenv(APP.dialogEnvKey, "true");
             api.interrupt(requestId);
@@ -4317,7 +4325,8 @@ function GenerationProgress() {
             return true;
         }
         if (!app.doProgressSegmentTask(
-            GENERATION_RUN_SEGMENT, GENERATION_PREPARE_SEGMENT, 100,
+            GENERATION_RUN_SEGMENT, GENERATION_PREPARE_SEGMENT,
+            GENERATION_TOTAL_SEGMENTS,
             "generationStageTwo()"
         )) {
             $.setenv(APP.dialogEnvKey, "true");
@@ -4335,7 +4344,9 @@ function GenerationProgress() {
             answer = api.startGeneration({
                 command: payload,
                 timeout: prepareTimeout,
-                title: prepareTitle || str.progressPrepare
+                title: prepareTitle || str.progressPrepare,
+                max: prepareDelayMax,
+                delayKey: delayKey ? delayKey + ":prepare" : ""
             });
         if (answer === false) return false;
         firstAnswer = answer;
@@ -4361,6 +4372,7 @@ function GenerationProgress() {
         prepareTitle = "";
         generateTitle = "";
         delayKey = "";
+        prepareDelayMax = 7500;
         delayMax = 7500;
         requestId = null;
     };
@@ -4590,7 +4602,9 @@ function BridgeApi() {
         return requestWithOptions(options.command, {
             timeout: options.timeout,
             title: options.title,
-            max: options.timeout,
+            max: options.max,
+            trackDelay: true,
+            delayKey: options.delayKey,
             interruptOnTimeout: true
         });
     };
@@ -4659,7 +4673,6 @@ function BridgeApi() {
         if (title) {
             max = Number(max) || timeout || 7500;
             if (max < 1) max = 1;
-            slice = 1 / max * PROGRESS_TASK_RANGE;
         }
         for (; ;) {
             t2 = (new Date()).getTime();
@@ -4672,6 +4685,14 @@ function BridgeApi() {
             }
             if (progress) progress.pulse();
             if (title && t2 - t3 >= 1) {
+                // taskLength — доля оставшейся части текущего segment. Такая
+                // формула даёт PROGRESS_STAGE_TARGET за ожидаемое время даже
+                // при неравномерной частоте poll, а при задержке продолжает
+                // делить оставшийся участок до фактического ответа backend.
+                var progressDelta = t2 - t3;
+                slice = progressDelta > 0
+                    ? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / max)
+                    : 0;
                 t3 = t2;
                 var text = trackDelay
                     ? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
@@ -5733,8 +5754,8 @@ function AM(target, order) {
         return null;
     }
 }
-// Хранит последние длительности генерации в custom options Photoshop и
-// использует среднее как ориентир для progress bar следующего запуска.
+// Хранит последние длительности инициализации и генерации в custom options
+// Photoshop и использует среднее как ориентир следующего progress bar.
 function Delay() {
     var settingsObj = this;
     this.getDelay = function (workflowId) {
