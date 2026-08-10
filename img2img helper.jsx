@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.165",
+	VER = "0.169",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -180,15 +180,25 @@ function init() {
 		}
 		api.initialize(startupProgress, apiRunning);
 		if (startupProgress) startupProgress.setStage(str.progressHandshake, 22);
-		// Каждый запуск проверяет выбранный backend; второй — перед переключением.
+		// Обычное открытие UI использует снимок фонового BackendMonitor и не
+		// блокируется на сетевом probe. Silent mode и Action по-прежнему
+		// синхронно проверяют выбранный backend перед продолжением.
+		var startupVerifyBackend = showInterface && !actionPlaybackMode ? "" : cfg.activeBackend;
 		backend.applyStatus(api.handshake(
 			startupProgress, null, false, showInterface ? "cached" : "silent",
-			cfg.activeBackend
+			startupVerifyBackend
 		));
 		if (showInterface && !backend.isAvailable(cfg.activeBackend) &&
 			!(actionPlaybackMode && actionUsesRecordedSettings)) {
-			var alternateBackend = cfg.activeBackend == BACKEND_FORGE ? BACKEND_COMFY : BACKEND_FORGE;
-			backend.applyStatus(api.handshake(startupProgress, null, false, "cached", alternateBackend));
+			// Отрицательный cached-status перепроверяем живым probe: backend мог
+			// быть запущен уже после последнего прохода фонового monitor.
+			backend.applyStatus(api.handshake(
+				startupProgress, null, false, "cached", cfg.activeBackend
+			));
+			if (!backend.isAvailable(cfg.activeBackend)) {
+				var alternateBackend = cfg.activeBackend == BACKEND_FORGE ? BACKEND_COMFY : BACKEND_FORGE;
+				backend.applyStatus(api.handshake(startupProgress, null, false, "cached", alternateBackend));
+			}
 		}
 		var backendChangedAtStartup = false;
 		// Тихий запуск и Action не подменяют выбранный backend.
@@ -200,8 +210,15 @@ function init() {
 				if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
 			}
 		} else if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
-		// Тихая генерация использует быстрый путь без полного каталога.
-		var allowFastInitialLoad = !showInterface && !backendChangedAtStartup && !settingsWarnings.length,
+		// Forge UI может использовать сохранённый список схем, если выбранная
+		// схема всё ещё присутствует в нём. Сама схема и требуемые каталоги
+		// всё равно запрашиваются заново, поэтому генерационные данные не кэшируются.
+		var interfaceRequestedAtStartup = showInterface,
+			hasCachedForgeSelection = showInterface && cfg.activeBackend == BACKEND_FORGE &&
+				cfg.forgeCatalog instanceof Array &&
+				!!backend.findForgeSchema(cfg.forgeCatalog, cfg.selectedForgePreset),
+			allowFastInitialLoad = !backendChangedAtStartup && !settingsWarnings.length &&
+				(!showInterface || hasCachedForgeSelection),
 			initial = backend.loadInitialData(startupProgress, allowFastInitialLoad);
 		initial.notices = settingsWarnings.concat(initial.notices instanceof Array ? initial.notices : []);
 		if (backendChangedAtStartup || initial.forceDialog || initial.notices.length ||
@@ -209,8 +226,9 @@ function init() {
 			showInterface = true;
 			$.setenv(APP.dialogEnvKey, "true");
 		}
-		// При переходе из быстрого пути в UI загружаем полный каталог.
-		if (showInterface && initial.fastPath) {
+		// Если тихий запуск сам потребовал UI, загружаем полный список.
+		// Для UI, запрошенного пользователем изначально, проверенного cached-list достаточно.
+		if (showInterface && initial.fastPath && !interfaceRequestedAtStartup) {
 			var fastNotices = initial.notices instanceof Array ? initial.notices : [],
 				fullInitial = backend.loadInitialData(startupProgress, false),
 				fullNotices = fullInitial.notices instanceof Array ? fullInitial.notices : [],
@@ -467,7 +485,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			state.forgeCatalog = loadedForge.catalog;
 			state.schema = loadedForge.schema;
 			var forgeProfile = cfg.getForgeProfile(presetId);
-			applyMetadataToProfile(metadata, forgeProfile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "selectedLoras", "imageStitchInputs"]);
+			applyMetadataToProfile(metadata, forgeProfile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "selectedLoras", "imageStitchInputs", "selectedPromptPresets"]);
 			showControls(); return true;
 		}
 		var workflow = null;
@@ -476,7 +494,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (!workflow) return false;
 		cfg.selectedWorkflow = cfg.data.selectedWorkflow = workflow.id;
 		var profile = cfg.getProfile(workflow.id), previous = cloneObj(profile.bindingOverrides);
-		applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat"]);
+		applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat", "selectedPromptPresets"]);
 		if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" };
 		if (profile.bindingOverrides.mask === undefined) profile.bindingOverrides.mask = "";
 		if (!(profile.bindingOverrides.references instanceof Array)) profile.bindingOverrides.references = [];
@@ -978,7 +996,8 @@ function mainDialog(selection, initial, responseSeconds) {
 			if (hasStoredValue) profile.values[definition.id] = cloneObj(stored);
 		}
 		state.controls[definition.id] = ui.addDynamic(parent, definition, stored, preferredWidth, {
-			backend: backend.schemaBackend(state.schema)
+			backend: backend.schemaBackend(state.schema),
+			profile: profile
 		});
 	}
 	// Сохраняет только реально созданные (видимые) контролы. Скрытые поля
@@ -1872,6 +1891,7 @@ function GenerationRuntime() {
 				manualScale: profile.manualScale,
 				sizeMultiple: resolveProfileSizeMultiple(schema, profile),
 				selectedLoras: currentBackend == BACKEND_FORGE ? cloneObj(profile.selectedLoras) : [],
+				selectedPromptPresets: cloneObj(profile.selectedPromptPresets || { positive: "", negative: "" }),
 				bindingOverrides: currentBackend == BACKEND_COMFY ? cloneObj(profile.bindingOverrides) : {},
 				referenceFiles: currentBackend == BACKEND_COMFY ? cloneObj(profile.referenceFiles) : {},
 				imageStitchInputs: currentBackend == BACKEND_FORGE ? cloneObj(profile.imageStitchInputs) : []
@@ -2564,10 +2584,14 @@ function BackendRuntime() {
 		catalog = catalog || {};
 		var controls = schema.controls || [];
 		for (var i = 0; i < controls.length; i++) {
-			var control = controls[i], source = control.source;
+			var control = controls[i], source = control.source,
+				id = String(control.id || ""), payloadKey = String(control.payload_key || "");
 			if (source && catalog[source] instanceof Array) control.items = cloneObj(catalog[source]);
 			control.backend = BACKEND_FORGE;
-			control.forgeLoras = cloneObj(catalog.loras instanceof Array ? catalog.loras : []);
+			// Каталог LoRA нужен только prompt-контролу. Раньше один и тот же
+			// потенциально большой массив клонировался в каждый control схемы.
+			if (id == "positive_prompt" || payloadKey == "prompt")
+				control.forgeLoras = cloneObj(catalog.loras instanceof Array ? catalog.loras : []);
 		}
 		return schema;
 	}
@@ -3829,10 +3853,10 @@ function UI() {
 		for (var i = 0; i < prefixes.length; i++) if (startsWithSemantic(id, prefixes[i])) return true;
 		return false;
 	}
-	function addPromptControl(parent, schema, storedValue) {
+	function addPromptControl(parent, schema, storedValue, options) {
 		var group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}"),
 			title = group.add("statictext"),
-			toolbar = self.addPresetToolbar(group, self.contentWidth(), str.promptClear),
+			toolbar = self.addPresetToolbar(group, self.contentWidth(), str.presetRestore),
 			presetList = toolbar.dropdown,
 			refresh = toolbar.refresh,
 			add = toolbar.add,
@@ -3844,21 +3868,27 @@ function UI() {
 		edit.preferredSize = [self.contentWidth(), self.promptHeight()];
 		self.setFixedWidth(translate, self.contentWidth());
 		var context = schema.id == "negative_prompt" ? "negative" : "positive",
-			presetStore = cfg.getPromptPresetStore(context);
+			presetStore = cfg.getPromptPresetStore(context),
+			profile = options && options.profile ? options.profile : null,
+			storedPresetName = profile && profile.selectedPromptPresets
+				? String(profile.selectedPromptPresets[context] || "")
+				: "";
+		if (storedPresetName && !presetStore.hasOwnProperty(storedPresetName)) storedPresetName = "";
 		title.text = self.label(schema);
 		title.helpTip = self.help(schema);
 		translate.text = str.translate + " → EN";
 		translate.helpTip = str.translatePromptHelp;
 		edit.text = String(storedValue === undefined ? "" : storedValue);
-		fillPresets();
+		fillPresets(storedPresetName);
+		rememberSelectedPreset();
 		updateControlState();
 		presetList.onChange = function () {
-			var presetText = selectedPresetText();
-			edit.text = presets.applyPrompt(presetText);
+			rememberSelectedPreset();
+			edit.text = presets.applyPrompt(selectedPresetText());
 			updateControlState();
 		};
 		refresh.onClick = function () {
-			edit.text = "";
+			edit.text = presets.applyPrompt(selectedPresetText());
 			updateControlState();
 		};
 		add.onClick = function () {
@@ -3873,6 +3903,7 @@ function UI() {
 			if (presetStore.hasOwnProperty(name) && !confirm(String(str.errPreset).replace("%1", name), false, str.presetNew)) return;
 			presetStore[name] = presets.promptText(edit.text);
 			fillPresets(name);
+			rememberSelectedPreset();
 			updateControlState();
 		};
 		save.onClick = function () {
@@ -3887,6 +3918,7 @@ function UI() {
 			if (!confirm(str.presetDeleteConfirmA + name + str.presetDeleteConfirmB)) return;
 			delete presetStore[name];
 			fillPresets(null, Math.max(0, index - 1));
+			rememberSelectedPreset();
 			updateControlState();
 		};
 		edit.onChanging = function () { updateControlState(); };
@@ -3910,6 +3942,14 @@ function UI() {
 		function selectedPresetText() {
 			return presetList.selection && presetList.selection.index > 0
 				? String(presetStore[presetList.selection.text] || "")
+				: "";
+		}
+		function rememberSelectedPreset() {
+			if (!profile) return;
+			if (!isObjectMap(profile.selectedPromptPresets))
+				profile.selectedPromptPresets = { positive: "", negative: "" };
+			profile.selectedPromptPresets[context] = presetList.selection && presetList.selection.index > 0
+				? String(presetList.selection.text)
 				: "";
 		}
 		function updateControlState() {
@@ -4986,6 +5026,10 @@ function Config() {
 	}
 	function normalizeBaseProfile(profile) {
 		if (!isObjectMap(profile.values)) profile.values = {};
+		if (!isObjectMap(profile.selectedPromptPresets))
+			profile.selectedPromptPresets = { positive: "", negative: "" };
+		if (typeof profile.selectedPromptPresets.positive != "string") profile.selectedPromptPresets.positive = "";
+		if (typeof profile.selectedPromptPresets.negative != "string") profile.selectedPromptPresets.negative = "";
 		if (profile.visibleControls !== null && profile.visibleControls !== undefined && !(profile.visibleControls instanceof Array))
 			profile.visibleControls = null;
 		if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", self.resizePresets);
@@ -5316,7 +5360,7 @@ function Config() {
 	this.getProfile = function (workflowId) {
 		var profiles = profileStore("workflowProfiles"), profile = profiles[workflowId];
 		if (!isObjectMap(profile)) profile = profiles[workflowId] = {
-			relativePath: "", values: {}, visibleControls: null,
+			relativePath: "", values: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null,
 			bindingOverrides: { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" },
 			referenceFiles: {}, sizeMultiple: self.sizeMultiple,
 			autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
@@ -5342,7 +5386,7 @@ function Config() {
 	this.getForgeProfile = function (presetId) {
 		var profiles = profileStore("forgeProfiles"), profile = profiles[presetId];
 		if (!isObjectMap(profile)) profile = profiles[presetId] = {
-			values: {}, visibleControls: null, selectedLoras: [], imageStitchInputs: ["", "", ""],
+			values: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null, selectedLoras: [], imageStitchInputs: ["", "", ""],
 			sizeMultiple: null, autoResize: self.autoResize,
 			resizePreset: presets.normalizeResizeName("", self.resizePresets), manualScale: 1,
 			lorasInitialized: false
@@ -5841,7 +5885,7 @@ function Locale() {
 		errPreset: ["Пресет «%1» уже существует. Перезаписать?", "Preset “%1” already exists. Overwrite?"], presetAdd: ["Добавить пресет", "Add preset"],
 		presetDefault: ["по умолчанию", "default"], presetDelete: ["Удалить пресет", "Delete preset"], presetDeleteConfirmA: ["Удалить пресет «", "Delete preset ‘"],
 		presetDeleteConfirmB: ["»?", "’?"], presetNamePrompt: ["Укажите имя пресета", "Enter preset name"],
-		presetRestore: ["Восстановить значения пресета", "Restore preset values"], promptClear: ["Очистить поле", "Clear field"], presetSave: ["Сохранить пресет", "Save preset"],
+		presetRestore: ["Восстановить значения пресета", "Restore preset values"], presetSave: ["Сохранить пресет", "Save preset"],
 		translate: ["Перевести", "Translate"], translatePromptHelp: ["Перевести текущий промпт на английский", "Translate the current prompt into English"],
 		progressTranslate: ["Перевод промпта", "Translating prompt"], errTranslate: ["Не удалось перевести промпт.", "Could not translate the prompt."],
 		primarySize: ["Поля width / height", "Width / height fields"], sizeControlMode: ["Управление размером", "Size control"], sizeModeAuto: ["Автоматически", "Automatic"],

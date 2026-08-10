@@ -46,7 +46,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.179"
+VERSION = "0.180"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -6509,10 +6509,21 @@ def _refresh_backend_status(
 def _refresh_selected_backend_status(
     endpoints: Tuple[str, int, int], backend: str
 ) -> Dict[str, Any]:
-    """Check the selected backend and retain the other backend status."""
+    """Check the selected backend and retain the other backend status.
 
+    If a background monitor probe already owns the shared probe lock when this
+    request arrives, its result is fresh enough to satisfy the live check. In
+    that case do not immediately perform the same network probe a second time.
+    """
+
+    requested_at = time.time()
     with BACKEND_PROBE_LOCK:
         cached = _cached_backend_status(endpoints) or _unchecked_backend_status(endpoints)
+        selected = (cached.get("backends") or {}).get(backend) or {}
+        selected_checked_at = float(selected.get("checked_at") or 0.0)
+        if selected_checked_at >= requested_at and selected.get("checked") is not False:
+            return cached
+
         host, comfy_port, forge_port = endpoints
         if backend == "comfy":
             comfy = _probe_comfy_regular(
