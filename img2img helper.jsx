@@ -34,7 +34,7 @@ var APP = {
         comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
     }
 },
-    VER = "0.155",
+    VER = "0.156",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -44,9 +44,8 @@ var APP = {
     API_PORT_LISTEN = 6371,
     API_PROTOCOL = 1,
     // Первый запуск Python может устанавливать deep-translator и Pillow.
-    // В обычных запусках соединение устанавливается сразу; увеличенный предел
-    // нужен только для первой установки зависимостей через pip.
-    START_TIMEOUT = 30 * 60 * 1000,
+    // Если API не открыл порт за две минуты, запуск считается неудачным.
+    START_TIMEOUT = 2 * 60 * 1000,
     SHORT_TIMEOUT = 8000,
     STARTUP_PROGRESS_DELAY = 1000,
     TRANSLATE_TIMEOUT = 10 * 60 * 1000,
@@ -78,7 +77,6 @@ var APP = {
     doc = new AM("document"),
     lr = new AM("layer"),
     layerMetadata = new LayerMetadata(),
-    isDirty = false,
     initialState = null,
     generationResultPlaced = false,
     startupProgress = null,
@@ -457,7 +455,7 @@ function mainDialog(selection, initial, responseSeconds) {
             state.forgeCatalog = loadedForge.catalog;
             state.schema = loadedForge.schema;
             var forgeProfile = cfg.getForgeProfile(presetId);
-            applyMetadataToProfile(metadata, forgeProfile, ["autoResize", "resizePreset", "resize", "manualScale", "sizeMultiple", "selectedLoras", "imageStitchInputs"]);
+            applyMetadataToProfile(metadata, forgeProfile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "selectedLoras", "imageStitchInputs"]);
             showControls(); return true;
         }
         var workflow = null;
@@ -466,7 +464,7 @@ function mainDialog(selection, initial, responseSeconds) {
         if (!workflow) return false;
         cfg.selectedWorkflow = cfg.data.selectedWorkflow = workflow.id;
         var profile = cfg.getProfile(workflow.id), previous = cloneObj(profile.bindingOverrides);
-        applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "resize", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat"]);
+        applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat"]);
         if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" };
         if (profile.bindingOverrides.mask === undefined) profile.bindingOverrides.mask = "";
         if (!(profile.bindingOverrides.references instanceof Array)) profile.bindingOverrides.references = [];
@@ -482,10 +480,16 @@ function mainDialog(selection, initial, responseSeconds) {
     function applyMetadataToProfile(metadata, profile, allowed) {
         if (isObjectMap(metadata.values)) profile.values = cloneObj(metadata.values);
         if (!isObjectMap(profile.values)) profile.values = {};
-        if (isObjectMap(metadata.profile))
+        if (isObjectMap(metadata.profile)) {
+            // Метаданные старых слоёв могли хранить ручной масштаб только в
+            // resize. Новые версии используют единственное поле manualScale.
+            if (arrayContains(allowed, "manualScale") && metadata.profile.manualScale === undefined &&
+                metadata.profile.resize !== undefined && !toBooleanValue(metadata.profile.autoResize))
+                profile.manualScale = cloneObj(metadata.profile.resize);
             for (var i = 0; i < allowed.length; i++)
                 if (metadata.profile[allowed[i]] !== undefined)
                     profile[allowed[i]] = cloneObj(metadata.profile[allowed[i]]);
+        }
         if (allowed && arrayContains(allowed, "selectedLoras") && metadata.profile && metadata.profile.selectedLoras !== undefined)
             profile.lorasInitialized = true;
     }
@@ -891,7 +895,6 @@ function mainDialog(selection, initial, responseSeconds) {
                 showControls();
             },
             rebuild: function (schemaId) {
-                isDirty = false;
                 ui.runWithPaletteProgress(str.progressForgePresets, function (progress) {
                     state.forgePresets = backend.refreshForgeSchemas(progress);
                     var presetItem = backend.findForgeSchema(state.forgePresets, schemaId);
@@ -934,7 +937,7 @@ function mainDialog(selection, initial, responseSeconds) {
         state.schema = loaded.schema;
     }
     function reloadSelectedWorkflow(force, progress, noShow) {
-        isDirty = false; var workflow = backend.findWorkflow(state.workflows, cfg.selectedWorkflow); if (!workflow) throw new Error(str.errSelectedWorkflowMissing);
+        var workflow = backend.findWorkflow(state.workflows, cfg.selectedWorkflow); if (!workflow) throw new Error(str.errSelectedWorkflowMissing);
         var profile = cfg.getProfile(workflow.id); profile.relativePath = workflow.relative_path || profile.relativePath || "";
         var schema = force ? null : cfg.getCachedSchema(workflow.id, workflow);
         if (!schema) { schema = backend.analyzeWorkflow(workflow, profile, force, progress); cfg.cacheSchema(schema, workflow); }
@@ -1729,14 +1732,9 @@ function GenerationRuntime() {
         return res;
     }
     function getProfileTargetSize(bounds, profile, schema) {
-        var scale;
-        if (toBooleanValue(profile.autoResize)) {
-            scale = isDirty
-                ? profile.resize
-                : autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets));
-        } else {
-            scale = profile.manualScale;
-        }
+        var scale = toBooleanValue(profile.autoResize)
+            ? autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets))
+            : profile.manualScale;
         return calculateSizeFromScale(bounds.width, bounds.height, scale || 1, resolveProfileSizeMultiple(schema, profile));
     }
     function run(selection, schema, values) {
@@ -1817,7 +1815,6 @@ function GenerationRuntime() {
             var metadataProfile = {
                 autoResize: profile.autoResize,
                 resizePreset: profile.resizePreset,
-                resize: profile.resize,
                 manualScale: profile.manualScale,
                 sizeMultiple: resolveProfileSizeMultiple(schema, profile),
                 selectedLoras: currentBackend == BACKEND_FORGE ? cloneObj(profile.selectedLoras) : [],
@@ -3933,7 +3930,6 @@ function UI() {
         if (profile.autoResize === undefined) profile.autoResize = cfg.autoResize;
         profile.autoResize = toBooleanValue(profile.autoResize);
         if (profile.manualScale === undefined) profile.manualScale = 1;
-        if (profile.resize === undefined) profile.resize = 1;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName(profile.resizePreset, cfg.resizePresets);
         var group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}");
         self.setFixedWidth(group, self.contentWidth());
@@ -3969,11 +3965,9 @@ function UI() {
                 profile.autoResize = false;
                 presetGroup.enabled = false;
             }
-            profile.resize = scale;
             profile.manualScale = scale;
             valueText.text = scale.toFixed(2);
             title.text = setTitle();
-            isDirty = true;
         }
         slider.onChange = syncResizeValue;
         slider.onChanging = syncResizeValue;
@@ -3986,7 +3980,6 @@ function UI() {
             if (!this.selection) return;
             profile.resizePreset = cfg.resizePresets[this.selection.index].name;
             setSliderValue();
-            isDirty = true;
         };
         presetGroup.enabled = checkbox.value;
         function fillPresetList() {
@@ -3998,7 +3991,9 @@ function UI() {
             profile.resizePreset = preset.name;
         }
         function setTitle() {
-            var scale = profile.autoResize ? profile.resize : profile.manualScale,
+            var scale = profile.autoResize
+                    ? autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets))
+                    : profile.manualScale,
                 size = calculateSizeFromScale(bounds.width, bounds.height, scale, resolveProfileSizeMultiple(schema, profile));
             var text = profile.autoResize ? str.autoResize : str.resize,
                 mp = Math.floor(size.width * size.height / 10000) / 100;
@@ -4009,7 +4004,6 @@ function UI() {
         function setSliderValue() {
             if (profile.autoResize) {
                 var scale = autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets));
-                profile.resize = scale;
                 slider.value = scale * 100;
                 valueText.text = scale.toFixed(2);
                 title.text = setTitle();
@@ -4711,15 +4705,26 @@ function Config() {
         if (profile.visibleControls !== null && profile.visibleControls !== undefined && !(profile.visibleControls instanceof Array))
             profile.visibleControls = null;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", self.resizePresets);
-        if (profile.resize === undefined) profile.resize = 1;
-        if (profile.manualScale === undefined) profile.manualScale = 1;
+        // Миграция старых профилей: до разделения Auto/Manual ручное значение
+        // могло храниться в resize. После нормализации лишнее поле удаляется.
+        if (profile.manualScale === undefined)
+            profile.manualScale = profile.resize === undefined ? 1 : profile.resize;
+        if (profile.hasOwnProperty("resize")) delete profile.resize;
         return profile;
+    }
+    function normalizeProfileStore(store) {
+        if (!isObjectMap(store)) return;
+        for (var profileId in store)
+            if (store.hasOwnProperty(profileId) && isObjectMap(store[profileId]))
+                normalizeBaseProfile(store[profileId]);
     }
     function applyLoadedData(loaded) {
         self.data = loaded ? mergeDefaults(defaultData(), loaded) : defaultData();
         self.bindProperties();
         if (!self.resizePresets || !self.resizePresets.length)
             self.resizePresets = self.data.resizePresets = presets.defaultResize();
+        normalizeProfileStore(self.workflowProfiles);
+        normalizeProfileStore(self.forgeProfiles);
         self.cleanReferenceHistory();
     }
     this.cleanReferenceHistory = function () {
@@ -5028,7 +5033,7 @@ function Config() {
             bindingOverrides: { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" },
             referenceFiles: {}, sizeMultiple: self.sizeMultiple,
             autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
-            outputFormat: "jpg", resize: 1, manualScale: 1,
+            outputFormat: "jpg", manualScale: 1,
             schemaCache: null, schemaCacheStamp: null, schemaCacheVersion: 0
         };
         normalizeBaseProfile(profile);
@@ -5052,7 +5057,7 @@ function Config() {
         if (!isObjectMap(profile)) profile = profiles[presetId] = {
             values: {}, visibleControls: null, selectedLoras: [], imageStitchInputs: ["", "", ""],
             sizeMultiple: null, autoResize: self.autoResize,
-            resizePreset: presets.normalizeResizeName("", self.resizePresets), resize: 1, manualScale: 1,
+            resizePreset: presets.normalizeResizeName("", self.resizePresets), manualScale: 1,
             lorasInitialized: false
         };
         normalizeBaseProfile(profile);
