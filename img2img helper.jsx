@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.163",
+	VER = "0.164",
 	// Отладочный флаг должен оставаться false в рабочей сборке. При true
 	// Photoshop Actions не распознаются, а главное окно открывается всегда.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -199,19 +199,21 @@ function init() {
 		}
 		api.initialize(startupProgress, apiRunning);
 		if (startupProgress) startupProgress.setStage(str.progressHandshake, 22);
+		// Каждый запуск проверяет именно backend из текущих настроек или Action.
+		// Вторую оболочку берём из фонового снимка и проверяем напрямую только
+		// перед возможным переключением в обычном диалоговом режиме.
 		backend.applyStatus(api.handshake(
-			startupProgress, null, false, showInterface ? "cached" : "silent"
+			startupProgress, null, false, showInterface ? "cached" : "silent",
+			cfg.activeBackend
 		));
-		// В диалоговом режиме отрицательный фоновый снимок может устареть между
-		// проверками monitor. Если сохранённый backend в нём недоступен, один раз
-		// просим Python выполнить актуальную параллельную проверку обеих оболочек.
-		// Положительный снимок используем сразу, не добавляя задержку к запуску.
-		if (showInterface && !backend.isAvailable(cfg.activeBackend))
-			backend.applyStatus(api.handshake(startupProgress, null, true, "cached"));
+		if (showInterface && !backend.isAvailable(cfg.activeBackend) &&
+			!(actionPlaybackMode && actionUsesRecordedSettings)) {
+			var alternateBackend = cfg.activeBackend == BACKEND_FORGE ? BACKEND_COMFY : BACKEND_FORGE;
+			backend.applyStatus(api.handshake(startupProgress, null, false, "cached", alternateBackend));
+		}
 		var backendChangedAtStartup = false;
-		// Тихий запуск не принимает решений по фоновому снимку: он использует
-		// сохранённый backend, а реальную недоступность сообщит его API. В UI
-		// можно выбрать найденную оболочку; записанный Action не подменяем.
+		// Тихий запуск и записанный Action никогда не подменяют выбранный backend.
+		// Обычный диалог может перейти на второй, но только после его живой проверки.
 		if (showInterface) {
 			if (actionPlaybackMode && actionUsesRecordedSettings) {
 				if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
@@ -219,7 +221,7 @@ function init() {
 				backendChangedAtStartup = backend.normalizeActiveBackend();
 				if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
 			}
-		}
+		} else if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
 		// Полный каталог нужен интерфейсу, но не тихой генерации с уже
 		// сохранённым workflow/preset. При предупреждениях или смене backend
 		// сразу используем полный путь, поскольку окно всё равно будет открыто.
@@ -4536,7 +4538,7 @@ function BridgeApi() {
 	};
 	this.ping = function (progress, timeout) { return call("ping", null, timeout || SHORT_TIMEOUT, progress); };
 	this.translate = function (text, progress) { return call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress); };
-	this.handshake = function (progress, settings, refreshBackends, backendStatusMode) {
+	this.handshake = function (progress, settings, refreshBackends, backendStatusMode, verifyBackend) {
 		var source = settings || cfg;
 		return call("handshake", {
 			host: source.backendHost,
@@ -4547,7 +4549,8 @@ function BridgeApi() {
 			pythonIdleTimeout: source.pythonIdleTimeout,
 			backendMonitorInterval: source.backendMonitorInterval,
 			backendStatusMode: backendStatusMode || "cached",
-			refreshBackends: !!refreshBackends
+			refreshBackends: !!refreshBackends,
+			verifyBackend: verifyBackend || ""
 		}, SHORT_TIMEOUT, progress);
 	};
 	this.probeBackends = function (settings, progress) {

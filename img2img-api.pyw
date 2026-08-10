@@ -46,7 +46,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.177"
+VERSION = "0.178"
 
 # Единый объект идентичности приложения. Пользовательские каталоги, имена
 # служебных файлов и расположение поставляемых схем вычисляются только отсюда.
@@ -6228,17 +6228,26 @@ def _backend_probe_result(name: str, host: str, port: int, started: float, *,
         "details": details or {},
         "error": str(error or ""),
         "checked": bool(checked),
+        "checked_at": time.time() if checked else 0.0,
     }
 
 
 def _compose_backend_status(comfy: Dict[str, Any], forge: Dict[str, Any]) -> Dict[str, Any]:
     available = [name for name, item in (("comfy", comfy), ("forge", forge)) if item.get("available")]
     mode = "both" if len(available) == 2 else (available[0] if available else "none")
+    checked_at_values = [
+        float(item.get("checked_at") or 0.0)
+        for item in (comfy, forge)
+        if item.get("checked")
+    ]
     return {
         "mode": mode,
         "available_backends": available,
         "backends": {"comfy": comfy, "forge": forge},
-        "checked_at": time.time(),
+        # Общий снимок считается свежим только по более старой из двух
+        # проверок. Одиночный probe активного backend не откладывает фоновую
+        # актуализацию второй оболочки.
+        "checked_at": min(checked_at_values) if len(checked_at_values) == 2 else 0.0,
     }
 
 
@@ -6308,8 +6317,8 @@ def _probe_backends_unlocked(host: str, comfy_port: int, forge_port: int, *,
                              update_runtime: bool = False) -> Dict[str, Any]:
     """Полностью и независимо проверяет ComfyUI и Forge Neo.
 
-    Эта функция используется при первом handshake и кнопкой ручного обновления
-    в настройках. Недоступность одного сервера является обычным состоянием.
+    Эта функция используется фоновым монитором, принудительным полным refresh
+    и кнопкой ручной проверки. Недоступность одного сервера — обычное состояние.
     """
 
     normalized_host = normalize_comfy_host(host)
@@ -6376,6 +6385,25 @@ def _refresh_backend_status(
         return _store_backend_status(status, endpoints)
 
 
+def _refresh_selected_backend_status(
+    endpoints: Tuple[str, int, int], backend: str
+) -> Dict[str, Any]:
+    """Live-probe one selected backend and retain the monitor state of the other."""
+
+    with BACKEND_PROBE_LOCK:
+        cached = _cached_backend_status(endpoints) or _unchecked_backend_status(endpoints)
+        host, comfy_port, forge_port = endpoints
+        if backend == "comfy":
+            comfy = _probe_comfy(host, comfy_port, update_runtime=True)
+            forge = cached["backends"]["forge"]
+        else:
+            comfy = cached["backends"]["comfy"]
+            forge = _probe_forge(host, forge_port)
+        return _store_backend_status(
+            _compose_backend_status(comfy, forge), endpoints
+        )
+
+
 def detect_backends(*, force_full: bool = False) -> Dict[str, Any]:
     """Return the monitor snapshot; synchronously probe only on cache miss/refresh."""
 
@@ -6438,10 +6466,15 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     endpoints_changed = previous_endpoints != endpoints
     status_mode = str(message.get("backendStatusMode") or "cached").lower()
     refresh_backends = bool(message.get("refreshBackends"))
-    if status_mode == "silent" and not refresh_backends:
+    verify_backend = str(message.get("verifyBackend") or "").strip().lower()
+    if refresh_backends:
+        status = detect_backends(force_full=True)
+    elif verify_backend in {"comfy", "forge"}:
+        status = _refresh_selected_backend_status(endpoints, verify_backend)
+    elif status_mode == "silent":
         status = _cached_backend_status(endpoints) or _unchecked_backend_status(endpoints)
     else:
-        status = detect_backends(force_full=refresh_backends or endpoints_changed)
+        status = detect_backends(force_full=endpoints_changed)
     BACKEND_MONITOR_WAKE.set()
     runtime_data = {
         "host": RUNTIME.backend_host,
