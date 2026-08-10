@@ -46,7 +46,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.174"
+VERSION = "0.175"
 
 # Единый объект идентичности приложения. Пользовательские каталоги, имена
 # служебных файлов и расположение поставляемых схем вычисляются только отсюда.
@@ -79,8 +79,10 @@ FORGE_REFERENCE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 # API не передаётся, поэтому 32 МБ оставляют большой запас.
 MAX_API_MESSAGE = 32 * 1024 * 1024
 
-# Через сколько секунд бездействия фоновый процесс завершается самостоятельно.
-IDLE_TIMEOUT_SECONDS = 15 * 60
+# Пользовательские значения по умолчанию. После handshake они заменяются
+# настройками из JSX и сохраняются в runtime.json для следующего запуска.
+DEFAULT_IDLE_TIMEOUT_SECONDS = 15 * 60
+DEFAULT_BACKEND_MONITOR_INTERVAL_SECONDS = 5
 
 # До начала выполнения очередь и история опрашиваются с прежним интервалом.
 # После перехода prompt в running запрашивается только история, поэтому более
@@ -3027,15 +3029,37 @@ class WorkflowAnalyzer:
 
 # ============================================================================
 # CACHE АНАЛИЗА И ПРИМЕНЕНИЕ ЗНАЧЕНИЙ К WORKFLOW
-# Cache проверяется по размеру/mtime/hash/UUID анализатора. WorkflowPatcher заново
+# Cache проверяется по размеру/mtime/UUID анализатора. WorkflowPatcher заново
 # валидирует тип, диапазон и target перед каждым фактическим изменением JSON.
 # ============================================================================
 class SchemaCache:
-    def cache_path(self, workflow_id: str) -> Path:
+    MAX_OVERRIDE_VARIANTS = 8
+
+    @staticmethod
+    def _override_digest(overrides: Optional[Dict[str, Any]]) -> str:
+        if not overrides:
+            return ""
+        canonical = json.dumps(
+            overrides, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+    def cache_path(
+        self,
+        workflow_id: str,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        digest = self._override_digest(overrides)
+        if digest:
+            return WORKFLOW_CACHE_DIR / f"{workflow_id}.bindings.{digest}.json"
         return WORKFLOW_CACHE_DIR / f"{workflow_id}.json"
 
-    def _read_payload(self, workflow_file: WorkflowFile) -> Optional[Dict[str, Any]]:
-        path = self.cache_path(workflow_file.workflow_id)
+    def _read_payload(
+        self,
+        workflow_file: WorkflowFile,
+        overrides: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        path = self.cache_path(workflow_file.workflow_id, overrides)
         try:
             if not path.exists():
                 return None
@@ -3050,14 +3074,18 @@ class SchemaCache:
                 return None
             if int(data.get("modified_ns", -1)) != int(workflow_file.modified_ns):
                 return None
+            stored_overrides = data.get("binding_overrides")
+            if (stored_overrides or None) != (overrides or None):
+                return None
             return data
         except Exception:
-            LOGGER.warning("Corrupted workflow cache %s", workflow_file.workflow_id)
+            LOGGER.warning("Corrupted workflow cache %s", path.name)
             return None
 
     def load_fast_bundle(
         self,
         workflow_file: WorkflowFile,
+        overrides: Optional[Dict[str, Any]] = None,
     ) -> Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]:
         """Returns cached analysis and its compact validation schema.
 
@@ -3066,7 +3094,7 @@ class SchemaCache:
         a real /object_info request.
         """
 
-        data = self._read_payload(workflow_file)
+        data = self._read_payload(workflow_file, overrides)
         if not data:
             return None
         workflow_file.sha256 = str(data.get("workflow_hash") or "")
@@ -3081,10 +3109,14 @@ class SchemaCache:
             validation_schema = None
         return analysis, validation_schema
 
-    def load_fast(self, workflow_file: WorkflowFile) -> Optional[Dict[str, Any]]:
+    def load_fast(
+        self,
+        workflow_file: WorkflowFile,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Compatibility wrapper returning only cached workflow analysis."""
 
-        bundle = self.load_fast_bundle(workflow_file)
+        bundle = self.load_fast_bundle(workflow_file, overrides)
         return bundle[0] if bundle else None
 
     def save(
@@ -3092,8 +3124,9 @@ class SchemaCache:
         workflow_file: WorkflowFile,
         analysis: Dict[str, Any],
         validation_schema: Dict[str, Any],
+        overrides: Optional[Dict[str, Any]] = None,
     ) -> None:
-        path = self.cache_path(workflow_file.workflow_id)
+        path = self.cache_path(workflow_file.workflow_id, overrides)
         payload = {
             "cache_version": CACHE_VERSION,
             "analyzer_uuid": ANALYZER_UUID,
@@ -3103,16 +3136,33 @@ class SchemaCache:
             "modified": workflow_file.modified,
             "modified_ns": workflow_file.modified_ns,
             "workflow_hash": WorkflowRepository.ensure_hash(workflow_file),
+            "binding_overrides": overrides or None,
             "analysis": analysis,
             "validation_schema": validation_schema,
         }
         temp_path = path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temp_path.replace(path)
+        if overrides:
+            self._trim_override_variants(workflow_file.workflow_id)
+
+    def _trim_override_variants(self, workflow_id: str) -> None:
+        try:
+            variants = sorted(
+                WORKFLOW_CACHE_DIR.glob(f"{workflow_id}.bindings.*.json"),
+                key=lambda item: item.stat().st_mtime_ns,
+                reverse=True,
+            )
+            for stale in variants[self.MAX_OVERRIDE_VARIANTS:]:
+                stale.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("Could not trim binding caches for %s", workflow_id)
 
     def invalidate(self, workflow_id: str) -> None:
         try:
             self.cache_path(workflow_id).unlink(missing_ok=True)
+            for path in WORKFLOW_CACHE_DIR.glob(f"{workflow_id}.bindings.*.json"):
+                path.unlink(missing_ok=True)
         except OSError:
             LOGGER.warning("Could not delete cache %s", workflow_id)
 
@@ -4873,6 +4923,8 @@ class RuntimeConfig:
     comfy_output_folder: Optional[Path] = None
     workflows_folder: Path = Path.home() / "Documents" / "Comfy Workflows"
     generation_timeout: int = 20 * 60
+    idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS
+    backend_monitor_interval_seconds: int = DEFAULT_BACKEND_MONITOR_INTERVAL_SECONDS
 
 
 @dataclass
@@ -4899,14 +4951,17 @@ GENERATION = GenerationState()
 LAST_ACTIVITY = time.monotonic()
 LAST_ACTIVITY_LOCK = threading.Lock()
 
-# Статус backend кешируется только на время жизни этого Python-процесса.
-# Первый handshake проверяет обе оболочки. Последующие handshake пингуют
-# только ранее доступные оболочки. Если все они перестали отвечать, выполняется
-# один аварийный ping другой оболочки: это покрывает переключение Comfy ↔ Forge.
-# Полная повторная проверка также доступна вручную из настроек.
+# Статус backend обновляется отдельным фоновым worker. Handshake читает готовый
+# снимок и не задерживает очередной запуск JSX сетевыми запросами. Первый
+# handshake после старта Python выполняет полную проверку только если worker ещё
+# не успел опубликовать результат.
 BACKEND_STATUS_LOCK = threading.Lock()
+BACKEND_PROBE_LOCK = threading.Lock()
 BACKEND_STATUS_CACHE: Optional[Dict[str, Any]] = None
 BACKEND_STATUS_ENDPOINTS: Optional[Tuple[str, int, int]] = None
+BACKEND_MONITOR_WAKE = threading.Event()
+BACKEND_MONITOR_START_LOCK = threading.Lock()
+BACKEND_MONITOR_STARTED = False
 # Поиск локальных Comfy input/output-папок на Windows использует netstat/PowerShell и
 # заметно дороже обычного HTTP ping. Повторяем его только один раз для endpoint
 # за время жизни Python-процесса; сам /system_stats по-прежнему проверяется.
@@ -5211,8 +5266,8 @@ def analyze_workflow(
             analysis, validation_schema = runtime_bundle
             LOGGER.info("Workflow analysis: process cache used")
 
-    if analysis is None and not force and not overrides:
-        cached_bundle = SCHEMA_CACHE.load_fast_bundle(workflow_file)
+    if analysis is None and not force:
+        cached_bundle = SCHEMA_CACHE.load_fast_bundle(workflow_file, overrides)
         if cached_bundle is not None:
             analysis, validation_schema = cached_bundle
             LOGGER.info("Workflow analysis: disk cache used")
@@ -5230,15 +5285,18 @@ def analyze_workflow(
         WORKFLOW_RUNTIME_CACHE.put_analysis(
             workflow_file, overrides, analysis, validation_schema
         )
-        if not overrides:
-            SCHEMA_CACHE.save(workflow_file, analysis, validation_schema)
+        SCHEMA_CACHE.save(
+            workflow_file, analysis, validation_schema, overrides
+        )
     elif validation_schema is None:
         # Legacy cache migration: keep its ready analysis, request /object_info
         # once, and append only the compact validation metadata.
         object_info = get_object_info(force=False)
         workflow_data = WORKFLOW_RUNTIME_CACHE.load_json(workflow_file, repository)
         validation_schema = build_validation_schema(workflow_data, object_info)
-        SCHEMA_CACHE.save(workflow_file, analysis, validation_schema)
+        SCHEMA_CACHE.save(
+            workflow_file, analysis, validation_schema, overrides
+        )
         WORKFLOW_RUNTIME_CACHE.put_analysis(
             workflow_file, overrides, analysis, validation_schema
         )
@@ -5289,11 +5347,20 @@ def save_workflow_values(
     if cached_bundle is not None:
         analysis, object_info = cached_bundle
     else:
-        full_object_info = get_object_info(force=False)
-        analysis = WorkflowAnalyzer(workflow_data, full_object_info).analyze(
-            normalized_overrides
+        disk_bundle = SCHEMA_CACHE.load_fast_bundle(
+            workflow_file, normalized_overrides
         )
-        object_info = build_validation_schema(workflow_data, full_object_info)
+        if disk_bundle is not None and disk_bundle[1] is not None:
+            analysis, object_info = disk_bundle
+        else:
+            full_object_info = get_object_info(force=False)
+            analysis = WorkflowAnalyzer(workflow_data, full_object_info).analyze(
+                normalized_overrides
+            )
+            object_info = build_validation_schema(workflow_data, full_object_info)
+            SCHEMA_CACHE.save(
+                workflow_file, analysis, object_info, normalized_overrides
+            )
         WORKFLOW_RUNTIME_CACHE.put_analysis(
             workflow_file, normalized_overrides, analysis, object_info
         )
@@ -5835,8 +5902,8 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         analysis, validation_schema = runtime_bundle
         LOGGER.info("Comfy generation: process analysis cache used")
 
-    if analysis is None and not overrides:
-        cached_bundle = SCHEMA_CACHE.load_fast_bundle(workflow_file)
+    if analysis is None:
+        cached_bundle = SCHEMA_CACHE.load_fast_bundle(workflow_file, overrides)
         if cached_bundle is not None:
             analysis, validation_schema = cached_bundle
             LOGGER.info("Comfy generation: disk analysis cache used")
@@ -5852,14 +5919,17 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         WORKFLOW_RUNTIME_CACHE.put_analysis(
             workflow_file, overrides, analysis, validation_schema
         )
-        if not overrides:
-            SCHEMA_CACHE.save(workflow_file, analysis, validation_schema)
+        SCHEMA_CACHE.save(
+            workflow_file, analysis, validation_schema, overrides
+        )
     elif validation_schema is None:
         # Old cache format: retain the cached analysis, fetch full /object_info
         # once and rewrite the cache with the small validation subset.
         object_info = get_object_info(force=False)
         validation_schema = build_validation_schema(workflow_data, object_info)
-        SCHEMA_CACHE.save(workflow_file, analysis, validation_schema)
+        SCHEMA_CACHE.save(
+            workflow_file, analysis, validation_schema, overrides
+        )
         WORKFLOW_RUNTIME_CACHE.put_analysis(
             workflow_file, overrides, analysis, validation_schema
         )
@@ -6168,6 +6238,7 @@ def _compose_backend_status(comfy: Dict[str, Any], forge: Dict[str, Any]) -> Dic
         "mode": mode,
         "available_backends": available,
         "backends": {"comfy": comfy, "forge": forge},
+        "checked_at": time.time(),
     }
 
 
@@ -6233,8 +6304,8 @@ def _probe_forge(host: str, port: int) -> Dict[str, Any]:
 # ОБНАРУЖЕНИЕ BACKEND И HANDSHAKE
 # Comfy и Forge проверяются независимо; результат содержит режим none/comfy/forge/both.
 # ============================================================================
-def probe_backends(host: str, comfy_port: int, forge_port: int, *,
-                   update_runtime: bool = False) -> Dict[str, Any]:
+def _probe_backends_unlocked(host: str, comfy_port: int, forge_port: int, *,
+                             update_runtime: bool = False) -> Dict[str, Any]:
     """Полностью и независимо проверяет ComfyUI и Forge Neo.
 
     Эта функция используется при первом handshake и кнопкой ручного обновления
@@ -6254,6 +6325,16 @@ def probe_backends(host: str, comfy_port: int, forge_port: int, *,
     return _compose_backend_status(comfy, forge)
 
 
+def probe_backends(host: str, comfy_port: int, forge_port: int, *,
+                   update_runtime: bool = False) -> Dict[str, Any]:
+    """Serializes full probes so a handshake and the monitor never duplicate work."""
+
+    with BACKEND_PROBE_LOCK:
+        return _probe_backends_unlocked(
+            host, comfy_port, forge_port, update_runtime=update_runtime
+        )
+
+
 def _backend_endpoints(host: str, comfy_port: int, forge_port: int) -> Tuple[str, int, int]:
     return normalize_comfy_host(host), int(comfy_port), int(forge_port)
 
@@ -6267,69 +6348,63 @@ def _store_backend_status(status: Dict[str, Any], endpoints: Tuple[str, int, int
     return copy.deepcopy(snapshot)
 
 
-def detect_backends(*, force_full: bool = False) -> Dict[str, Any]:
-    """Возвращает статус с быстрым кешированным повторным handshake.
+def _cached_backend_status(
+    endpoints: Tuple[str, int, int],
+) -> Optional[Dict[str, Any]]:
+    with BACKEND_STATUS_LOCK:
+        if BACKEND_STATUS_ENDPOINTS != endpoints or BACKEND_STATUS_CACHE is None:
+            return None
+        return copy.deepcopy(BACKEND_STATUS_CACHE)
 
-    Если ранее была найдена хотя бы одна оболочка, обычно проверяются только
-    найденные оболочки. Если все ранее доступные backend перестали отвечать,
-    дополнительно проверяется ранее недоступная оболочка. Это позволяет быстро
-    обработать сценарий, когда пользователь закрыл Comfy и запустил Forge либо
-    наоборот. Полная проверка обеих оболочек выполняется при пустом кеше,
-    изменении адресов или ручном обновлении статуса.
-    """
+
+def _refresh_backend_status(
+    endpoints: Tuple[str, int, int],
+    *,
+    reuse_cached: bool,
+    max_cache_age: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Refresh both backends, rechecking the cache after waiting for probe lock."""
+
+    with BACKEND_PROBE_LOCK:
+        if reuse_cached:
+            cached = _cached_backend_status(endpoints)
+            if cached is not None:
+                checked_at = float(cached.get("checked_at") or 0.0)
+                if max_cache_age is None or time.time() - checked_at < max_cache_age:
+                    return cached
+        status = _probe_backends_unlocked(*endpoints, update_runtime=True)
+        return _store_backend_status(status, endpoints)
+
+
+def detect_backends(*, force_full: bool = False) -> Dict[str, Any]:
+    """Return the monitor snapshot; synchronously probe only on cache miss/refresh."""
 
     endpoints = _backend_endpoints(
         RUNTIME.backend_host, RUNTIME.comfy_port, RUNTIME.forge_port
     )
-    with BACKEND_STATUS_LOCK:
-        cached = copy.deepcopy(BACKEND_STATUS_CACHE)
-        cached_endpoints = BACKEND_STATUS_ENDPOINTS
+    if not force_full:
+        cached = _cached_backend_status(endpoints)
+        if cached is not None:
+            return cached
+    return _refresh_backend_status(endpoints, reuse_cached=not force_full)
 
-    cached_available = list(cached.get("available_backends") or []) if isinstance(cached, dict) else []
-    if force_full or cached is None or cached_endpoints != endpoints or not cached_available:
-        return _store_backend_status(
-            probe_backends(*endpoints, update_runtime=True), endpoints
-        )
 
+def _unchecked_backend_status(endpoints: Tuple[str, int, int]) -> Dict[str, Any]:
     host, comfy_port, forge_port = endpoints
-    previous_backends = cached.get("backends") if isinstance(cached.get("backends"), dict) else {}
-    if "comfy" in cached_available and "forge" in cached_available:
-        return _store_backend_status(
-            probe_backends(host, comfy_port, forge_port, update_runtime=True), endpoints
-        )
-    if "comfy" in cached_available:
-        comfy = _probe_comfy(host, comfy_port, update_runtime=True)
-    else:
-        comfy = copy.deepcopy(previous_backends.get("comfy") or _backend_probe_result(
-            "comfy", host, comfy_port, time.monotonic(), available=False,
-            error="Not checked: use manual status refresh.", checked=False,
-        ))
-        comfy["checked"] = False
-        comfy["latency_ms"] = 0
+    started = time.monotonic()
+    status = _compose_backend_status(
+        _backend_probe_result(
+            "comfy", host, comfy_port, started, available=False,
+            error="Background status is not ready.", checked=False,
+        ),
+        _backend_probe_result(
+            "forge", host, forge_port, started, available=False,
+            error="Background status is not ready.", checked=False,
+        ),
+    )
+    status["checked_at"] = 0.0
+    return status
 
-    if "forge" in cached_available:
-        forge = _probe_forge(host, forge_port)
-    else:
-        forge = copy.deepcopy(previous_backends.get("forge") or _backend_probe_result(
-            "forge", host, forge_port, time.monotonic(), available=False,
-            error="Not checked: use manual status refresh.", checked=False,
-        ))
-        forge["checked"] = False
-        forge["latency_ms"] = 0
-
-    status = _compose_backend_status(comfy, forge)
-    if status.get("available_backends"):
-        return _store_backend_status(status, endpoints)
-
-    # Быстрый путь не нашёл ни одной ранее доступной оболочки. Проверяем только
-    # альтернативный backend, который в этом handshake ещё не опрашивался.
-    # Повторно пинговать уже проверенный сервер не требуется.
-    if "comfy" in cached_available and "forge" not in cached_available:
-        forge = _probe_forge(host, forge_port)
-    elif "forge" in cached_available and "comfy" not in cached_available:
-        comfy = _probe_comfy(host, comfy_port, update_runtime=True)
-
-    return _store_backend_status(_compose_backend_status(comfy, forge), endpoints)
 
 def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     previous_endpoints = _backend_endpoints(
@@ -6348,13 +6423,26 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         RUNTIME.workflows_folder = Path(str(workflows_folder))
     if message.get("generationTimeout"):
         RUNTIME.generation_timeout = max(30, int(message["generationTimeout"]))
+    if "pythonIdleTimeout" in message:
+        RUNTIME.idle_timeout_seconds = max(
+            0, min(7 * 24 * 60 * 60, int(message["pythonIdleTimeout"]))
+        )
+    if "backendMonitorInterval" in message:
+        RUNTIME.backend_monitor_interval_seconds = max(
+            2, min(300, int(message["backendMonitorInterval"]))
+        )
 
-    endpoints_changed = previous_endpoints != _backend_endpoints(
+    endpoints = _backend_endpoints(
         RUNTIME.backend_host, RUNTIME.comfy_port, RUNTIME.forge_port
     )
-    status = detect_backends(
-        force_full=bool(message.get("refreshBackends")) or endpoints_changed
-    )
+    endpoints_changed = previous_endpoints != endpoints
+    status_mode = str(message.get("backendStatusMode") or "cached").lower()
+    refresh_backends = bool(message.get("refreshBackends"))
+    if status_mode == "silent" and not refresh_backends:
+        status = _cached_backend_status(endpoints) or _unchecked_backend_status(endpoints)
+    else:
+        status = detect_backends(force_full=refresh_backends or endpoints_changed)
+    BACKEND_MONITOR_WAKE.set()
     runtime_data = {
         "host": RUNTIME.backend_host,
         "comfy_port": RUNTIME.comfy_port,
@@ -6363,6 +6451,8 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         "comfy_output_folder": str(RUNTIME.comfy_output_folder or ""),
         "workflows_folder": str(RUNTIME.workflows_folder),
         "generation_timeout": RUNTIME.generation_timeout,
+        "idle_timeout_seconds": RUNTIME.idle_timeout_seconds,
+        "backend_monitor_interval_seconds": RUNTIME.backend_monitor_interval_seconds,
         "updated": time.time(),
     }
     try:
@@ -6377,6 +6467,8 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         "protocol": API_PROTOCOL,
         "comfy_input_folder": str(RUNTIME.comfy_input_folder or ""),
         "comfy_output_folder": str(RUNTIME.comfy_output_folder or ""),
+        "idle_timeout_seconds": RUNTIME.idle_timeout_seconds,
+        "backend_monitor_interval_seconds": RUNTIME.backend_monitor_interval_seconds,
     }
     result.update(status)
     return result
@@ -6418,6 +6510,7 @@ def handle_command(command: Dict[str, Any]) -> None:
             # следующий запуск JSX мог повторить подготовку зависимостей.
             if str(startup.get("status") or "") == "error":
                 WORKER_STOP.set()
+                BACKEND_MONITOR_WAKE.set()
                 try:
                     with socket.create_connection((API_HOST, API_RECEIVE_PORT), timeout=1):
                         pass
@@ -6563,6 +6656,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                 # между приёмом команды и началом run_generation больше нет окна.
                 GENERATION.queued = True
                 GENERATION_QUEUE.put(command)
+                BACKEND_MONITOR_WAKE.set()
             # Первый ответ придёт из worker после успешного POST /prompt.
             return
 
@@ -6659,18 +6753,72 @@ def remove_lock_file() -> None:
         pass
 
 
+def backend_monitor_watcher() -> None:
+    """Refresh both backend states without adding network work to JSX startup."""
+
+    while not WORKER_STOP.is_set():
+        interval = max(2, int(RUNTIME.backend_monitor_interval_seconds))
+        endpoints = _backend_endpoints(
+            RUNTIME.backend_host, RUNTIME.comfy_port, RUNTIME.forge_port
+        )
+        cached = _cached_backend_status(endpoints)
+        checked_at = float(cached.get("checked_at") or 0.0) if cached else 0.0
+        remaining = max(0.0, interval - (time.time() - checked_at)) if cached else 0.0
+        if remaining > 0:
+            BACKEND_MONITOR_WAKE.wait(remaining)
+            BACKEND_MONITOR_WAKE.clear()
+            continue
+        if GENERATION.active or GENERATION.queued or not GENERATION_QUEUE.empty():
+            BACKEND_MONITOR_WAKE.wait(min(1.0, float(interval)))
+            BACKEND_MONITOR_WAKE.clear()
+            continue
+        # Короткое окно позволяет только что принятой генерации разбудить
+        # monitor до начала HTTP-probe. Оно не блокирует JSX или worker.
+        if BACKEND_MONITOR_WAKE.wait(0.1):
+            BACKEND_MONITOR_WAKE.clear()
+            continue
+        if GENERATION.active or GENERATION.queued or not GENERATION_QUEUE.empty():
+            continue
+        try:
+            _refresh_backend_status(
+                endpoints,
+                reuse_cached=True,
+                max_cache_age=max(1.0, interval * 0.8),
+            )
+        except Exception:
+            log_exception("Background backend status check failed")
+            BACKEND_MONITOR_WAKE.wait(1.0)
+            BACKEND_MONITOR_WAKE.clear()
+
+
+def start_backend_monitor() -> None:
+    global BACKEND_MONITOR_STARTED
+    with BACKEND_MONITOR_START_LOCK:
+        if BACKEND_MONITOR_STARTED:
+            return
+        BACKEND_MONITOR_STARTED = True
+        monitor_thread = threading.Thread(
+            target=backend_monitor_watcher,
+            name="BackendMonitor",
+            daemon=True,
+        )
+        monitor_thread.start()
+
+
 def idle_watcher() -> None:
     while not WORKER_STOP.wait(5.0):
         with LAST_ACTIVITY_LOCK:
             idle = time.monotonic() - LAST_ACTIVITY
         if (
-            idle > IDLE_TIMEOUT_SECONDS
+            RUNTIME.idle_timeout_seconds > 0
+            and idle > RUNTIME.idle_timeout_seconds
             and not GENERATION.active
             and not GENERATION.queued
             and GENERATION_QUEUE.empty()
         ):
             LOGGER.info("Shutting down after %.0f seconds of inactivity", idle)
             WORKER_STOP.set()
+            BACKEND_MONITOR_WAKE.set()
             # Пустое подключение будит accept().
             try:
                 with socket.create_connection((API_HOST, API_RECEIVE_PORT), timeout=1):
@@ -6698,6 +6846,25 @@ def load_runtime_file() -> None:
         if folder:
             RUNTIME.workflows_folder = Path(str(folder))
         RUNTIME.generation_timeout = int(data.get("generation_timeout") or RUNTIME.generation_timeout)
+        RUNTIME.idle_timeout_seconds = max(
+            0,
+            min(
+                7 * 24 * 60 * 60,
+                int(data.get("idle_timeout_seconds", RUNTIME.idle_timeout_seconds)),
+            ),
+        )
+        RUNTIME.backend_monitor_interval_seconds = max(
+            2,
+            min(
+                300,
+                int(
+                    data.get(
+                        "backend_monitor_interval_seconds",
+                        RUNTIME.backend_monitor_interval_seconds,
+                    )
+                ),
+            ),
+        )
     except Exception:
         LOGGER.warning("Could not read runtime.json")
 
@@ -6713,6 +6880,7 @@ def initialize_server_runtime() -> None:
         write_startup_status("error", str(exc) or exc.__class__.__name__)
         return
     write_startup_status("ready", "Python API is ready")
+    start_backend_monitor()
     # Очистка не влияет на готовность API и выполняется в уже существующем
     # InitializationWorker после публикации ready. Файлы текущих запросов моложе
     # TEMP_MAX_AGE_SECONDS, поэтому параллельная генерация с ней не конфликтует.
@@ -6792,6 +6960,7 @@ def start_local_server() -> None:
             thread.start()
     finally:
         WORKER_STOP.set()
+        BACKEND_MONITOR_WAKE.set()
         cancel_current_generation()
         try:
             server.close()

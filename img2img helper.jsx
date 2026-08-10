@@ -33,10 +33,11 @@ var APP = {
     },
     cache: {
         schemaVersion: 1,
-        comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
+        comfyAnalysisUuid: "7b8ac290-d69b-4b3e-aff4-69b238bfe71f",
+        maxWorkflowSchemas: 6
     }
 },
-    VER = "0.158",
+    VER = "0.159",
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // Photoshop Actions не распознаются, а главное окно открывается всегда.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -152,6 +153,7 @@ function init() {
             globalSettings.load();
             settingsWarnings = settingsWarnings.concat(globalSettings.consumeLoadWarnings());
             cfg.copySharedLibrariesFrom(globalSettings);
+            cfg.copyPythonRuntimeSettingsFrom(globalSettings);
         }
     } else {
         cfg.load();
@@ -189,17 +191,20 @@ function init() {
         }
         api.initialize(startupProgress, apiRunning);
         if (startupProgress) startupProgress.setStage(str.progressHandshake, 22);
-        backend.applyStatus(api.handshake(startupProgress));
+        backend.applyStatus(api.handshake(
+            startupProgress, null, false, showInterface ? "cached" : "silent"
+        ));
         var backendChangedAtStartup = false;
-        // Action с записанными настройками обязан использовать backend,
-        // сохранённый в playbackParameters. Не подменяем его другим
-        // доступным backend: иначе Forge Action может открыть Comfy profile
-        // (и наоборот), скрывая реальную причину невозможности запуска.
-        if (actionPlaybackMode && actionUsesRecordedSettings) {
-            if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
-        } else {
-            backendChangedAtStartup = backend.normalizeActiveBackend();
-            if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
+        // Тихий запуск не принимает решений по фоновому снимку: он использует
+        // сохранённый backend, а реальную недоступность сообщит его API. В UI
+        // можно выбрать найденную оболочку; записанный Action не подменяем.
+        if (showInterface) {
+            if (actionPlaybackMode && actionUsesRecordedSettings) {
+                if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
+            } else {
+                backendChangedAtStartup = backend.normalizeActiveBackend();
+                if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
+            }
         }
         // Полный каталог нужен интерфейсу, но не тихой генерации с уже
         // сохранённым workflow/preset. При предупреждениях или смене backend
@@ -496,7 +501,12 @@ function mainDialog(selection, initial, responseSeconds) {
         if (profile.bindingOverrides.sizeMode !== "source_image" && profile.bindingOverrides.sizeMode !== "binding")
             profile.bindingOverrides.sizeMode = "auto";
         if (profile.bindingOverrides.sizeMode != "binding") profile.bindingOverrides.size = "";
-        if (!bindingOverridesEqual(previous, profile.bindingOverrides)) profile.schemaCache = null;
+        if (!bindingOverridesEqual(previous, profile.bindingOverrides)) {
+            profile.schemaCache = null;
+            profile.schemaCacheStamp = null;
+            profile.schemaCacheVersion = 0;
+            profile.schemaCacheUsed = 0;
+        }
         reloadSelectedWorkflow(false, progress); return true;
     }
     // Значения слоя заменяют profile.values целиком. Это важно: скрытые
@@ -880,6 +890,7 @@ function mainDialog(selection, initial, responseSeconds) {
                         profile.schemaCache = null;
                         profile.schemaCacheStamp = null;
                         profile.schemaCacheVersion = 0;
+                        profile.schemaCacheUsed = 0;
                     }
                     // Сохраняем принятые настройки до повторного анализа.
                     // Если API снова вернёт ошибку сопоставления, выбранные
@@ -1339,6 +1350,29 @@ function mainDialog(selection, initial, responseSeconds) {
             forgeBrowse = connectionRows.forgeSchemasFolder.button;
         browse.onClick = function () { var folder = Folder.selectDialog(str.selectWorkflowFolder); if (folder) folderEdit.text = folder.fsName; };
         forgeBrowse.onClick = function () { var folder = Folder.selectDialog(str.selectForgeSchemaFolder); if (folder) forgeFolderEdit.text = folder.fsName; };
+        var pythonIdleSeconds = parseInt(temp.pythonIdleTimeout, 10);
+        if (isNaN(pythonIdleSeconds)) pythonIdleSeconds = 15 * 60;
+        var pythonServer = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
+        pythonServer.text = str.pythonServerSettings;
+        var pythonRows = ui.addFormRows(pythonServer, [
+                {
+                    id: "version", type: "static", label: str.pythonApiVersion,
+                    value: backend.pythonVersion() ? "v" + backend.pythonVersion() : "—",
+                    labelWidth: 220, controlWidth: 100
+                },
+                {
+                    id: "idleTimeout", label: str.pythonIdleTimeout,
+                    value: String(Math.round(pythonIdleSeconds / 60)),
+                    labelWidth: 220, controlWidth: 65
+                },
+                {
+                    id: "monitorInterval", label: str.backendMonitorInterval,
+                    value: String(temp.backendMonitorInterval || 5),
+                    labelWidth: 220, controlWidth: 65
+                }
+            ], ui.settingsControlWidth),
+            pythonIdleTimeout = pythonRows.idleTimeout.control,
+            backendMonitorInterval = pythonRows.monitorInterval.control;
         function updateBackendFields() {
             var comfyMode = temp.activeBackend != BACKEND_FORGE;
             comfyPortRow.enabled = folderRow.enabled = comfyMode;
@@ -1537,6 +1571,10 @@ function mainDialog(selection, initial, responseSeconds) {
             temp.flatten = flatten.value; temp.rasterizeImage = rasterize.value; temp.keepAspectRatioDuringPlace = keepAspectRatio.value;
             temp.recordSettingsToAction = recordSettings.value; temp.writeLayerMetadata = metadata.value; temp.selectBrush = selectBrush.value;
             temp.brushOpacity = clamp(Math.round(opacityControl.slider.value), 1, 100); temp.generationTimeout = clamp(parseInt(timeout.text, 10) || 1200, 30, 86400);
+            var idleMinutes = parseInt(pythonIdleTimeout.text, 10);
+            if (isNaN(idleMinutes)) idleMinutes = 15;
+            temp.pythonIdleTimeout = clamp(idleMinutes, 0, 7 * 24 * 60) * 60;
+            temp.backendMonitorInterval = clamp(parseInt(backendMonitorInterval.text, 10) || 5, 2, 300);
             if (folderChanged) { temp.workflowCatalog = []; temp.selectedWorkflow = ""; }
             if (forgeFolderChanged) { temp.forgeCatalog = []; temp.selectedForgePreset = ""; }
             cfg.data = temp; cfg.bindProperties(); accepted = true; w.close(1);
@@ -2227,12 +2265,14 @@ function GenerationRuntime() {
 // ============================================================================
 // PHOTOSHOP ACTIONS
 // Разделяет обычный DESC и параметры конкретного Action. Общие библиотеки
-// prompt/reference всегда остаются в DESC, чтобы не размножаться по Actions.
+// prompt/reference и настройки Python остаются в DESC, чтобы не размножаться
+// и не устаревать внутри записанных Actions.
 // ============================================================================
 function ActionRuntime() {
-    function saveSharedLibraries() {
+    function saveSharedSettings() {
         if (!globalSettings) return;
         cfg.copySharedLibrariesTo(globalSettings);
+        cfg.copyPythonRuntimeSettingsTo(globalSettings);
         globalSettings.save();
     }
     this.getPlaybackParameterCount = function () {
@@ -2273,7 +2313,7 @@ function ActionRuntime() {
     this.saveAcceptedSettings = function () {
         if (actionPlaybackMode && actionUsesRecordedSettings && cfg.recordSettingsToAction) {
             cfg.saveToAction();
-            saveSharedLibraries();
+            saveSharedSettings();
             return;
         }
         cfg.save();
@@ -2302,7 +2342,8 @@ function ActionRuntime() {
 function BackendRuntime() {
     var status = { mode: "none", available_backends: [], backends: { comfy: { available: false }, forge: { available: false } } },
         pendingNotices = [],
-        localComfyInputFolder = "";
+        localComfyInputFolder = "",
+        pythonApiVersion = "";
     function pushNotice(key, msg) {
         key = String(key || msg || "");
         msg = String(msg || "");
@@ -2330,6 +2371,8 @@ function BackendRuntime() {
     }
     function applyStatus(response) {
         if (!response || typeof response != "object") return;
+        if (response.hasOwnProperty("version"))
+            pythonApiVersion = String(response.version || "");
         if (response.hasOwnProperty("comfy_input_folder"))
             localComfyInputFolder = String(response.comfy_input_folder || "");
         var source = response.backends ? response : { mode: "none", available_backends: [], backends: {} };
@@ -2341,7 +2384,8 @@ function BackendRuntime() {
                 forge: source.backends && source.backends.forge ? source.backends.forge : { available: false }
             }
         };
-        if (!status.backends.comfy.available) localComfyInputFolder = "";
+        if (!status.backends.comfy.available && status.backends.comfy.checked !== false)
+            localComfyInputFolder = "";
     }
     function isAvailable(name) {
         return !!(status && status.backends && status.backends[name] && status.backends[name].available);
@@ -2728,6 +2772,7 @@ function BackendRuntime() {
     this.hasAvailable = function () { return status.mode != "none"; };
     this.isAvailable = isAvailable;
     this.statusLabel = statusLabel;
+    this.pythonVersion = function () { return pythonApiVersion; };
     this.normalizeActiveBackend = normalizeActiveBackend;
     this.comfyFolderReady = comfyFolderReady;
     this.defaultForgeFolder = defaultForgeFolder;
@@ -4476,7 +4521,7 @@ function BridgeApi() {
     };
     this.ping = function (progress, timeout) { return call("ping", null, timeout || SHORT_TIMEOUT, progress); };
     this.translate = function (text, progress) { return call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress); };
-    this.handshake = function (progress, settings, refreshBackends) {
+    this.handshake = function (progress, settings, refreshBackends, backendStatusMode) {
         var source = settings || cfg;
         return call("handshake", {
             host: source.backendHost,
@@ -4484,6 +4529,9 @@ function BridgeApi() {
             forgePort: source.forgePort,
             workflowsFolder: source.workflowsFolder,
             generationTimeout: source.generationTimeout,
+            pythonIdleTimeout: source.pythonIdleTimeout,
+            backendMonitorInterval: source.backendMonitorInterval,
+            backendStatusMode: backendStatusMode || "cached",
             refreshBackends: !!refreshBackends
         }, SHORT_TIMEOUT, progress);
     };
@@ -4925,7 +4973,7 @@ function Config() {
             "backendHost", "activeBackend", "comfyPort", "forgePort", "workflowsFolder", "forgeSchemasFolder", "selectedWorkflow", "selectedForgePreset",
             "autoResize", "sizeMultiple", "resizePresets",
             "flatten", "rasterizeImage", "keepAspectRatioDuringPlace", "recordSettingsToAction", "writeLayerMetadata",
-            "selectBrush", "brushOpacity", "generationTimeout", "workflowProfiles", "forgeProfiles",
+            "selectBrush", "brushOpacity", "generationTimeout", "pythonIdleTimeout", "backendMonitorInterval", "workflowProfiles", "forgeProfiles",
             "workflowCatalog", "forgeCatalog", "referenceHistory", "promptPresets", "descSaveCount"
         ];
     this.data = defaultData();
@@ -5084,11 +5132,14 @@ function Config() {
         delete res.workflowCatalog;
         delete res.forgeCatalog;
         delete res.descSaveCount;
+        delete res.pythonIdleTimeout;
+        delete res.backendMonitorInterval;
         var profiles = isObjectMap(res.workflowProfiles) ? res.workflowProfiles : {};
         for (var workflowId in profiles) if (profiles.hasOwnProperty(workflowId) && profiles[workflowId]) {
             delete profiles[workflowId].schemaCache;
             delete profiles[workflowId].schemaCacheStamp;
             delete profiles[workflowId].schemaCacheVersion;
+            delete profiles[workflowId].schemaCacheUsed;
         }
         return res;
     }
@@ -5275,7 +5326,7 @@ function Config() {
             referenceFiles: {}, sizeMultiple: self.sizeMultiple,
             autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
             outputFormat: "jpg", manualScale: 1,
-            schemaCache: null, schemaCacheStamp: null, schemaCacheVersion: 0
+            schemaCache: null, schemaCacheStamp: null, schemaCacheVersion: 0, schemaCacheUsed: 0
         };
         normalizeBaseProfile(profile);
         if (!isObjectMap(profile.bindingOverrides))
@@ -5342,6 +5393,16 @@ function Config() {
         targetConfig.getPromptPresetStore("positive");
         targetConfig.getPromptPresetStore("negative");
     };
+    this.copyPythonRuntimeSettingsFrom = function (sourceConfig) {
+        if (!sourceConfig) return;
+        self.pythonIdleTimeout = self.data.pythonIdleTimeout = sourceConfig.pythonIdleTimeout;
+        self.backendMonitorInterval = self.data.backendMonitorInterval = sourceConfig.backendMonitorInterval;
+    };
+    this.copyPythonRuntimeSettingsTo = function (targetConfig) {
+        if (!targetConfig) return;
+        targetConfig.pythonIdleTimeout = targetConfig.data.pythonIdleTimeout = self.pythonIdleTimeout;
+        targetConfig.backendMonitorInterval = targetConfig.data.backendMonitorInterval = self.backendMonitorInterval;
+    };
     this.setWorkflowCatalog = function (items) {
         self.workflowCatalog = self.data.workflowCatalog = items || [];
         for (var i = 0; i < self.workflowCatalog.length; i++) {
@@ -5357,20 +5418,31 @@ function Config() {
         var stamp = workflowStamp(workflow.relative_path || profile.relativePath);
         if (!stamp) return null;
         if (stamp.size != profile.schemaCacheStamp.size || stamp.modified != profile.schemaCacheStamp.modified) return null;
+        profile.schemaCacheUsed = (new Date()).getTime();
         return profile.schemaCache;
     };
     this.cacheSchema = function (schema, workflow) {
         if (!schema || !schema.workflow_id) return;
-        for (var workflowId in self.workflowProfiles) if (self.workflowProfiles.hasOwnProperty(workflowId) && workflowId != schema.workflow_id) {
-            self.workflowProfiles[workflowId].schemaCache = null;
-            self.workflowProfiles[workflowId].schemaCacheStamp = null;
-            self.workflowProfiles[workflowId].schemaCacheVersion = 0;
-        }
         var profile = self.getProfile(schema.workflow_id);
         profile.relativePath = schema.relative_path || (workflow ? workflow.relative_path : profile.relativePath) || "";
         profile.schemaCache = schema;
         profile.schemaCacheStamp = workflowStamp(profile.relativePath);
         profile.schemaCacheVersion = APP.cache.schemaVersion;
+        profile.schemaCacheUsed = (new Date()).getTime();
+        var cached = [], workflowId;
+        for (workflowId in self.workflowProfiles) if (self.workflowProfiles.hasOwnProperty(workflowId)) {
+            var cachedProfile = self.workflowProfiles[workflowId];
+            if (cachedProfile && cachedProfile.schemaCache)
+                cached.push({ id: workflowId, used: Number(cachedProfile.schemaCacheUsed) || 0 });
+        }
+        cached.sort(function (a, b) { return b.used - a.used; });
+        for (var i = APP.cache.maxWorkflowSchemas; i < cached.length; i++) {
+            var staleProfile = self.workflowProfiles[cached[i].id];
+            staleProfile.schemaCache = null;
+            staleProfile.schemaCacheStamp = null;
+            staleProfile.schemaCacheVersion = 0;
+            staleProfile.schemaCacheUsed = 0;
+        }
     };
     this.bindProperties();
     if (!this.resizePresets || !this.resizePresets.length) this.resizePresets = this.data.resizePresets = presets.defaultResize();
@@ -5404,6 +5476,8 @@ function Config() {
             selectBrush: true,
             brushOpacity: 60,
             generationTimeout: 1200,
+            pythonIdleTimeout: 15 * 60,
+            backendMonitorInterval: 5,
             workflowProfiles: {},
             forgeProfiles: {},
             workflowCatalog: [],
@@ -5693,7 +5767,11 @@ function Locale() {
     var localized = {
         all: ["Все", "All"], recordSettingsToAction: ["Записывать настройки в экшен", "Record settings to action"], automatic: ["Автоматически", "Automatic"],
         autoResize: ["Автомасштаб", "Auto resize"], brushSettings: ["Настройки кисти", "Brush settings"], browse: ["Обзор…", "Browse…"],
-        connectionSettings: ["Подключение", "Connection"], errorDialogTitle: ["Ошибка", "Error"],
+        connectionSettings: ["Подключение", "Connection"], pythonServerSettings: ["Python-сервер", "Python server"],
+        pythonApiVersion: ["Версия Python API:", "Python API version:"],
+        pythonIdleTimeout: ["Остановка после простоя, мин (0 — выкл.):", "Stop after idle, min (0 = off):"],
+        backendMonitorInterval: ["Проверка бэкендов в фоне, с:", "Background backend check, s:"],
+        errorDialogTitle: ["Ошибка", "Error"],
         errSettingsSaveAfterError: ["Операция завершилась с ошибкой, и настройки сохранить не удалось:", "The operation failed and the settings could not be saved:"],
         errSettingsSaveAfterGeneration: ["Результат создан, но настройки сохранить не удалось:", "The result was created, but the settings could not be saved:"],
         errSettingsReadFile: ["Не удалось прочитать файл настроек.", "Could not read the settings file."],
