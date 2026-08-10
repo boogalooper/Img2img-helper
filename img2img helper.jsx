@@ -37,32 +37,27 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.164",
-	// Отладочный флаг должен оставаться false в рабочей сборке. При true
-	// Photoshop Actions не распознаются, а главное окно открывается всегда.
+	VER = "0.165",
+	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
 	API_HOST = "127.0.0.1",
 	API_PORT_SEND = 6370,
 	API_PORT_LISTEN = 6371,
 	API_PROTOCOL = 1,
-	// Первый запуск Python может устанавливать deep-translator, Pillow и websocket-client.
-	// Если API не открыл порт за две минуты, запуск считается неудачным.
+	// На запуск Python и установку зависимостей даётся две минуты.
 	START_TIMEOUT = 2 * 60 * 1000,
 	SHORT_TIMEOUT = 8000,
 	STARTUP_PROGRESS_DELAY = 1000,
 	TRANSLATE_TIMEOUT = 10 * 60 * 1000,
 	ANALYZE_TIMEOUT = 90000,
-	// Масштаб времени плавной инициализации: за 7,5 с заполняется половина
-	// первого сегмента, затем индикатор всё медленнее приближается к 20%.
+	// За 7,5 с подготовка проходит половину пути к пределу 20%.
 	GENERATION_PREPARE_EXPECTED_MS = 7500,
 	GENERATION_RUN_DEFAULT_EXPECTED_MS = 7500,
 	GENERATION_PREPARE_SEGMENT = 20,
 	GENERATION_RUN_SEGMENT = 80,
 	GENERATION_TOTAL_SEGMENTS = 100,
-	// doProgressTask() получает долю ещё не использованного участка, а не
-	// процентные пункты. Основная генерация за ожидаемое время заполняет 95%
-	// своего сегмента; подготовка использует отдельную плавную асимптоту.
+	// doProgressTask() получает долю оставшегося участка.
 	PROGRESS_STAGE_TARGET = 0.95,
 	DESC_PROFILE_CLEANUP_INTERVAL = 500,
 	BACKEND_COMFY = "comfy",
@@ -97,13 +92,7 @@ var APP = {
 	globalSettings = null,
 	settingsReady = false,
 	keyboardState = ScriptUI.environment.keyboardState;
-// ---
-// ТОЧКА ВХОДА И ОБЩАЯ ОБРАБОТКА ОШИБОК
-// Shift всегда принудительно показывает окно только для текущего запуска.
-// Аргумент dialog/ui учитывается обычным запуском. Тихий шаг Photoshop Action
-// игнорирует обычный dialog-флаг. Shift остаётся одноразовым ручным
-// исключением; ошибки сами прерывают Action и не влияют на следующий запуск.
-// ---
+// ТОЧКА ВХОДА: Shift открывает окно только для текущего запуска.
 try { init(); }
 catch (e) {
 	if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
@@ -112,9 +101,7 @@ catch (e) {
 		isCancelled = true;
 		$.setenv(APP.dialogEnvKey, "true");
 	} else {
-		// После успешного placeResult повторное сохранение настроек не
-		// запускаем: ошибка финализации не должна затрагивать уже созданный
-		// слой и не должна провоцировать ещё одну ошибку записи.
+		// После placeResult не повторяем сохранение при ошибке финализации.
 		var settingsSaveError = generationResultPlaced ? "" : action.saveAfterError(),
 			errorText = APP.name + "\n\n" + e.message +
 				(e.line ? "\n\n" + str.jsxLine + e.line : "");
@@ -126,9 +113,7 @@ catch (e) {
 	}
 }
 finally {
-	// checkSelection() может выйти из Quick Mask ещё до открытия главного
-	// окна. Если генерация не дошла до успешного размещения результата,
-	// возвращаем документ к состоянию, сохранённому перед проверкой selection.
+	// При неудаче возвращаем состояние документа до checkSelection().
 	restoreInitialDocumentState();
 }
 isCancelled ? "cancel" : undefined;
@@ -171,10 +156,7 @@ function init() {
 	settingsReady = true;
 	cfg.cleanReferenceHistory();
 	var environmentMode = DEBUG_FIRST_LAUNCH_WITH_INTERFACE ? null : $.getenv(APP.dialogEnvKey),
-		// В Action обычный dialog-флаг не наследуется между итерациями.
-		// Shift и Photoshop dialog mode действуют только на текущий запуск.
-		// Ошибка сама прерывает Action и не заставляет следующую итерацию
-		// открывать интерфейс.
+		// В Action dialog-флаг действует только на текущую итерацию.
 		showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
 			? forceDialog || app.playbackDisplayDialogs == DialogModes.ALL
 			: forceDialog || environmentMode == "true" || environmentMode == null);
@@ -190,8 +172,7 @@ function init() {
 	app.activeDocument.suspendHistory(localize(str.historyCheckSelection), "checkSelection(selection)");
 	if (!selection.result) return;
 	try {
-		// Один дешёвый TCP-check определяет, нужно ли показывать прогресс запуска.
-		// Сам ping выполняется только один раз внутри initialize().
+		// TCP-check определяет, нужен ли прогресс запуска.
 		var apiRunning = api.isRunning();
 		if (!apiRunning) {
 			startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT + ANALYZE_TIMEOUT);
@@ -199,9 +180,7 @@ function init() {
 		}
 		api.initialize(startupProgress, apiRunning);
 		if (startupProgress) startupProgress.setStage(str.progressHandshake, 22);
-		// Каждый запуск проверяет именно backend из текущих настроек или Action.
-		// Вторую оболочку берём из фонового снимка и проверяем напрямую только
-		// перед возможным переключением в обычном диалоговом режиме.
+		// Каждый запуск проверяет выбранный backend; второй — перед переключением.
 		backend.applyStatus(api.handshake(
 			startupProgress, null, false, showInterface ? "cached" : "silent",
 			cfg.activeBackend
@@ -212,8 +191,7 @@ function init() {
 			backend.applyStatus(api.handshake(startupProgress, null, false, "cached", alternateBackend));
 		}
 		var backendChangedAtStartup = false;
-		// Тихий запуск и записанный Action никогда не подменяют выбранный backend.
-		// Обычный диалог может перейти на второй, но только после его живой проверки.
+		// Тихий запуск и Action не подменяют выбранный backend.
 		if (showInterface) {
 			if (actionPlaybackMode && actionUsesRecordedSettings) {
 				if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
@@ -222,9 +200,7 @@ function init() {
 				if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
 			}
 		} else if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
-		// Полный каталог нужен интерфейсу, но не тихой генерации с уже
-		// сохранённым workflow/preset. При предупреждениях или смене backend
-		// сразу используем полный путь, поскольку окно всё равно будет открыто.
+		// Тихая генерация использует быстрый путь без полного каталога.
 		var allowFastInitialLoad = !showInterface && !backendChangedAtStartup && !settingsWarnings.length,
 			initial = backend.loadInitialData(startupProgress, allowFastInitialLoad);
 		initial.notices = settingsWarnings.concat(initial.notices instanceof Array ? initial.notices : []);
@@ -233,9 +209,7 @@ function init() {
 			showInterface = true;
 			$.setenv(APP.dialogEnvKey, "true");
 		}
-		// Быстрый путь мог сам обнаружить причину для показа окна (например,
-		// исчезнувшее значение dropdown). Перед созданием UI один раз получаем
-		// актуальный полный список, сохраняя уже сформированные уведомления.
+		// При переходе из быстрого пути в UI загружаем полный каталог.
 		if (showInterface && initial.fastPath) {
 			var fastNotices = initial.notices instanceof Array ? initial.notices : [],
 				fullInitial = backend.loadInitialData(startupProgress, false),
@@ -280,11 +254,7 @@ function init() {
 		if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
 	}
 }
-// ---
-// ГЛОБАЛЬНЫЕ CALLBACK-ОБЁРТКИ ДЛЯ Photoshop progress/suspendHistory
-// Photoshop вызывает такие функции по имени из строкового выражения, поэтому
-// они намеренно находятся в глобальной области, а не внутри объектов.
-// ---
+// Глобальные callback для Photoshop progress/suspendHistory.
 function runWorkflowAnalysisProgress() { return backend.runWorkflowAnalysisProgress(); }
 function workflowAnalysisStage() { return backend.workflowAnalysisStage(); }
 function errorMessageText(value) {
@@ -298,16 +268,14 @@ function itemData(source) {
 		value = objectItem && source.value !== undefined ? source.value : label;
 	return { label: String(label === undefined ? "" : label), value: value === undefined ? "" : value };
 }
-// Ищет именно обычный CFG Scale. Guidance и Distilled CFG — самостоятельные
-// параметры и не должны управлять доступностью Negative prompt.
+// Только обычный CFG Scale управляет доступностью Negative prompt.
 function findForgeCfgControlId(schema) {
 	var controls = schema && schema.controls instanceof Array ? schema.controls : [];
 	for (var i = 0; i < controls.length; i++) {
 		var id = String(controls[i].id || ""),
 			input = String(controls[i].input || "").toLowerCase(),
 			payloadKey = String(controls[i].payload_key || "").toLowerCase();
-		// Guidance и Distilled CFG являются отдельными параметрами и не должны
-		// управлять доступностью Negative prompt вместо обычного CFG Scale.
+		// Guidance и Distilled CFG не заменяют обычный CFG Scale.
 		if (startsWithSemantic(id, "cfg")) return id;
 		if (input == "cfg" || input == "cfg_scale" || payloadKey == "cfg_scale") return id;
 	}
@@ -325,11 +293,7 @@ function shouldDisableNegativePrompt(schema, values) {
 function forgeSchemaId(schema) {
 	return schema ? schema.workspace_id || String(schema.workflow_id || "").replace(/^forge:/, "") : "";
 }
-// ---
-// ГЛАВНОЕ ОКНО
-// Внутренние функции работают с единым state и полностью перестраивают только
-// динамическую область gSettings при смене backend/workflow/schema.
-// ---
+// ГЛАВНОЕ ОКНО: state хранит данные динамической области.
 function mainDialog(selection, initial, responseSeconds) {
 	var selectionBounds = selection.bounds,
 		state = {
@@ -409,9 +373,10 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (probePerformed || oldData.backendHost != cfg.backendHost || oldData.forgePort != cfg.forgePort || oldData.forgeSchemasFolder != cfg.forgeSchemasFolder)
 			state.forgeCatalog = {};
 		try {
-			backend.normalizeActiveBackend();
 			ui.runWithPaletteProgress(str.progressInitializing, function (progress) {
-				backend.applyStatus(api.handshake(progress, null, true));
+				backend.applyStatus(api.handshake(
+					progress, null, false, "cached", "", settingsResult.probeToken
+				));
 				backend.normalizeActiveBackend();
 				if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
 				loadBackend(cfg.activeBackend, progress, true);
@@ -419,7 +384,8 @@ function mainDialog(selection, initial, responseSeconds) {
 			updateMetadataButton();
 		} catch (e) {
 			cfg.data = oldData; cfg.bindProperties();
-			try { backend.applyStatus(api.handshake(null, cfg)); } catch (_) { }
+			try { api.handshake(null, cfg, false, "silent"); } catch (_) { }
+			backend.applyStatus(oldStatus);
 			backend.normalizeActiveBackend();
 			ui.showErrorMessage(e);
 		}
@@ -1323,11 +1289,7 @@ function mainDialog(selection, initial, responseSeconds) {
 	function candidateId(dropdown) {
 		return dropdown && dropdown.selection ? dropdown.selection.candidateId : "";
 	}
-	// ---
-	// ГЛОБАЛЬНЫЕ НАСТРОЙКИ
-	// Редактирование ведётся в копии temp. cfg изменяется только после Save,
-	// поэтому закрытие окна не оставляет частично применённых значений.
-	// ---
+	// ГЛОБАЛЬНЫЕ НАСТРОЙКИ: cfg изменяется только после Save.
 	function showGlobalSettings() {
 		var temp = cloneObj(cfg.data),
 			w = ui.createDialog({ title: str.scriptSettings, spacing: 10, margins: 14 }),
@@ -1395,7 +1357,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			forgePortRow.enabled = forgeFolderRow.enabled = !comfyMode;
 		}
 		updateBackendFields();
-		var probePerformed = false;
+		var probePerformed = false, probeToken = "";
 		testConnection.onClick = function () {
 			var probe = cloneObj(temp);
 			probe.backendHost = String(hostEdit.text || "").replace(/^\s+|\s+$/g, "") || "127.0.0.1";
@@ -1405,7 +1367,12 @@ function mainDialog(selection, initial, responseSeconds) {
 			probe.forgeSchemasFolder = forgeFolderEdit.text || "";
 			try {
 				probePerformed = true;
-				ui.runWithPaletteProgress(str.progressHandshake, function (progress) { backend.applyStatus(api.probeBackends(probe, progress)); });
+				probeToken = "";
+				ui.runWithPaletteProgress(str.progressHandshake, function (progress) {
+					var probeStatus = api.probeBackends(probe, progress);
+					probeToken = String(probeStatus.probe_token || "");
+					backend.applyStatus(probeStatus);
+				});
 				statusValue.text = backend.statusLabel();
 			} catch (e) { ui.showErrorMessage(e); }
 		};
@@ -1560,9 +1527,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			syncValue(true);
 			return control;
 		}
-		// При drag значение просто привязывается к сетке. При hover-focus,
-		// колесе или клавиатуре forceStep гарантирует ровно один дискретный шаг,
-		// даже если ScriptUI сообщил слишком маленькое промежуточное изменение.
+		// forceStep обеспечивает один дискретный шаг колеса или клавиши.
 		function syncPresetSlider(control, reset, forceStep) {
 			var raw = Number(control.slider.value),
 				previous = reset ? null : control.snappedValue,
@@ -1596,12 +1561,10 @@ function mainDialog(selection, initial, responseSeconds) {
 			cfg.data = temp; cfg.bindProperties(); accepted = true; w.close(1);
 		});
 		ui.showDialog(w);
-		return { accepted: accepted, probePerformed: probePerformed };
+		return { accepted: accepted, probePerformed: probePerformed, probeToken: probeToken };
 	}
 }
-// ---
-// ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ REFERENCE / IMAGESTITCH
-// ---
+// REFERENCE / IMAGESTITCH
 function isSupportedReferenceImage(path) {
 	return /\.(?:jpe?g|png|webp)$/i.test(String(path || ""));
 }
@@ -4538,7 +4501,7 @@ function BridgeApi() {
 	};
 	this.ping = function (progress, timeout) { return call("ping", null, timeout || SHORT_TIMEOUT, progress); };
 	this.translate = function (text, progress) { return call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress); };
-	this.handshake = function (progress, settings, refreshBackends, backendStatusMode, verifyBackend) {
+	this.handshake = function (progress, settings, refreshBackends, backendStatusMode, verifyBackend, backendProbeToken) {
 		var source = settings || cfg;
 		return call("handshake", {
 			host: source.backendHost,
@@ -4550,7 +4513,8 @@ function BridgeApi() {
 			backendMonitorInterval: source.backendMonitorInterval,
 			backendStatusMode: backendStatusMode || "cached",
 			refreshBackends: !!refreshBackends,
-			verifyBackend: verifyBackend || ""
+			verifyBackend: verifyBackend || "",
+			backendProbeToken: backendProbeToken || ""
 		}, SHORT_TIMEOUT, progress);
 	};
 	this.probeBackends = function (settings, progress) {

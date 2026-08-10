@@ -46,10 +46,9 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.178"
+VERSION = "0.179"
 
-# Единый объект идентичности приложения. Пользовательские каталоги, имена
-# служебных файлов и расположение поставляемых схем вычисляются только отсюда.
+# Общая идентичность приложения и служебных путей.
 APP = {
     "name": "img2img helper",
     "slug": "img2img-helper",
@@ -75,18 +74,14 @@ FORGE_SCHEMA_VERSION = 1
 FORGE_REFERENCE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
-# Максимальный размер одного JSON-сообщения от JSX. Workflow целиком через
-# API не передаётся, поэтому 32 МБ оставляют большой запас.
+# Лимит одного JSON-сообщения от JSX.
 MAX_API_MESSAGE = 32 * 1024 * 1024
 
-# Пользовательские значения по умолчанию. После handshake они заменяются
-# настройками из JSX и сохраняются в runtime.json для следующего запуска.
+# Handshake заменяет эти значения и сохраняет их в runtime.json.
 DEFAULT_IDLE_TIMEOUT_SECONDS = 15 * 60
 DEFAULT_BACKEND_MONITOR_INTERVAL_SECONDS = 5
 
-# До начала выполнения очередь и история опрашиваются с прежним интервалом.
-# После перехода prompt в running запрашивается только история, поэтому более
-# частый poll почти не нагружает ComfyUI и быстрее замечает готовый результат.
+# После запуска prompt история опрашивается чаще.
 HISTORY_PREPARE_POLL_INTERVAL = 0.35
 HISTORY_RESULT_POLL_INTERVAL = 0.20
 
@@ -97,21 +92,16 @@ OUTPUT_SUBFOLDER = "Img2imgHelper"
 
 # Версия формата внутреннего кеша. При изменении структуры увеличить число.
 CACHE_VERSION = 1
-# Версия сокращённой /object_info-схемы, которая хранится рядом с анализом.
-# Старый cache без этого поля используется как analysis cache, но один раз
-# дополняется настоящими типами из ComfyUI.
+# Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
-# UUID анализатора не является версией схемы. Новое значение принудительно
-# сбрасывает только кеш анализа workflow после изменения правил распознавания.
+# Новый UUID сбрасывает только кэш анализа workflow.
 ANALYZER_UUID = "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
 
-# Кеш нормализованных ImageStitch-изображений существует только в памяти
-# Python-процесса и ограничен одновременно количеством и суммарным размером.
+# Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
 IMAGESTITCH_CACHE_MAX_BYTES = 128 * 1024 * 1024
 
-# Упрощённые теги, которые пользователь может дописать к названию ноды прямо
-# в интерфейсе ComfyUI.
+# Теги, добавляемые к имени ноды в ComfyUI.
 TAG_PATTERNS = {
     "input": [r"#PS-INPUT\b"],
     "output": [r"#PS-OUTPUT\b"],
@@ -4813,11 +4803,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         else:
             LOGGER.info("ImageStitch was requested without usable reference files; continuing without it.")
 
-    # POST Forge блокирующий, поэтому выполняем его в отдельном потоке. Worker
-    # параллельно опрашивает /progress и освобождает первый progress-сегмент JSX
-    # только после появления sampling_step > 0. Если ответ пришёл слишком быстро
-    # и sampling не успел попасть в polling, переключаем сегмент после завершения
-    # POST, но обязательно до отправки итогового изображения.
+    # POST идёт в потоке, пока worker ждёт sampling_step через /progress.
     post_done = threading.Event()
     post_result: Dict[str, Any] = {"value": None, "error": None}
 
@@ -4860,8 +4846,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
                     progress_stage_started = True
                     break
             except UserVisibleError as exc:
-                # /progress может кратковременно не отвечать во время загрузки
-                # модели. Сам POST остаётся источником истины об успехе задачи.
+                # Ошибка /progress не отменяет выполняющийся POST.
                 LOGGER.debug("Forge progress polling failed: %s", exc)
         post_done.wait(timeout=0.05)
 
@@ -4870,9 +4855,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
             touch_activity()
             raise_if_generation_cancelled(request_id)
     else:
-        # Быстрый путь: sampling_step не успел появиться. При ошибке первый
-        # progress-сегмент получает error напрямую; при успехе всё равно делаем
-        # handshake init/ACK, чтобы второй сегмент и счётчик секунд появились.
+        # При быстром ответе переключаем сегмент после POST.
         if post_result.get("error") is not None:
             raise post_result["error"]
         raise_if_generation_cancelled(request_id)
@@ -4909,11 +4892,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
 
 
 @dataclass
-# ============================================================================
 # СОСТОЯНИЕ ПРОЦЕССА И ФОНОВЫЕ WORKERS
-# GenerationState защищён lock: одновременно выполняется только одна генерация,
-# а interrupt/cancel доступны из отдельного socket-командного потока.
-# ============================================================================
 class RuntimeConfig:
     backend_host: str = DEFAULT_COMFY_HOST
     comfy_host: str = DEFAULT_COMFY_HOST
@@ -4937,10 +4916,7 @@ class GenerationState:
     uploaded_images: List[Dict[str, Any]] = field(default_factory=list)
     progress_watcher: Optional[ComfyProgressWatcher] = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
-    # JSX закрывает listener первой стадии и после ответа "init" открывает
-    # listener финальной стадии. ACK подтверждает, что переключение началось.
-    # Без этого очень быстрый/cached workflow теоретически мог бы вернуть
-    # результат между двумя listener-окнами.
+    # ACK закрывает разрыв между двумя listener-стадиями JSX.
     ack_event: threading.Event = field(default_factory=threading.Event)
     active: bool = False
     queued: bool = False
@@ -4951,20 +4927,16 @@ GENERATION = GenerationState()
 LAST_ACTIVITY = time.monotonic()
 LAST_ACTIVITY_LOCK = threading.Lock()
 
-# Статус backend обновляется отдельным фоновым worker. Handshake читает готовый
-# снимок и не задерживает очередной запуск JSX сетевыми запросами. Первый
-# handshake после старта Python выполняет полную проверку только если worker ещё
-# не успел опубликовать результат.
+# Фоновый worker хранит последний статус обеих оболочек.
 BACKEND_STATUS_LOCK = threading.Lock()
 BACKEND_PROBE_LOCK = threading.Lock()
 BACKEND_STATUS_CACHE: Optional[Dict[str, Any]] = None
 BACKEND_STATUS_ENDPOINTS: Optional[Tuple[str, int, int]] = None
+BACKEND_TEST_RESULTS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 BACKEND_MONITOR_WAKE = threading.Event()
 BACKEND_MONITOR_START_LOCK = threading.Lock()
 BACKEND_MONITOR_STARTED = False
-# Поиск локальных Comfy input/output-папок на Windows использует netstat/PowerShell и
-# заметно дороже обычного HTTP ping. Повторяем его только один раз для endpoint
-# за время жизни Python-процесса; сам /system_stats по-прежнему проверяется.
+# Локальные папки Comfy определяются один раз для каждого endpoint.
 COMFY_INPUT_FOLDER_ENDPOINT: Optional[Tuple[str, int]] = None
 
 
@@ -5131,7 +5103,9 @@ def comfy_queue_contains_prompt(queue_state: Any, key: str, prompt_id: str) -> b
 
 
 def forge_sampling_has_started(client: ForgeClient) -> bool:
-    progress = client.get_json("sdapi/v1/progress", timeout=5)
+    progress = client.get_json(
+        "sdapi/v1/progress?skip_current_image=true", timeout=5
+    )
     if not isinstance(progress, dict):
         return False
     state = progress.get("state")
@@ -6092,10 +6066,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         cancel_current_generation(request_id)
         raise CancelledError("Generation was cancelled.")
 
-    # WebSocket удерживает Photoshop на «Инициализации модели» до первого
-    # progress sampler-ноды. /queue используется как переключатель только если
-    # WebSocket недоступен или sampler не распознан. /history остаётся
-    # единственным источником истины об ошибке и завершении workflow.
+    # WebSocket задаёт границу инициализации; /history подтверждает результат.
     deadline = time.monotonic() + int(message.get("timeout") or RUNTIME.generation_timeout)
     history_entry: Optional[Dict[str, Any]] = None
     progress_stage_started = False
@@ -6108,8 +6079,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
             not progress_stage_started
             and progress_watcher.sampling_started(actual_prompt_id)
         ):
-            # После определения границы WebSocket больше не нужен. Закрываем
-            # его до sampling, чтобы не накапливать бинарные latent preview.
+            # После начала sampling WebSocket больше не нужен.
             progress_watcher.close()
             notify_generation_progress_ready(
                 request_id, "comfy", actual_prompt_id
@@ -6144,8 +6114,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
                         )
                         progress_stage_started = True
             except UserVisibleError as exc:
-                # История остаётся источником истины. Временная ошибка /queue
-                # не должна прерывать уже поставленную генерацию.
+                # Временная ошибка /queue не прерывает генерацию.
                 LOGGER.debug("Comfy queue polling failed: %s", exc)
 
         time.sleep(
@@ -6174,9 +6143,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         local_output_folder=output_folder,
     )
 
-    # init/ACK уже выполнен либо при переходе prompt в queue_running, либо в
-    # fast-completion ветке выше. Поэтому итоговый путь всегда относится ко
-    # второму progress-сегменту Photoshop.
+    # Итоговый путь всегда отправляется после init/ACK.
     answer(
         {
             "path": str(destination),
@@ -6244,31 +6211,36 @@ def _compose_backend_status(comfy: Dict[str, Any], forge: Dict[str, Any]) -> Dic
         "mode": mode,
         "available_backends": available,
         "backends": {"comfy": comfy, "forge": forge},
-        # Общий снимок считается свежим только по более старой из двух
-        # проверок. Одиночный probe активного backend не откладывает фоновую
-        # актуализацию второй оболочки.
+        # Свежесть снимка определяется более старой проверкой.
         "checked_at": min(checked_at_values) if len(checked_at_values) == 2 else 0.0,
     }
 
 
-def _probe_comfy(host: str, port: int, *, update_runtime: bool) -> Dict[str, Any]:
+def _probe_comfy_full(host: str, port: int, *, update_runtime: bool) -> Dict[str, Any]:
     global COMFY_INPUT_FOLDER_ENDPOINT
     started = time.monotonic()
     endpoint = (normalize_comfy_host(host), int(port))
     try:
-        details = ComfyClient(host, int(port)).ping(timeout=2.0)
-        if update_runtime and COMFY_INPUT_FOLDER_ENDPOINT != endpoint:
-            RUNTIME.comfy_input_folder = detect_comfy_input_folder(details, host, int(port))
-            RUNTIME.comfy_output_folder = detect_comfy_output_folder(details, host, int(port))
+        stats = ComfyClient(host, int(port)).ping(timeout=2.0)
+        if update_runtime and COMFY_INPUT_FOLDER_ENDPOINT == endpoint:
+            input_folder = RUNTIME.comfy_input_folder
+            output_folder = RUNTIME.comfy_output_folder
+        else:
+            input_folder = detect_comfy_input_folder(stats, host, int(port))
+            output_folder = detect_comfy_output_folder(stats, host, int(port))
+        if update_runtime:
+            RUNTIME.comfy_input_folder = input_folder
+            RUNTIME.comfy_output_folder = output_folder
             COMFY_INPUT_FOLDER_ENDPOINT = endpoint
-            schedule_comfy_folder_cleanup(
-                RUNTIME.comfy_input_folder, RUNTIME.comfy_output_folder
-            )
-        # Полный /system_stats нужен Python для определения input-папки, но JSX
-        # использует только available/latency. Не гоняем большой JSON обратно.
-        public_details = {"ok": True}
+            schedule_comfy_folder_cleanup(input_folder, output_folder)
+        details = {
+            "ok": True,
+            "validated": True,
+            "input_folder": str(input_folder or ""),
+            "output_folder": str(output_folder or ""),
+        }
         return _backend_probe_result(
-            "comfy", host, int(port), started, available=True, details=public_details,
+            "comfy", host, int(port), started, available=True, details=details,
         )
     except Exception as exc:
         if update_runtime:
@@ -6280,17 +6252,52 @@ def _probe_comfy(host: str, port: int, *, update_runtime: bool) -> Dict[str, Any
         )
 
 
-def _probe_forge(host: str, port: int) -> Dict[str, Any]:
+def _probe_comfy_light(host: str, port: int, previous: Dict[str, Any]) -> Dict[str, Any]:
+    started = time.monotonic()
+    try:
+        response = ComfyClient(host, int(port)).get_json("/prompt", timeout=2.0)
+        if not isinstance(response, dict):
+            raise UserVisibleError("ComfyUI health response is invalid.")
+        details = copy.deepcopy(previous.get("details") or {})
+        details["ok"] = True
+        return _backend_probe_result(
+            "comfy", host, int(port), started, available=True, details=details,
+        )
+    except Exception as exc:
+        return _backend_probe_result(
+            "comfy", host, int(port), started, available=False, error=str(exc),
+        )
+
+
+def _probe_comfy_regular(host: str, port: int, previous: Dict[str, Any], *,
+                         update_runtime: bool) -> Dict[str, Any]:
+    validated = bool(
+        previous.get("available")
+        and (previous.get("details") or {}).get("validated")
+    )
+    light = _probe_comfy_light(host, port, previous)
+    if validated or not light.get("available"):
+        if update_runtime and not light.get("available"):
+            invalidate_detected_comfy_input_folder()
+            RUNTIME.comfy_output_folder = None
+        return light
+    return _probe_comfy_full(host, port, update_runtime=update_runtime)
+
+
+def _probe_forge_full(host: str, port: int) -> Dict[str, Any]:
     global FORGE_CATALOG_CACHE_SERVER
     started = time.monotonic()
     try:
         client = ForgeClient(host, int(port), timeout=2.0)
         options = client.get_json("sdapi/v1/options", timeout=2.0)
         is_forge_neo = isinstance(options, dict) and "forge_additional_modules" in options
-        details = {"ok": isinstance(options, dict), "forge_neo": bool(is_forge_neo)}
+        details = {
+            "ok": isinstance(options, dict),
+            "forge_neo": bool(is_forge_neo),
+            "validated": bool(is_forge_neo),
+        }
         if is_forge_neo:
-            # /options уже был получен для probe. Сохраняем current в process-cache,
-            # чтобы первая загрузка Forge schema не запрашивала /options второй раз.
+            # Переиспользуем /options при первой загрузке Forge schema.
             server_key = (normalize_comfy_host(host), int(port))
             with FORGE_CATALOG_CACHE_LOCK:
                 if FORGE_CATALOG_CACHE_SERVER != server_key:
@@ -6309,26 +6316,67 @@ def _probe_forge(host: str, port: int) -> Dict[str, Any]:
         )
 
 
-# ============================================================================
-# ОБНАРУЖЕНИЕ BACKEND И HANDSHAKE
-# Comfy и Forge проверяются независимо; результат содержит режим none/comfy/forge/both.
-# ============================================================================
-def _probe_backends_unlocked(host: str, comfy_port: int, forge_port: int, *,
-                             update_runtime: bool = False) -> Dict[str, Any]:
-    """Полностью и независимо проверяет ComfyUI и Forge Neo.
-
-    Эта функция используется фоновым монитором, принудительным полным refresh
-    и кнопкой ручной проверки. Недоступность одного сервера — обычное состояние.
-    """
-
-    normalized_host = normalize_comfy_host(host)
-    # Оба HTTP-probe независимы. Параллельный запуск сохраняет полную проверку,
-    # но её длительность определяется более медленным backend, а не их суммой.
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="BackendProbe") as executor:
-        comfy_future = executor.submit(
-            _probe_comfy, normalized_host, int(comfy_port), update_runtime=update_runtime
+def _probe_forge_light(host: str, port: int, previous: Dict[str, Any]) -> Dict[str, Any]:
+    started = time.monotonic()
+    try:
+        client = ForgeClient(host, int(port), timeout=2.0)
+        response = client.get_json(
+            "sdapi/v1/progress?skip_current_image=true", timeout=2.0
         )
-        forge_future = executor.submit(_probe_forge, normalized_host, int(forge_port))
+        if not isinstance(response, dict) or "progress" not in response:
+            raise UserVisibleError("Forge Neo health response is invalid.")
+        details = copy.deepcopy(previous.get("details") or {})
+        details["ok"] = True
+        return _backend_probe_result(
+            "forge", host, int(port), started, available=True, details=details,
+        )
+    except Exception as exc:
+        return _backend_probe_result(
+            "forge", host, int(port), started, available=False, error=str(exc),
+        )
+
+
+def _probe_forge_regular(host: str, port: int, previous: Dict[str, Any]) -> Dict[str, Any]:
+    details = previous.get("details") or {}
+    validated = bool(
+        previous.get("available")
+        and details.get("validated")
+        and details.get("forge_neo")
+    )
+    light = _probe_forge_light(host, port, previous)
+    if validated or not light.get("available"):
+        return light
+    return _probe_forge_full(host, port)
+
+
+# BACKEND DISCOVERY
+def _probe_backends_unlocked(host: str, comfy_port: int, forge_port: int, *,
+                             update_runtime: bool = False,
+                             full_check: bool = False,
+                             previous_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    normalized_host = normalize_comfy_host(host)
+    endpoints = _backend_endpoints(normalized_host, comfy_port, forge_port)
+    previous_status = previous_status or _cached_backend_status(endpoints)
+    previous_status = previous_status or _unchecked_backend_status(endpoints)
+    previous = previous_status["backends"]
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="BackendProbe") as executor:
+        if full_check:
+            comfy_future = executor.submit(
+                _probe_comfy_full, normalized_host, int(comfy_port),
+                update_runtime=update_runtime,
+            )
+            forge_future = executor.submit(
+                _probe_forge_full, normalized_host, int(forge_port)
+            )
+        else:
+            comfy_future = executor.submit(
+                _probe_comfy_regular, normalized_host, int(comfy_port),
+                previous["comfy"], update_runtime=update_runtime,
+            )
+            forge_future = executor.submit(
+                _probe_forge_regular, normalized_host, int(forge_port),
+                previous["forge"],
+            )
         comfy = comfy_future.result()
         forge = forge_future.result()
     return _compose_backend_status(comfy, forge)
@@ -6336,11 +6384,10 @@ def _probe_backends_unlocked(host: str, comfy_port: int, forge_port: int, *,
 
 def probe_backends(host: str, comfy_port: int, forge_port: int, *,
                    update_runtime: bool = False) -> Dict[str, Any]:
-    """Serializes full probes so a handshake and the monitor never duplicate work."""
-
     with BACKEND_PROBE_LOCK:
         return _probe_backends_unlocked(
-            host, comfy_port, forge_port, update_runtime=update_runtime
+            host, comfy_port, forge_port,
+            update_runtime=update_runtime, full_check=True,
         )
 
 
@@ -6366,39 +6413,163 @@ def _cached_backend_status(
         return copy.deepcopy(BACKEND_STATUS_CACHE)
 
 
+def _store_backend_test_result(
+    status: Dict[str, Any], endpoints: Tuple[str, int, int]
+) -> Dict[str, Any]:
+    token = uuid.uuid4().hex
+    snapshot = copy.deepcopy(status)
+    response = copy.deepcopy(status)
+    response["probe_token"] = token
+    now = time.time()
+    with BACKEND_STATUS_LOCK:
+        for key in list(BACKEND_TEST_RESULTS):
+            if now - float(BACKEND_TEST_RESULTS[key].get("created") or 0.0) > 600:
+                BACKEND_TEST_RESULTS.pop(key, None)
+        while len(BACKEND_TEST_RESULTS) >= 8:
+            BACKEND_TEST_RESULTS.popitem(last=False)
+        BACKEND_TEST_RESULTS[token] = {
+            "status": snapshot,
+            "endpoints": endpoints,
+            "created": now,
+        }
+    return response
+
+
+def _take_backend_test_result(
+    token: str, endpoints: Tuple[str, int, int]
+) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    with BACKEND_STATUS_LOCK:
+        item = BACKEND_TEST_RESULTS.pop(token, None)
+    if item is None or item.get("endpoints") != endpoints:
+        return None
+    if time.time() - float(item.get("created") or 0.0) > 600:
+        return None
+    return copy.deepcopy(item.get("status") or {})
+
+
+def _apply_comfy_runtime_status(
+    status: Dict[str, Any], endpoints: Tuple[str, int, int]
+) -> None:
+    global COMFY_INPUT_FOLDER_ENDPOINT
+    comfy = (status.get("backends") or {}).get("comfy") or {}
+    if comfy.get("checked") is False:
+        return
+    if not comfy.get("available"):
+        RUNTIME.comfy_input_folder = None
+        RUNTIME.comfy_output_folder = None
+        COMFY_INPUT_FOLDER_ENDPOINT = None
+        return
+    details = comfy.get("details") or {}
+    if not details.get("validated") or "input_folder" not in details:
+        return
+    input_value = str(details.get("input_folder") or "")
+    output_value = str(details.get("output_folder") or "")
+    input_folder = Path(input_value) if input_value else None
+    output_folder = Path(output_value) if output_value else None
+    comfy_endpoint = (endpoints[0], endpoints[1])
+    changed = (
+        COMFY_INPUT_FOLDER_ENDPOINT != comfy_endpoint
+        or RUNTIME.comfy_input_folder != input_folder
+        or RUNTIME.comfy_output_folder != output_folder
+    )
+    RUNTIME.comfy_input_folder = input_folder
+    RUNTIME.comfy_output_folder = output_folder
+    COMFY_INPUT_FOLDER_ENDPOINT = comfy_endpoint
+    if changed:
+        schedule_comfy_folder_cleanup(input_folder, output_folder)
+
+
 def _refresh_backend_status(
     endpoints: Tuple[str, int, int],
     *,
     reuse_cached: bool,
     max_cache_age: Optional[float] = None,
+    full_check: bool = False,
 ) -> Dict[str, Any]:
-    """Refresh both backends, rechecking the cache after waiting for probe lock."""
+    """Refresh both backends after rechecking the shared cache."""
 
     with BACKEND_PROBE_LOCK:
+        cached = _cached_backend_status(endpoints)
         if reuse_cached:
-            cached = _cached_backend_status(endpoints)
             if cached is not None:
                 checked_at = float(cached.get("checked_at") or 0.0)
                 if max_cache_age is None or time.time() - checked_at < max_cache_age:
                     return cached
-        status = _probe_backends_unlocked(*endpoints, update_runtime=True)
+        status = _probe_backends_unlocked(
+            *endpoints,
+            update_runtime=True,
+            full_check=full_check,
+            previous_status=cached,
+        )
         return _store_backend_status(status, endpoints)
 
 
 def _refresh_selected_backend_status(
     endpoints: Tuple[str, int, int], backend: str
 ) -> Dict[str, Any]:
-    """Live-probe one selected backend and retain the monitor state of the other."""
+    """Check the selected backend and retain the other backend status."""
 
     with BACKEND_PROBE_LOCK:
         cached = _cached_backend_status(endpoints) or _unchecked_backend_status(endpoints)
         host, comfy_port, forge_port = endpoints
         if backend == "comfy":
-            comfy = _probe_comfy(host, comfy_port, update_runtime=True)
+            comfy = _probe_comfy_regular(
+                host, comfy_port, cached["backends"]["comfy"], update_runtime=True
+            )
             forge = cached["backends"]["forge"]
         else:
             comfy = cached["backends"]["comfy"]
-            forge = _probe_forge(host, forge_port)
+            forge = _probe_forge_regular(
+                host, forge_port, cached["backends"]["forge"]
+            )
+        return _store_backend_status(
+            _compose_backend_status(comfy, forge), endpoints
+        )
+
+
+def _refresh_changed_backend_status(
+    previous_endpoints: Tuple[str, int, int],
+    endpoints: Tuple[str, int, int],
+    previous_status: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Fully validate changed endpoints and retain unchanged results."""
+
+    with BACKEND_PROBE_LOCK:
+        previous_status = previous_status or _unchecked_backend_status(
+            previous_endpoints
+        )
+        previous = previous_status["backends"]
+        old_host, old_comfy_port, old_forge_port = previous_endpoints
+        host, comfy_port, forge_port = endpoints
+        comfy_changed = (old_host, old_comfy_port) != (host, comfy_port)
+        forge_changed = (old_host, old_forge_port) != (host, forge_port)
+        with ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="BackendSettingsProbe"
+        ) as executor:
+            comfy_future = None
+            forge_future = None
+            if comfy_changed:
+                comfy_future = executor.submit(
+                    _probe_comfy_full, host, comfy_port, update_runtime=True
+                )
+            elif previous["comfy"].get("checked") is False:
+                comfy_future = executor.submit(
+                    _probe_comfy_regular,
+                    host,
+                    comfy_port,
+                    previous["comfy"],
+                    update_runtime=True,
+                )
+            if forge_changed:
+                forge_future = executor.submit(_probe_forge_full, host, forge_port)
+            elif previous["forge"].get("checked") is False:
+                forge_future = executor.submit(
+                    _probe_forge_regular, host, forge_port, previous["forge"]
+                )
+            comfy = comfy_future.result() if comfy_future else previous["comfy"]
+            forge = forge_future.result() if forge_future else previous["forge"]
         return _store_backend_status(
             _compose_backend_status(comfy, forge), endpoints
         )
@@ -6414,7 +6585,9 @@ def detect_backends(*, force_full: bool = False) -> Dict[str, Any]:
         cached = _cached_backend_status(endpoints)
         if cached is not None:
             return cached
-    return _refresh_backend_status(endpoints, reuse_cached=not force_full)
+    return _refresh_backend_status(
+        endpoints, reuse_cached=not force_full, full_check=force_full
+    )
 
 
 def _unchecked_backend_status(endpoints: Tuple[str, int, int]) -> Dict[str, Any]:
@@ -6438,6 +6611,7 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     previous_endpoints = _backend_endpoints(
         RUNTIME.backend_host, RUNTIME.comfy_port, RUNTIME.forge_port
     )
+    previous_status = _cached_backend_status(previous_endpoints)
     host = message.get("host")
     if host:
         RUNTIME.backend_host = normalize_comfy_host(host)
@@ -6464,17 +6638,30 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         RUNTIME.backend_host, RUNTIME.comfy_port, RUNTIME.forge_port
     )
     endpoints_changed = previous_endpoints != endpoints
+    if endpoints_changed:
+        invalidate_detected_comfy_input_folder()
+        RUNTIME.comfy_output_folder = None
     status_mode = str(message.get("backendStatusMode") or "cached").lower()
     refresh_backends = bool(message.get("refreshBackends"))
     verify_backend = str(message.get("verifyBackend") or "").strip().lower()
+    tested_status = _take_backend_test_result(
+        str(message.get("backendProbeToken") or ""), endpoints
+    )
     if refresh_backends:
         status = detect_backends(force_full=True)
     elif verify_backend in {"comfy", "forge"}:
         status = _refresh_selected_backend_status(endpoints, verify_backend)
     elif status_mode == "silent":
         status = _cached_backend_status(endpoints) or _unchecked_backend_status(endpoints)
+    elif tested_status is not None:
+        status = _store_backend_status(tested_status, endpoints)
+    elif endpoints_changed:
+        status = _refresh_changed_backend_status(
+            previous_endpoints, endpoints, previous_status
+        )
     else:
-        status = detect_backends(force_full=endpoints_changed)
+        status = detect_backends(force_full=False)
+    _apply_comfy_runtime_status(status, endpoints)
     BACKEND_MONITOR_WAKE.set()
     runtime_data = {
         "host": RUNTIME.backend_host,
@@ -6507,11 +6694,7 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-# ============================================================================
 # ДИСПЕТЧЕР КОМАНД JSX И ЛОКАЛЬНЫЙ SOCKET-СЕРВЕР
-# Быстрые команды отвечают сразу. Генерация помещается в очередь и сначала
-# отправляет ACK init, чтобы JSX переключился со стадии подготовки на ожидание.
-# ============================================================================
 def handle_command(command: Dict[str, Any]) -> None:
     touch_activity()
     request_id = command.get("request_id")
@@ -6539,8 +6722,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                 "startup_message": str(startup.get("message") or ""),
                 "startup_log_file": str(startup.get("log_file") or LOG_FILE),
             }, request_id)
-            # После передачи startup-ошибки завершаем этот процесс, чтобы
-            # следующий запуск JSX мог повторить подготовку зависимостей.
+            # После startup-ошибки следующий запуск повторит подготовку.
             if str(startup.get("status") or "") == "error":
                 WORKER_STOP.set()
                 BACKEND_MONITOR_WAKE.set()
@@ -6569,15 +6751,18 @@ def handle_command(command: Dict[str, Any]) -> None:
             return
 
         if command_type == "probe_backends":
-            # Ручной поиск запущенных backend инвалидирует накопленные Forge-
-            # каталоги. Следующая выбранная schema загрузит только нужные данные.
+            # Ручная проверка сбрасывает Forge-каталог для нового endpoint.
             clear_forge_catalog_cache()
-            answer(probe_backends(
+            endpoints = _backend_endpoints(
                 str(message.get("host") or RUNTIME.backend_host),
                 int(message.get("comfyPort") or RUNTIME.comfy_port),
                 int(message.get("forgePort") or RUNTIME.forge_port),
+            )
+            status = probe_backends(
+                *endpoints,
                 update_runtime=False,
-            ), request_id)
+            )
+            answer(_store_backend_test_result(status, endpoints), request_id)
             return
 
         if command_type == "workflow_list":
@@ -6805,8 +6990,7 @@ def backend_monitor_watcher() -> None:
             BACKEND_MONITOR_WAKE.wait(min(1.0, float(interval)))
             BACKEND_MONITOR_WAKE.clear()
             continue
-        # Короткое окно позволяет только что принятой генерации разбудить
-        # monitor до начала HTTP-probe. Оно не блокирует JSX или worker.
+        # Даём новой генерации отменить фоновый probe.
         if BACKEND_MONITOR_WAKE.wait(0.1):
             BACKEND_MONITOR_WAKE.clear()
             continue
@@ -6914,9 +7098,7 @@ def initialize_server_runtime() -> None:
         return
     write_startup_status("ready", "Python API is ready")
     start_backend_monitor()
-    # Очистка не влияет на готовность API и выполняется в уже существующем
-    # InitializationWorker после публикации ready. Файлы текущих запросов моложе
-    # TEMP_MAX_AGE_SECONDS, поэтому параллельная генерация с ней не конфликтует.
+    # Временные файлы очищаются после публикации ready.
     try:
         cleanup_old_temp_files()
         schedule_comfy_folder_cleanup(
@@ -6933,8 +7115,7 @@ def start_local_server() -> None:
     try:
         server.bind((API_HOST, API_RECEIVE_PORT))
     except OSError as exc:
-        # Lock-файл активного процесса не перезаписываем и не удаляем: второй
-        # экземпляр просто завершается после неудачного bind.
+        # Второй экземпляр не трогает lock активного процесса.
         LOGGER.error("Could not bind port %s: %s", API_RECEIVE_PORT, exc)
         write_startup_status(
             "error",
