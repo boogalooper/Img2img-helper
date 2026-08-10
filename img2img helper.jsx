@@ -37,14 +37,14 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.169",
+	VER = "0.175",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
 	API_HOST = "127.0.0.1",
 	API_PORT_SEND = 6370,
 	API_PORT_LISTEN = 6371,
-	API_PROTOCOL = 1,
+	API_PROTOCOL = 2,
 	// На запуск Python и установку зависимостей даётся две минуты.
 	START_TIMEOUT = 2 * 60 * 1000,
 	SHORT_TIMEOUT = 8000,
@@ -59,6 +59,14 @@ var APP = {
 	GENERATION_TOTAL_SEGMENTS = 100,
 	// doProgressTask() получает долю оставшегося участка.
 	PROGRESS_STAGE_TARGET = 0.95,
+	// Вертикальный ритм главного окна. Эти значения можно менять независимо:
+	// обычные динамические блоки, верхняя строка Selection/Settings, Backend и Workflow/Schema.
+	MAIN_UI_BLOCK_SPACING = 5,
+	MAIN_UI_SELECTION_HEADER_BOTTOM_MARGIN = 0,
+	MAIN_UI_BACKEND_TOP_MARGIN = 5,
+	MAIN_UI_BACKEND_BOTTOM_MARGIN = 0,
+	MAIN_UI_SELECTOR_TOP_MARGIN = 5,
+	MAIN_UI_SELECTOR_BOTTOM_MARGIN = 5,
 	DESC_PROFILE_CLEANUP_INTERVAL = 500,
 	BACKEND_COMFY = "comfy",
 	BACKEND_FORGE = "forge",
@@ -130,7 +138,7 @@ function init() {
 	if (doc.getProperty("mode").value != "RGBColor") throw new Error(str.errMode);
 	var playbackCount = action.getPlaybackParameterCount(),
 		settingsWarnings = [];
-	actionPlaybackMode = action.isPlayback(playbackCount);
+	actionPlaybackMode = action.isPlayback();
 	var forceDialog = keyboardState.shiftKey || (!actionPlaybackMode && action.hasInterfaceArgument());
 	if (actionPlaybackMode) {
 		var actionSettingsMode = action.getRecordedSettingsMode();
@@ -151,6 +159,8 @@ function init() {
 	} else {
 		cfg.load();
 		settingsWarnings = settingsWarnings.concat(cfg.consumeLoadWarnings());
+		// Внешний запуск Photoshop может передать один playback-параметр, не являясь Action.
+		// Такой запуск всегда должен открыть интерфейс, даже если прошлый запуск был тихим.
 		if (playbackCount == 1) $.setenv(APP.dialogEnvKey, "true");
 	}
 	settingsReady = true;
@@ -185,7 +195,7 @@ function init() {
 		// синхронно проверяют выбранный backend перед продолжением.
 		var startupVerifyBackend = showInterface && !actionPlaybackMode ? "" : cfg.activeBackend;
 		backend.applyStatus(api.handshake(
-			startupProgress, null, false, showInterface ? "cached" : "silent",
+			startupProgress, null, showInterface ? "cached" : "silent",
 			startupVerifyBackend
 		));
 		if (showInterface && !backend.isAvailable(cfg.activeBackend) &&
@@ -193,11 +203,11 @@ function init() {
 			// Отрицательный cached-status перепроверяем живым probe: backend мог
 			// быть запущен уже после последнего прохода фонового monitor.
 			backend.applyStatus(api.handshake(
-				startupProgress, null, false, "cached", cfg.activeBackend
+				startupProgress, null, "cached", cfg.activeBackend
 			));
 			if (!backend.isAvailable(cfg.activeBackend)) {
 				var alternateBackend = cfg.activeBackend == BACKEND_FORGE ? BACKEND_COMFY : BACKEND_FORGE;
-				backend.applyStatus(api.handshake(startupProgress, null, false, "cached", alternateBackend));
+				backend.applyStatus(api.handshake(startupProgress, null, "cached", alternateBackend));
 			}
 		}
 		var backendChangedAtStartup = false;
@@ -323,7 +333,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			notices: initial.notices instanceof Array ? initial.notices : [],
 			noticeKeysShown: {},
 			emptyDropdownIds: initial.emptyDropdownIds instanceof Array ? initial.emptyDropdownIds : [],
-			controls: {}, forgeLoraControl: null, result: null
+			controls: {}, forgeLoraControl: null, comfyMainLabels: {}, result: null
 		},
 		mainControlLayout = [
 			{ prefix: "checkpoint" },
@@ -345,7 +355,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			{ id: "seed" }
 		],
 		w = new Window("dialog{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:15}"),
-		gGlobal = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:0,margins:0}"),
+		gGlobal = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:0,margins:[0,0,0," + MAIN_UI_SELECTION_HEADER_BOTTOM_MARGIN + "]}"),
 		tWH = gGlobal.add("statictext"),
 		gGlobalButtons = gGlobal.add("group{orientation:'row',alignChildren:['right','center'],spacing:0,margins:0}"),
 		bLoadMetadata = gGlobalButtons.add("button"),
@@ -393,7 +403,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		try {
 			ui.runWithPaletteProgress(str.progressInitializing, function (progress) {
 				backend.applyStatus(api.handshake(
-					progress, null, false, "cached", "", settingsResult.probeToken
+					progress, null, "cached", "", settingsResult.probeToken
 				));
 				backend.normalizeActiveBackend();
 				if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
@@ -402,7 +412,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			updateMetadataButton();
 		} catch (e) {
 			cfg.data = oldData; cfg.bindProperties();
-			try { api.handshake(null, cfg, false, "silent"); } catch (_) { }
+			try { api.handshake(null, cfg, "silent"); } catch (_) { }
 			backend.applyStatus(oldStatus);
 			backend.normalizeActiveBackend();
 			ui.showErrorMessage(e);
@@ -516,11 +526,6 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (isObjectMap(metadata.values)) profile.values = cloneObj(metadata.values);
 		if (!isObjectMap(profile.values)) profile.values = {};
 		if (isObjectMap(metadata.profile)) {
-			// Метаданные старых слоёв могли хранить ручной масштаб только в
-			// resize. Новые версии используют единственное поле manualScale.
-			if (arrayContains(allowed, "manualScale") && metadata.profile.manualScale === undefined &&
-				metadata.profile.resize !== undefined && !toBooleanValue(metadata.profile.autoResize))
-				profile.manualScale = cloneObj(metadata.profile.resize);
 			for (var i = 0; i < allowed.length; i++)
 				if (metadata.profile[allowed[i]] !== undefined)
 					profile[allowed[i]] = cloneObj(metadata.profile[allowed[i]]);
@@ -558,7 +563,7 @@ function mainDialog(selection, initial, responseSeconds) {
 	function showControls() {
 		appendNotices(backend.takeNotices());
 		if (gSettings) { try { gSettings.visible = false; } catch (_) { } try { gSettingsHost.remove(gSettings); } catch (_) { } }
-		gSettings = gSettingsHost.add("group{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:0}");
+		gSettings = gSettingsHost.add("group{orientation:'column',alignChildren:['fill','top'],spacing:" + MAIN_UI_BLOCK_SPACING + ",margins:0}");
 		ui.setFixedWidth(gSettings, ui.contentWidth());
 		state.controls = {};
 		state.forgeLoraControl = null;
@@ -582,6 +587,9 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (visible === null || visible === undefined) visible = state.schema.recommended_controls || [];
 		var definitions = state.schema.controls || [], map = {}, i;
 		for (i = 0; i < definitions.length; i++) map[definitions[i].id] = definitions[i];
+		state.comfyMainLabels = state.backend == BACKEND_COMFY
+			? buildComfyMainLabels(definitions, visible)
+			: {};
 		addDeclaredControls(gSettings, definitions, map, visible, profile);
 		for (i = 0; i < definitions.length; i++) {
 			var def = definitions[i];
@@ -664,7 +672,8 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (backend.isAvailable(BACKEND_COMFY)) items.push({ label: "ComfyUI", value: BACKEND_COMFY });
 		if (backend.isAvailable(BACKEND_FORGE)) items.push({ label: "Forge Neo", value: BACKEND_FORGE });
 		if (items.length < 2) return;
-		var control = ui.addDropdown(parent, str.backendLabel, items, ui.contentWidth(), [0, 5, 0, 5]);
+		var control = ui.addDropdown(parent, str.backendLabel, items, ui.contentWidth(),
+			[0, MAIN_UI_BACKEND_TOP_MARGIN, 0, MAIN_UI_BACKEND_BOTTOM_MARGIN]);
 		ui.selectDropdown(control.dropdown, state.backend, 0);
 		control.dropdown.onChange = function () {
 			if (!this.selection) return;
@@ -676,7 +685,8 @@ function mainDialog(selection, initial, responseSeconds) {
 		};
 	}
 	function addSchemaControl(parent) {
-		var description = schemaControlDescription(), group = ui.addColumn(parent, [0, 10, 0, 5]);
+		var description = schemaControlDescription(), group = ui.addColumn(parent,
+			[0, MAIN_UI_SELECTOR_TOP_MARGIN, 0, MAIN_UI_SELECTOR_BOTTOM_MARGIN]);
 		ui.setFixedWidth(group, ui.contentWidth());
 		var title = group.add("statictext"), toolbar = ui.addToolbarRow(group, ui.contentWidth(), 4),
 			dropdown = toolbar.dropdown, buttons = toolbar.controls, sel = 0;
@@ -979,6 +989,47 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (!schema) { schema = backend.analyzeWorkflow(workflow, profile, force, progress); cfg.cacheSchema(schema, workflow); }
 		state.schema = schema; if (!noShow) showControls();
 	}
+	// Главное окно Comfy показывает короткие подписи, но не меняет schema/bindings.
+	// Сначала используем семантическое имя или имя input, затем добавляем
+	// минимальный контекст ноды только при неоднозначности/слишком общем input.
+	function buildComfyMainLabels(definitions, visible) {
+		var entries = [], baseCounts = {}, finalCounts = {}, res = {}, i;
+		for (i = 0; i < definitions.length; i++) {
+			var definition = definitions[i], id = String(definition.id || "");
+			if (!id || !arrayContains(visible, id)) continue;
+			var info = ui.compactLabelInfo(definition), key = normalizeCompactLabel(info.base);
+			entries.push({ definition: definition, info: info, baseKey: key, text: info.base });
+			baseCounts[key] = (baseCounts[key] || 0) + 1;
+		}
+		for (i = 0; i < entries.length; i++) {
+			var entry = entries[i], info = entry.info, needsContext = baseCounts[entry.baseKey] > 1 || info.lowInfo;
+			if (info.valueOnly && info.context) entry.text = info.context;
+			else if (needsContext && info.context) {
+				entry.text = info.lowInfo && !info.semantic
+					? info.context + " · " + info.base
+					: info.base + " · " + info.context;
+			}
+			var finalKey = normalizeCompactLabel(entry.text);
+			finalCounts[finalKey] = (finalCounts[finalKey] || 0) + 1;
+		}
+		for (i = 0; i < entries.length; i++) {
+			var current = entries[i], definition = current.definition,
+				text = current.text, finalKey = normalizeCompactLabel(text);
+			if (finalCounts[finalKey] > 1) {
+				var discriminator = String(definition.node_id || "");
+				if (!discriminator) discriminator = String(definition.input || definition.id || "");
+				if (discriminator) text += " · #" + discriminator;
+			}
+			res[String(definition.id || "")] = {
+				label: text,
+				help: ui.compactMainHelp(definition, text)
+			};
+		}
+		return res;
+	}
+	function normalizeCompactLabel(value) {
+		return String(value || "").toLowerCase().replace(/[^a-z0-9а-яё]+/g, "");
+	}
 	function addControlById(id, parent, map, visible, profile) { if (map[id] && arrayContains(visible, id)) addControlDefinition(parent, map[id], profile, ui.contentWidth()); }
 	function addControlsByPrefix(prefix, parent, definitions, visible, profile) { for (var i = 0; i < definitions.length; i++) if (startsWithSemantic(definitions[i].id, prefix) && arrayContains(visible, definitions[i].id)) addControlDefinition(parent, definitions[i], profile, ui.contentWidth()); }
 	function isPriorityMainControl(id) {
@@ -990,16 +1041,24 @@ function mainDialog(selection, initial, responseSeconds) {
 	}
 	function addControlDefinition(parent, definition, profile, preferredWidth) {
 		var hasStoredValue = profile.values.hasOwnProperty(definition.id),
-			stored = hasStoredValue ? profile.values[definition.id] : cloneObj(definition.value);
+			stored = hasStoredValue ? profile.values[definition.id] : cloneObj(definition.value),
+			displayDefinition = definition,
+			displayInfo = state.comfyMainLabels[String(definition.id || "")];
+		if (displayInfo) {
+			displayDefinition = cloneObj(definition);
+			displayDefinition.display_label = displayInfo.label;
+			displayDefinition.display_help = displayInfo.help;
+		}
 		if (definition.type == "multiselect") {
 			stored = ui.normalizeMultiselect(definition, stored);
 			if (hasStoredValue) profile.values[definition.id] = cloneObj(stored);
 		}
-		state.controls[definition.id] = ui.addDynamic(parent, definition, stored, preferredWidth, {
+		state.controls[definition.id] = ui.addDynamic(parent, displayDefinition, stored, preferredWidth, {
 			backend: backend.schemaBackend(state.schema),
 			profile: profile
 		});
 	}
+
 	// Сохраняет только реально созданные (видимые) контролы. Скрытые поля
 	// остаются в профиле и не затираются при обычном переключении интерфейса.
 	function saveCurrentValues() {
@@ -2276,15 +2335,12 @@ function ActionRuntime() {
 		try { return app.playbackParameters ? app.playbackParameters.count : 0; }
 		catch (_) { return 0; }
 	};
-	// Новые Actions распознаются по actionDataVersion. Проверка count > 1
-	// оставлена как совместимость с Actions, записанными старыми версиями.
-	this.isPlayback = function (parameterCount) {
+	this.isPlayback = function () {
 		try {
 			var desc = app.playbackParameters,
 				marker = s2t("actionDataVersion");
-			if (desc && desc.hasKey(marker)) return true;
-		} catch (_) { }
-		return Number(parameterCount) > 1;
+			return !!(desc && desc.hasKey(marker));
+		} catch (_) { return false; }
 	};
 	this.hasInterfaceArgument = function () {
 		var values = [];
@@ -2301,9 +2357,8 @@ function ActionRuntime() {
 		try {
 			var desc = app.playbackParameters,
 				key = s2t("recordSettingsToAction");
-			if (desc && desc.hasKey(key) && desc.getType(key) == DescValueType.BOOLEANTYPE) return desc.getBoolean(key);
-		} catch (_) { }
-		return true;
+			return !!(desc && desc.hasKey(key) && desc.getType(key) == DescValueType.BOOLEANTYPE && desc.getBoolean(key));
+		} catch (_) { return false; }
 	};
 	// При playback с записанными параметрами профиль остаётся в Action,
 	// а изменённые общие библиотеки отдельно синхронизируются с DESC.
@@ -2337,7 +2392,7 @@ function ActionRuntime() {
 // и гидратацию Forge-схем актуальными списками моделей/модулей.
 // ---
 function BackendRuntime() {
-	var status = { mode: "none", available_backends: [], backends: { comfy: { available: false }, forge: { available: false } } },
+	var status = { mode: "none", backends: { comfy: { available: false }, forge: { available: false } } },
 		pendingNotices = [],
 		localComfyInputFolder = "",
 		pythonApiVersion = "";
@@ -2372,10 +2427,9 @@ function BackendRuntime() {
 			pythonApiVersion = String(response.version || "");
 		if (response.hasOwnProperty("comfy_input_folder"))
 			localComfyInputFolder = String(response.comfy_input_folder || "");
-		var source = response.backends ? response : { mode: "none", available_backends: [], backends: {} };
+		var source = response.backends ? response : { mode: "none", backends: {} };
 		status = {
 			mode: source.mode || "none",
-			available_backends: source.available_backends instanceof Array ? source.available_backends : [],
 			backends: {
 				comfy: source.backends && source.backends.comfy ? source.backends.comfy : { available: false },
 				forge: source.backends && source.backends.forge ? source.backends.forge : { available: false }
@@ -3168,7 +3222,7 @@ function UI() {
 		}
 		return res;
 	};
-	function label(schema) {
+	function semanticLabel(schema) {
 		var labels = {
 			positive_prompt: str.prompt,
 			negative_prompt: str.negativePrompt,
@@ -3183,17 +3237,88 @@ function UI() {
 			distilled_cfg_scale: str.distilledCfgScale,
 			shift: str.shift,
 			lora: str.lora
-		}, id = String(schema.id || ""), semantic = id.split("__")[0], value = labels[semantic];
+		}, id = String(schema.id || ""), semantic = id.split("__")[0];
+		return labels.hasOwnProperty(semantic) ? labels[semantic] : undefined;
+	}
+	function label(schema) {
+		if (schema.display_label !== undefined) return String(schema.display_label || "");
+		var id = String(schema.id || ""), semantic = id.split("__")[0], value = semanticLabel(schema);
 		if (value === undefined) return schema.label;
 		if (id != semantic && schema.label && String(schema.label).indexOf("—") >= 0)
 			return value + " " + String(schema.label).substring(String(schema.label).indexOf("—"));
 		return value;
 	}
 	function help(schema) {
+		if (schema.display_help !== undefined) return String(schema.display_help || "");
 		if (schema.help) return schema.help;
 		if (schema.node_id !== undefined && schema.input !== undefined) return str.nodeInput + schema.node_id + ", " + schema.input;
 		return schema.label || schema.id || "";
 	}
+	function prettyInputLabel(value) {
+		var text = String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
+		text = text.replace(/^\s+|\s+$/g, "").replace(/\s+/g, " ");
+		return text ? text.charAt(0).toUpperCase() + text.substring(1) : "";
+	}
+	function semanticNodeContext(schema) {
+		var title = String(schema.node_title || ""), classType = String(schema.class_type || ""),
+			source = (title + " " + classType).toLowerCase().replace(/[^a-z0-9]+/g, " ");
+		// Только устойчивые семейства. Для custom nodes ниже остаётся обычный title/class fallback.
+		if (/vae/.test(source)) return "VAE";
+		if (/checkpoint|ckpt/.test(source)) return "Checkpoint";
+		if (/clip|text encoder/.test(source)) return "CLIP";
+		if (/unet|diffusion|(^| )dit(?: |loader|model)|transformer/.test(source)) return "Diffusion";
+		if (/ksampler|k sampler/.test(source)) return "KSampler";
+		if (/controlnet/.test(source)) return "ControlNet";
+		if (/lora/.test(source)) return "LoRA";
+		return "";
+	}
+	function compactNodeContext(schema) {
+		var semantic = semanticNodeContext(schema);
+		if (semantic) return semantic;
+		var title = String(schema.node_title || "").replace(/^\s+|\s+$/g, ""),
+			classType = String(schema.class_type || "").replace(/^\s+|\s+$/g, "");
+		if (!title) title = prettyInputLabel(classType);
+		// Версии в конце названия ноды полезны в tooltip, но редко различают поля.
+		title = title.replace(/\s*\(\s*v?\d+(?:\.\d+)+(?:[^)]*)\)\s*$/i, "");
+		var words = title.split(/\s+/), first = words[0];
+		// У имён семейства вроде SeedVR2 первый токен обычно уже уникален.
+		if (words.length > 2 && (/\d/.test(first) || /[a-z][A-Z]/.test(first))) title = first;
+		else if (words.length > 3) title = words.slice(0, 3).join(" ");
+		return title;
+	}
+	function isLowInformationInput(value) {
+		var key = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, ""),
+			low = {
+				value: true, type: true, device: true, active: true, enabled: true,
+				seed: true, steps: true, strength: true, cfg: true, denoise: true,
+				shift: true, guidance: true, sampler: true, scheduler: true,
+				weight_dtype: true
+			};
+		return !!low[key];
+	}
+	this.compactLabelInfo = function (schema) {
+		var semantic = semanticLabel(schema), input = String(schema.input || ""),
+			base = semantic !== undefined ? String(semantic) : prettyInputLabel(input);
+		if (!base) base = String(schema.label || schema.id || "");
+		return {
+			base: base,
+			context: compactNodeContext(schema),
+			semantic: semantic !== undefined,
+			lowInfo: semantic === undefined && isLowInformationInput(input),
+			valueOnly: semantic === undefined && String(input || "").toLowerCase() == "value"
+		};
+	};
+	this.compactMainHelp = function (schema, displayLabel) {
+		var parts = [], originalHelp = schema.help ? String(schema.help) : "",
+			originalLabel = String(schema.label || ""), technical = "";
+		if (originalHelp) parts.push(originalHelp);
+		if (originalLabel && originalLabel != displayLabel && originalLabel != originalHelp) parts.push(originalLabel);
+		if (schema.node_id !== undefined && schema.input !== undefined)
+			technical = str.nodeInput + schema.node_id + ", " + schema.input;
+		if (technical && technical != originalHelp && technical != originalLabel) parts.push(technical);
+		if (!parts.length) parts.push(originalLabel || String(schema.id || ""));
+		return parts.join("\n");
+	};
 	this.showItemSelector = function (options) {
 		options = options || {};
 		var items = options.items instanceof Array ? options.items : [],
@@ -3461,6 +3586,10 @@ function UI() {
 				var empty = selectedHost.add("statictext");
 				empty.text = "› " + str.lorasNone;
 				setLabelTooltip(empty, "");
+				if (normalizedItems.length) {
+					try { empty.addEventListener("mousedown", openSelector); }
+					catch (_) { try { empty.onClick = openSelector; } catch (_) { } }
+				}
 			} else {
 				for (var i = 0; i < values.length; i++) {
 					(function (index) {
@@ -3602,8 +3731,8 @@ function UI() {
 	function addNumericControl(parent, schema, storedValue, options) {
 		// Тип из /object_info имеет приоритет над типом JSON-литерала.
 		// Например, KSampler.denoise является FLOAT, но значение 1 в API JSON
-		// сериализуется как integer. Дополнительная проверка ниже также
-		// защищает интерфейс от старого закешированного анализа.
+		// сериализуется как integer. Дополнительная проверка защищает интерфейс
+		// от противоречивых числовых метаданных.
 		var integer = isIntegerNumericSchema(schema),
 			value = parseNumericText(storedValue);
 		if (isNaN(value)) value = parseNumericText(schema.value) || 0;
@@ -3785,8 +3914,7 @@ function UI() {
 		var declared = String(schema && schema.type || "").toLowerCase();
 		if (declared == "float" || declared == "number") return false;
 		if (declared != "integer" && declared != "int") return false;
-		// Fractional metadata is incompatible with an integer slider. This
-		// catches stale analysis where FLOAT was inferred from the JSON value 1.
+		// Fractional metadata is incompatible with an integer slider.
 		var keys = ["value", "min", "max", "step"];
 		for (var i = 0; i < keys.length; i++) {
 			var raw = schema ? schema[keys[i]] : null,
@@ -3795,8 +3923,7 @@ function UI() {
 				!isNaN(number) && Math.abs(number - Math.round(number)) > 0.000000001)
 				return false;
 		}
-		// Denoise in a normalized 0..1 range must remain fractional even if an
-		// old cache labelled the current literal 1 as integer.
+		// Denoise in a normalized 0..1 range must remain fractional.
 		if (isDenoiseNumericSchema(schema) &&
 			hasNumericSchemaValue(schema.min) && hasNumericSchemaValue(schema.max) &&
 			parseNumericText(schema.max) - parseNumericText(schema.min) <= 1.000000001)
@@ -4446,8 +4573,7 @@ function fitSelectionBounds(res, multiple) {
 }
 // ---
 // XMP-МЕТАДАННЫЕ СЛОЯ
-// JSON хранится в собственном namespace. Старый eval-fallback оставлен только
-// для чтения метаданных ранних версий; новые данные пишутся через jsonStringify.
+// JSON хранится в собственном namespace.
 // ---
 function LayerMetadata() {
 	var cur = null;
@@ -4479,7 +4605,7 @@ function LayerMetadata() {
 			var source = xmp.getProperty(APP.xmp.namespace, APP.xmp.property).value.toString(),
 				value = null;
 			try { value = jsonParse(source); }
-			catch (_) { try { value = eval("(" + source + ")"); } catch (_) { value = null; } }
+			catch (_) { value = null; }
 			if (!isObjectMap(value)) return null;
 			if (value.backend == BACKEND_COMFY && !value.workflow_id && !value.relative_path) return null;
 			if (value.backend == BACKEND_FORGE && !value.workspace_id) return null;
@@ -4541,7 +4667,7 @@ function BridgeApi() {
 	};
 	this.ping = function (progress, timeout) { return call("ping", null, timeout || SHORT_TIMEOUT, progress); };
 	this.translate = function (text, progress) { return call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress); };
-	this.handshake = function (progress, settings, refreshBackends, backendStatusMode, verifyBackend, backendProbeToken) {
+	this.handshake = function (progress, settings, backendStatusMode, verifyBackend, backendProbeToken) {
 		var source = settings || cfg;
 		return call("handshake", {
 			host: source.backendHost,
@@ -4552,7 +4678,6 @@ function BridgeApi() {
 			pythonIdleTimeout: source.pythonIdleTimeout,
 			backendMonitorInterval: source.backendMonitorInterval,
 			backendStatusMode: backendStatusMode || "cached",
-			refreshBackends: !!refreshBackends,
 			verifyBackend: verifyBackend || "",
 			backendProbeToken: backendProbeToken || ""
 		}, SHORT_TIMEOUT, progress);
@@ -4585,9 +4710,7 @@ function BridgeApi() {
 		return call("workflow_get", workflowMessage(workflowId, overrides, relativePath), ANALYZE_TIMEOUT, progress);
 	};
 	this.workflowReinitialize = function (workflowId, overrides, relativePath, progress) {
-		var msg = workflowMessage(workflowId, overrides, relativePath);
-		msg.force = true;
-		return call("workflow_reinitialize", msg, ANALYZE_TIMEOUT, progress);
+		return call("workflow_reinitialize", workflowMessage(workflowId, overrides, relativePath), ANALYZE_TIMEOUT, progress);
 	};
 	this.workflowSaveValues = function (workflowId, relativePath, overrides, values, destinationPath, progress) {
 		var msg = workflowMessage(workflowId, overrides, relativePath);
@@ -5033,11 +5156,7 @@ function Config() {
 		if (profile.visibleControls !== null && profile.visibleControls !== undefined && !(profile.visibleControls instanceof Array))
 			profile.visibleControls = null;
 		if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", self.resizePresets);
-		// Миграция старых профилей: до разделения Auto/Manual ручное значение
-		// могло храниться в resize. После нормализации лишнее поле удаляется.
-		if (profile.manualScale === undefined)
-			profile.manualScale = profile.resize === undefined ? 1 : profile.resize;
-		if (profile.hasOwnProperty("resize")) delete profile.resize;
+		if (profile.manualScale === undefined) profile.manualScale = 1;
 		return profile;
 	}
 	function normalizeProfileStore(store) {
@@ -5764,21 +5883,12 @@ function AM(target, order) {
 	}
 }
 // Хранит последние длительности генерации в custom options Photoshop и
-// использует среднее как ориентир следующего progress bar. Старые записи
-// инициализации удаляются при первом чтении и больше не создаются.
+// использует среднее как ориентир следующего progress bar.
 function Delay() {
 	var settingsObj = this;
 	this.getDelay = function (workflowId) {
 		try { var desc = getCustomOptions(APP.uuid); } catch (_) { }
 		if (desc != undefined) descriptorCodec.readInto(settingsObj, desc);
-		var legacyChanged = false, key;
-		for (key in settingsObj) if (settingsObj.hasOwnProperty(key) && /:prepare$/.test(key)) {
-			delete settingsObj[key];
-			legacyChanged = true;
-		}
-		if (legacyChanged) try {
-			putCustomOptions(APP.uuid, descriptorCodec.toDescriptor(settingsObj, true));
-		} catch (_) { }
 		if (settingsObj[workflowId]) {
 			var sum = 0;
 			for (var i = 0; i < settingsObj[workflowId].length; i++) sum += settingsObj[workflowId][i];

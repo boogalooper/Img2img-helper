@@ -7,7 +7,6 @@ Forge Neo с интерфейсами, описанными поставляем
 
 from __future__ import annotations
 
-import atexit
 import base64
 from collections import OrderedDict
 import copy
@@ -38,24 +37,21 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 API_HOST = "127.0.0.1"
 DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
-API_PROTOCOL = 1
-VERSION = "0.180"
+API_PROTOCOL = 2
+VERSION = "0.182"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
     "name": "img2img helper",
-    "slug": "img2img-helper",
-    "python_module": "img2img-api",
     "data_folder": "img2img helper",
     "schema_folder": "forge-schemas",
-    "lock_file": "img2img-api.lock",
     "runtime_file": "runtime.json",
     "startup_file": "startup.json",
     "log_file": "img2img-api.log",
@@ -207,7 +203,6 @@ CACHE_DIR = APP_DIR / "cache"
 WORKFLOW_CACHE_DIR = CACHE_DIR / "workflows"
 TEMP_DIR = APP_DIR / "temp"
 STATE_DIR = APP_DIR / "state"
-LOCK_FILE = STATE_DIR / APP["lock_file"]
 RUNTIME_FILE = STATE_DIR / APP["runtime_file"]
 STARTUP_FILE = STATE_DIR / APP["startup_file"]
 LOG_FILE = APP_DIR / APP["log_file"]
@@ -257,12 +252,8 @@ def write_startup_status(status: str, message: str = "") -> None:
     payload = {
         "status": str(status or "starting"),
         "message": str(message or ""),
-        "pid": os.getpid(),
         "started_at": STARTUP_PROCESS_STARTED_AT,
-        "updated_at": time.time(),
         "log_file": str(LOG_FILE),
-        "protocol": API_PROTOCOL,
-        "version": VERSION,
     }
     temp_path = STARTUP_FILE.with_name(
         f".{STARTUP_FILE.name}.{os.getpid()}.tmp"
@@ -470,7 +461,7 @@ def json_dumps(value: Any) -> str:
 
 
 def api_json_dumps(value: Any) -> str:
-    """ASCII-only JSON для старого Socket/eval стека ExtendScript.
+    """ASCII-only JSON для Socket/eval JSON-стека ExtendScript.
 
     ensure_ascii=True экранирует не только U+2028/U+2029, но и NEL U+0085,
     нестандартные пробелы, emoji и любые другие Unicode-символы, которые
@@ -875,7 +866,31 @@ def cleanup_stale_comfy_outputs(output_folder: Optional[Path]) -> None:
         LOGGER.warning("Could not inspect ComfyUI helper output folder: %s", base)
 
 
-def cleanup_comfy_request_outputs(output_folder: Optional[Path], request_id: str) -> None:
+def _comfy_request_output_path(
+    path: Path, output_folder: Optional[Path], request_id: str
+) -> Optional[Path]:
+    """Return resolved path only for this helper-owned Comfy request output."""
+
+    root = _existing_directory(output_folder)
+    prefix = safe_filename(request_id)
+    if not root or not prefix:
+        return None
+    try:
+        base = (root / OUTPUT_SUBFOLDER).resolve()
+        resolved = Path(path).resolve()
+        relative = resolved.relative_to(base)
+    except (OSError, ValueError):
+        return None
+    if not any(str(part).startswith(prefix) for part in relative.parts):
+        return None
+    return resolved
+
+
+def cleanup_comfy_request_outputs(
+    output_folder: Optional[Path],
+    request_id: str,
+    preserve_path: Optional[Path] = None,
+) -> None:
     root = _existing_directory(output_folder)
     if not root:
         return
@@ -885,6 +900,11 @@ def cleanup_comfy_request_outputs(output_folder: Optional[Path], request_id: str
     prefix = safe_filename(request_id)
     if not prefix:
         return
+    preserved = (
+        _comfy_request_output_path(preserve_path, output_folder, request_id)
+        if preserve_path is not None
+        else None
+    )
     try:
         for target in base.rglob("*"):
             try:
@@ -893,6 +913,8 @@ def cleanup_comfy_request_outputs(output_folder: Optional[Path], request_id: str
                     continue
                 relative = resolved.relative_to(base)
                 if not any(str(part).startswith(prefix) for part in relative.parts):
+                    continue
+                if preserved is not None and resolved == preserved:
                     continue
                 resolved.unlink(missing_ok=True)
             except (OSError, ValueError):
@@ -1179,6 +1201,7 @@ class ComfyClient:
         quality: int = 95,
         output_format: Any = "jpg",
         local_output_folder: Optional[Path] = None,
+        request_id: str = "",
     ) -> Path:
         """Скачивает output в формате, удобном для размещения в Photoshop.
 
@@ -1208,6 +1231,19 @@ class ComfyClient:
                 ).resolve()
                 local_source.relative_to(root)
                 if local_source.is_file():
+                    # Если Comfy уже сохранил helper-owned output в нужном
+                    # Photoshop формате, возвращаем этот файл напрямую.
+                    # generation_context сохранит его до Place, а JSX удалит
+                    # после успешного размещения. Читаем только magic header.
+                    owned_source = _comfy_request_output_path(
+                        local_source, local_root, request_id
+                    )
+                    if owned_source is not None:
+                        with owned_source.open("rb") as stream:
+                            detected_suffix = _detect_image_suffix(stream.read(12))
+                        target_suffix = ".png" if requested_format == "png" else ".jpg"
+                        if detected_suffix == target_suffix:
+                            return owned_source
                     return _save_image_content_for_photoshop(
                         local_source.read_bytes(), destination, requested_format
                     )
@@ -1437,7 +1473,6 @@ class WorkflowFile:
     relative_path: str
     absolute_path: Path
     size: int
-    modified: float
     modified_ns: int
     # Хеш вычисляется только для выбранного workflow во время полного анализа.
     sha256: str = ""
@@ -1447,10 +1482,6 @@ class WorkflowFile:
             "id": self.workflow_id,
             "name": self.name,
             "relative_path": self.relative_path,
-            "size": self.size,
-            "modified": self.modified,
-            "modified_ns": self.modified_ns,
-            "sha256": self.sha256,
         }
 
 
@@ -1482,7 +1513,6 @@ class WorkflowRepository:
             relative_path=relative,
             absolute_path=path,
             size=stat.st_size,
-            modified=stat.st_mtime,
             modified_ns=getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)),
             sha256=sha256_file(path) if compute_hash else "",
         )
@@ -1782,19 +1812,6 @@ class WorkflowGraph:
                 if source_id not in visited:
                     visited.add(source_id)
                     frontier.append((source_id, depth + 1))
-        return visited
-
-    def downstream_nodes(self, start_id: str, max_depth: int = 20) -> Set[str]:
-        visited: Set[str] = set()
-        frontier = [(str(start_id), 0)]
-        while frontier:
-            node_id, depth = frontier.pop()
-            if depth >= max_depth:
-                continue
-            for target_id, _, _ in self.outgoing.get(node_id, []):
-                if target_id not in visited:
-                    visited.add(target_id)
-                    frontier.append((target_id, depth + 1))
         return visited
 
 
@@ -2382,9 +2399,6 @@ class WorkflowAnalyzer:
                     candidates.append((score, TargetBinding(node_id, input_name)))
         candidates.sort(key=lambda item: (-item[0], item[1].node_id, item[1].input_name))
         return candidates
-
-    def _find_upstream_text_targets(self, source_id: str, semantic_id: str = "") -> List[TargetBinding]:
-        return [target for _score, target in self._find_upstream_text_candidates(source_id, semantic_id)]
 
     def _branch_zeroes_conditioning(self, source_id: str) -> bool:
         """True when a conditioning branch intentionally contains no prompt.
@@ -3076,38 +3090,22 @@ class SchemaCache:
         self,
         workflow_file: WorkflowFile,
         overrides: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]:
-        """Returns cached analysis and its compact validation schema.
-
-        A cache written by an older helper can still provide its analysis. Its
-        missing validation schema is returned as None and migrated once through
-        a real /object_info request.
-        """
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Return current cached analysis and its compact validation schema."""
 
         data = self._read_payload(workflow_file, overrides)
         if not data:
             return None
-        workflow_file.sha256 = str(data.get("workflow_hash") or "")
         analysis = data.get("analysis")
-        if not isinstance(analysis, dict):
-            return None
         validation_schema = data.get("validation_schema")
         if (
-            data.get("validation_schema_version") != VALIDATION_SCHEMA_VERSION
+            not isinstance(analysis, dict)
+            or data.get("validation_schema_version") != VALIDATION_SCHEMA_VERSION
             or not isinstance(validation_schema, dict)
         ):
-            validation_schema = None
+            return None
+        workflow_file.sha256 = str(data.get("workflow_hash") or "")
         return analysis, validation_schema
-
-    def load_fast(
-        self,
-        workflow_file: WorkflowFile,
-        overrides: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Compatibility wrapper returning only cached workflow analysis."""
-
-        bundle = self.load_fast_bundle(workflow_file, overrides)
-        return bundle[0] if bundle else None
 
     def save(
         self,
@@ -3123,7 +3121,6 @@ class SchemaCache:
             "validation_schema_version": VALIDATION_SCHEMA_VERSION,
             "relative_path": workflow_file.relative_path,
             "file_size": workflow_file.size,
-            "modified": workflow_file.modified,
             "modified_ns": workflow_file.modified_ns,
             "workflow_hash": WorkflowRepository.ensure_hash(workflow_file),
             "binding_overrides": overrides or None,
@@ -3800,15 +3797,6 @@ class ForgeClient:
         except Exception:
             return raw.decode("utf-8", errors="replace")
 
-    def ping(self, timeout: float = 3.0) -> Dict[str, Any]:
-        options = self._request("sdapi/v1/options", timeout=timeout)
-        if not isinstance(options, dict):
-            return {"ok": False, "forge_neo": False}
-        return {
-            "ok": True,
-            "forge_neo": "forge_additional_modules" in options,
-        }
-
     def get_json(self, path: str, timeout: float = 30.0) -> Any:
         return self._request(path, timeout=timeout)
 
@@ -3912,8 +3900,8 @@ def list_forge_schemas(
 ) -> Tuple[List[Dict[str, Any]], Path, List[Dict[str, str]]]:
     """Lists usable Forge schemas and reports files that could not be loaded.
 
-    Files that are valid JSON but are not img2img helper Forge schemas remain
-    ignored, as before. A file that declares itself as a Forge schema is fully
+    Files that are valid JSON but are not img2img helper Forge schemas are
+    ignored. A file that declares itself as a Forge schema is fully
     validated, including inheritance, version and numeric list metadata.
     """
 
@@ -3939,9 +3927,8 @@ def list_forge_schemas(
             )
             continue
 
-        # The schema folder may contain unrelated JSON files. Preserve the old
-        # behavior and ignore those unless they explicitly identify themselves
-        # as Forge schemas for this helper.
+        # The schema folder may contain unrelated JSON files. Ignore them unless
+        # they explicitly identify themselves as Forge schemas for this helper.
         if not isinstance(raw, dict) or raw.get("kind") != FORGE_SCHEMA_KIND or raw.get("backend") != "forge":
             continue
 
@@ -3963,12 +3950,13 @@ def list_forge_schemas(
         items.append({
             "id": schema_id,
             "label": str(raw.get("label") or schema_id),
-            "ui_family": str(raw.get("ui_family") or "standard"),
             "file": path.name,
             "order": order,
         })
 
     items.sort(key=lambda item: (item.get("order", 1000), item["label"].lower()))
+    for item in items:
+        item.pop("order", None)
     return items, schema_dir, invalid_schemas
 
 
@@ -4638,10 +4626,10 @@ def run_forge_generation(task: Dict[str, Any]) -> None:
 # берутся из default схемы, а значения видимых — из проверенного словаря JSX.
 def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     message = task.get("message") or {}
-    schema_id = str(message.get("schema_id") or message.get("workspace_id") or "")
+    schema_id = str(message.get("schema_id") or "")
     schema = get_forge_schema(schema_id, message.get("schema_folder"))
     input_path = Path(str(message.get("input") or ""))
-    output_dir = Path(str(message.get("output") or TEMP_DIR))
+    output_dir = TEMP_DIR
     values = message.get("values") if isinstance(message.get("values"), dict) else {}
     width = int(message.get("width") or 0)
     height = int(message.get("height") or 0)
@@ -4883,11 +4871,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         generated_seeds["seed"] = info.get("seed")
     answer({
         "path": str(destination),
-        "backend": "forge",
-        "workspace_id": schema_id,
-        "values": values,
         "generated_seeds": generated_seeds,
-        "warnings": [],
     }, request_id=request_id)
 
 
@@ -4895,7 +4879,6 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
 # СОСТОЯНИЕ ПРОЦЕССА И ФОНОВЫЕ WORKERS
 class RuntimeConfig:
     backend_host: str = DEFAULT_COMFY_HOST
-    comfy_host: str = DEFAULT_COMFY_HOST
     comfy_port: int = 8188
     forge_port: int = 7860
     comfy_input_folder: Optional[Path] = None
@@ -4915,6 +4898,7 @@ class GenerationState:
     output_folder: Optional[Path] = None
     uploaded_images: List[Dict[str, Any]] = field(default_factory=list)
     progress_watcher: Optional[ComfyProgressWatcher] = None
+    preserved_output_path: Optional[Path] = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     # ACK закрывает разрыв между двумя listener-стадиями JSX.
     ack_event: threading.Event = field(default_factory=threading.Event)
@@ -4959,6 +4943,7 @@ def generation_context(task: Dict[str, Any], backend: str):
     GENERATION.output_folder = None
     GENERATION.uploaded_images = []
     GENERATION.progress_watcher = None
+    GENERATION.preserved_output_path = None
     GENERATION.cancel_event.clear()
     GENERATION.ack_event.clear()
     GENERATION.active = True
@@ -4970,7 +4955,11 @@ def generation_context(task: Dict[str, Any], backend: str):
         try:
             if GENERATION.progress_watcher is not None:
                 GENERATION.progress_watcher.close()
-            cleanup_comfy_request_outputs(GENERATION.output_folder, request_id)
+            cleanup_comfy_request_outputs(
+                GENERATION.output_folder,
+                request_id,
+                preserve_path=GENERATION.preserved_output_path,
+            )
             cleanup_uploaded_images(GENERATION.input_folder, GENERATION.uploaded_images)
         finally:
             with CANCELLED_REQUESTS_LOCK:
@@ -4982,6 +4971,7 @@ def generation_context(task: Dict[str, Any], backend: str):
             GENERATION.output_folder = None
             GENERATION.uploaded_images = []
             GENERATION.progress_watcher = None
+            GENERATION.preserved_output_path = None
             GENERATION.active = False
             GENERATION.queued = False
             GENERATION.cancel_event.clear()
@@ -4999,7 +4989,7 @@ REPLY_LOCK = threading.Lock()
 
 
 # Ответы отправляются на отдельный listener JSX. ASCII-only JSON нужен из-за
-# ограничений старого ExtendScript Socket/eval при Unicode control characters.
+# ограничений ExtendScript Socket/eval при Unicode control characters.
 def send_data_to_jsx(message: Dict[str, Any], retries: int = 20) -> bool:
     """Отправляет один ASCII-only JSON-ответ локальному JSX listener."""
 
@@ -5162,11 +5152,11 @@ def invalidate_workflow_cache(workflow_id: str) -> None:
 
 
 def current_client() -> ComfyClient:
-    return ComfyClient(RUNTIME.comfy_host, RUNTIME.comfy_port)
+    return ComfyClient(RUNTIME.backend_host, RUNTIME.comfy_port)
 
 
 def get_object_info(force: bool = False) -> Dict[str, Any]:
-    server_key = f"{RUNTIME.comfy_host}:{RUNTIME.comfy_port}"
+    server_key = f"{RUNTIME.backend_host}:{RUNTIME.comfy_port}"
     with OBJECT_INFO_LOCK:
         cached = OBJECT_INFO_CACHE.get("value")
         if cached is not None and OBJECT_INFO_CACHE.get("server") == server_key and not force:
@@ -5245,10 +5235,9 @@ def analyze_workflow(
         if cached_bundle is not None:
             analysis, validation_schema = cached_bundle
             LOGGER.info("Workflow analysis: disk cache used")
-            if validation_schema is not None:
-                WORKFLOW_RUNTIME_CACHE.put_analysis(
-                    workflow_file, overrides, analysis, validation_schema
-                )
+            WORKFLOW_RUNTIME_CACHE.put_analysis(
+                workflow_file, overrides, analysis, validation_schema
+            )
 
     if analysis is None:
         object_info = get_object_info(force=force)
@@ -5262,30 +5251,12 @@ def analyze_workflow(
         SCHEMA_CACHE.save(
             workflow_file, analysis, validation_schema, overrides
         )
-    elif validation_schema is None:
-        # Legacy cache migration: keep its ready analysis, request /object_info
-        # once, and append only the compact validation metadata.
-        object_info = get_object_info(force=False)
-        workflow_data = WORKFLOW_RUNTIME_CACHE.load_json(workflow_file, repository)
-        validation_schema = build_validation_schema(workflow_data, object_info)
-        SCHEMA_CACHE.save(
-            workflow_file, analysis, validation_schema, overrides
-        )
-        WORKFLOW_RUNTIME_CACHE.put_analysis(
-            workflow_file, overrides, analysis, validation_schema
-        )
-        LOGGER.info("Workflow analysis: legacy disk cache validation schema migrated")
-
     result = dict(analysis)
     result.update(
         {
             "workflow_id": workflow_file.workflow_id,
             "workflow_name": workflow_file.name,
             "relative_path": workflow_file.relative_path,
-            "workflow_hash": WorkflowRepository.ensure_hash(workflow_file),
-            "file_size": workflow_file.size,
-            "modified": workflow_file.modified,
-            "modified_ns": workflow_file.modified_ns,
         }
     )
     LOGGER.info(
@@ -5356,7 +5327,6 @@ def save_workflow_values(
         if isinstance(control, dict) and control.get("id")
     }
     patcher = WorkflowPatcher(workflow_data, object_info)
-    updated = 0
     for raw_id, value in values.items():
         control_id = str(raw_id or "")
         control = controls_by_id.get(control_id)
@@ -5373,7 +5343,6 @@ def save_workflow_values(
             )
         for target in targets:
             patcher.set_target(target, value)
-        updated += 1
 
     raw_destination = str(destination_path or "").strip()
     if not raw_destination:
@@ -5386,15 +5355,10 @@ def save_workflow_values(
         saved_relative = destination.resolve().relative_to(repository.folder.resolve()).as_posix()
         invalidate_workflow_cache(stable_workflow_id(saved_relative))
     except (OSError, ValueError):
-        saved_relative = ""
+        pass
     if destination.resolve() == workflow_file.absolute_path.resolve():
         invalidate_workflow_cache(workflow_file.workflow_id)
-    return {
-        "ok": True,
-        "path": str(destination),
-        "relative_path": saved_relative,
-        "updated": updated,
-    }
+    return {"path": str(destination)}
 
 
 def save_forge_schema_values(
@@ -5411,7 +5375,7 @@ def save_forge_schema_values(
     if not values:
         raise UserVisibleError("There are no visible Forge schema values to save.")
 
-    items, schema_dir, _invalid_schemas = list_forge_schemas(schema_folder)
+    items, schema_dir, _ = list_forge_schemas(schema_folder)
     item = next((entry for entry in items if str(entry.get("id") or "") == str(schema_id or "")), None)
     if not item:
         raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
@@ -5456,7 +5420,6 @@ def save_forge_schema_values(
         if isinstance(control, dict) and control.get("id")
     }
     runtime_catalog = _forge_runtime_control_catalog(effective_schema)
-    updated = 0
     for raw_id, value in values.items():
         control_id = str(raw_id or "")
         if control_id == "image_stitch":
@@ -5468,7 +5431,6 @@ def save_forge_schema_values(
             if not _forge_bool(capabilities.get("image_stitch")):
                 raise UserVisibleError("The selected Forge schema does not support ImageStitch.")
             raw["image_stitch_default"] = _forge_bool(value)
-            updated += 1
             continue
         control = controls_by_id.get(control_id)
         if not control:
@@ -5479,7 +5441,6 @@ def save_forge_schema_values(
         control["value"] = _forge_coerce_control_value(
             effective_control, value, runtime_catalog
         )
-        updated += 1
 
     raw_destination = str(destination_path or "").strip()
     if not raw_destination:
@@ -5537,11 +5498,7 @@ def save_forge_schema_values(
         raw.pop("loras", None)
 
     write_json_atomic(destination, raw, "Forge schema JSON")
-    return {
-        "ok": True,
-        "path": str(destination),
-        "updated": updated,
-    }
+    return {"path": str(destination)}
 
 
 GENERATION_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -5846,7 +5803,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     input_path = Path(str(message.get("input") or ""))
     mask_path = Path(str(message.get("mask") or "")) if message.get("mask") else None
     inpaint_mode = str(message.get("inpaint_mode") or "")
-    output_dir = Path(str(message.get("output") or TEMP_DIR))
+    output_dir = TEMP_DIR
     width = int(message.get("width") or 0)
     height = int(message.get("height") or 0)
     relative_path = str(message.get("relative_path") or "")
@@ -5881,10 +5838,9 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         if cached_bundle is not None:
             analysis, validation_schema = cached_bundle
             LOGGER.info("Comfy generation: disk analysis cache used")
-            if validation_schema is not None:
-                WORKFLOW_RUNTIME_CACHE.put_analysis(
-                    workflow_file, overrides, analysis, validation_schema
-                )
+            WORKFLOW_RUNTIME_CACHE.put_analysis(
+                workflow_file, overrides, analysis, validation_schema
+            )
 
     if analysis is None:
         object_info = get_object_info(force=False)
@@ -5896,21 +5852,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         SCHEMA_CACHE.save(
             workflow_file, analysis, validation_schema, overrides
         )
-    elif validation_schema is None:
-        # Old cache format: retain the cached analysis, fetch full /object_info
-        # once and rewrite the cache with the small validation subset.
-        object_info = get_object_info(force=False)
-        validation_schema = build_validation_schema(workflow_data, object_info)
-        SCHEMA_CACHE.save(
-            workflow_file, analysis, validation_schema, overrides
-        )
-        WORKFLOW_RUNTIME_CACHE.put_analysis(
-            workflow_file, overrides, analysis, validation_schema
-        )
-        LOGGER.info("Comfy generation: legacy disk cache validation schema migrated")
-
-    # WorkflowPatcher always receives real ComfyUI type metadata. On a current
-    # disk cache hit this is the compact schema and requires no /object_info.
+    # WorkflowPatcher receives current ComfyUI type metadata from the compact cache.
     object_info = validation_schema or {}
     raise_if_generation_cancelled(request_id)
     if not analysis.get("valid"):
@@ -6141,16 +6083,17 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         quality=95,
         output_format=output_format,
         local_output_folder=output_folder,
+        request_id=request_id,
     )
+    if _comfy_request_output_path(destination, output_folder, request_id) is not None:
+        GENERATION.preserved_output_path = destination
 
     # Итоговый путь всегда отправляется после init/ACK.
     answer(
         {
             "path": str(destination),
             "prompt_id": actual_prompt_id,
-            "workflow_id": workflow_file.workflow_id,
             "workflow_hash": WorkflowRepository.ensure_hash(workflow_file),
-            "values": values,
             "generated_seeds": patcher.generated_seeds,
             "warnings": generation_warnings,
         },
@@ -6183,17 +6126,11 @@ def generation_worker() -> None:
             GENERATION_QUEUE.task_done()
 
 
-def _backend_probe_result(name: str, host: str, port: int, started: float, *,
-                          available: bool, details: Optional[Dict[str, Any]] = None,
-                          error: str = "", checked: bool = True) -> Dict[str, Any]:
+def _backend_probe_result(*, available: bool, details: Optional[Dict[str, Any]] = None,
+                          checked: bool = True) -> Dict[str, Any]:
     return {
-        "name": name,
         "available": bool(available),
-        "host": host,
-        "port": int(port),
-        "latency_ms": int(round((time.monotonic() - started) * 1000)) if checked else 0,
         "details": details or {},
-        "error": str(error or ""),
         "checked": bool(checked),
         "checked_at": time.time() if checked else 0.0,
     }
@@ -6209,7 +6146,6 @@ def _compose_backend_status(comfy: Dict[str, Any], forge: Dict[str, Any]) -> Dic
     ]
     return {
         "mode": mode,
-        "available_backends": available,
         "backends": {"comfy": comfy, "forge": forge},
         # Свежесть снимка определяется более старой проверкой.
         "checked_at": min(checked_at_values) if len(checked_at_values) == 2 else 0.0,
@@ -6218,7 +6154,6 @@ def _compose_backend_status(comfy: Dict[str, Any], forge: Dict[str, Any]) -> Dic
 
 def _probe_comfy_full(host: str, port: int, *, update_runtime: bool) -> Dict[str, Any]:
     global COMFY_INPUT_FOLDER_ENDPOINT
-    started = time.monotonic()
     endpoint = (normalize_comfy_host(host), int(port))
     try:
         stats = ComfyClient(host, int(port)).ping(timeout=2.0)
@@ -6234,39 +6169,28 @@ def _probe_comfy_full(host: str, port: int, *, update_runtime: bool) -> Dict[str
             COMFY_INPUT_FOLDER_ENDPOINT = endpoint
             schedule_comfy_folder_cleanup(input_folder, output_folder)
         details = {
-            "ok": True,
             "validated": True,
             "input_folder": str(input_folder or ""),
             "output_folder": str(output_folder or ""),
         }
-        return _backend_probe_result(
-            "comfy", host, int(port), started, available=True, details=details,
-        )
-    except Exception as exc:
+        return _backend_probe_result(available=True, details=details)
+    except Exception:
         if update_runtime:
             RUNTIME.comfy_input_folder = None
             RUNTIME.comfy_output_folder = None
             COMFY_INPUT_FOLDER_ENDPOINT = None
-        return _backend_probe_result(
-            "comfy", host, int(port), started, available=False, error=str(exc),
-        )
+        return _backend_probe_result(available=False)
 
 
 def _probe_comfy_light(host: str, port: int, previous: Dict[str, Any]) -> Dict[str, Any]:
-    started = time.monotonic()
     try:
         response = ComfyClient(host, int(port)).get_json("/prompt", timeout=2.0)
         if not isinstance(response, dict):
             raise UserVisibleError("ComfyUI health response is invalid.")
         details = copy.deepcopy(previous.get("details") or {})
-        details["ok"] = True
-        return _backend_probe_result(
-            "comfy", host, int(port), started, available=True, details=details,
-        )
-    except Exception as exc:
-        return _backend_probe_result(
-            "comfy", host, int(port), started, available=False, error=str(exc),
-        )
+        return _backend_probe_result(available=True, details=details)
+    except Exception:
+        return _backend_probe_result(available=False)
 
 
 def _probe_comfy_regular(host: str, port: int, previous: Dict[str, Any], *,
@@ -6286,13 +6210,11 @@ def _probe_comfy_regular(host: str, port: int, previous: Dict[str, Any], *,
 
 def _probe_forge_full(host: str, port: int) -> Dict[str, Any]:
     global FORGE_CATALOG_CACHE_SERVER
-    started = time.monotonic()
     try:
         client = ForgeClient(host, int(port), timeout=2.0)
         options = client.get_json("sdapi/v1/options", timeout=2.0)
         is_forge_neo = isinstance(options, dict) and "forge_additional_modules" in options
         details = {
-            "ok": isinstance(options, dict),
             "forge_neo": bool(is_forge_neo),
             "validated": bool(is_forge_neo),
         }
@@ -6304,20 +6226,12 @@ def _probe_forge_full(host: str, port: int) -> Dict[str, Any]:
                     FORGE_CATALOG_CACHE.clear()
                     FORGE_CATALOG_CACHE_SERVER = server_key
             _update_forge_catalog_current(options)
-        return _backend_probe_result(
-            "forge", host, int(port), started,
-            available=is_forge_neo,
-            details=details,
-            error="" if is_forge_neo else "The server responded, but Forge Neo was not recognized.",
-        )
-    except Exception as exc:
-        return _backend_probe_result(
-            "forge", host, int(port), started, available=False, error=str(exc),
-        )
+        return _backend_probe_result(available=is_forge_neo, details=details)
+    except Exception:
+        return _backend_probe_result(available=False)
 
 
 def _probe_forge_light(host: str, port: int, previous: Dict[str, Any]) -> Dict[str, Any]:
-    started = time.monotonic()
     try:
         client = ForgeClient(host, int(port), timeout=2.0)
         response = client.get_json(
@@ -6326,14 +6240,9 @@ def _probe_forge_light(host: str, port: int, previous: Dict[str, Any]) -> Dict[s
         if not isinstance(response, dict) or "progress" not in response:
             raise UserVisibleError("Forge Neo health response is invalid.")
         details = copy.deepcopy(previous.get("details") or {})
-        details["ok"] = True
-        return _backend_probe_result(
-            "forge", host, int(port), started, available=True, details=details,
-        )
-    except Exception as exc:
-        return _backend_probe_result(
-            "forge", host, int(port), started, available=False, error=str(exc),
-        )
+        return _backend_probe_result(available=True, details=details)
+    except Exception:
+        return _backend_probe_result(available=False)
 
 
 def _probe_forge_regular(host: str, port: int, previous: Dict[str, Any]) -> Dict[str, Any]:
@@ -6357,7 +6266,7 @@ def _probe_backends_unlocked(host: str, comfy_port: int, forge_port: int, *,
     normalized_host = normalize_comfy_host(host)
     endpoints = _backend_endpoints(normalized_host, comfy_port, forge_port)
     previous_status = previous_status or _cached_backend_status(endpoints)
-    previous_status = previous_status or _unchecked_backend_status(endpoints)
+    previous_status = previous_status or _unchecked_backend_status()
     previous = previous_status["backends"]
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="BackendProbe") as executor:
         if full_check:
@@ -6486,7 +6395,6 @@ def _refresh_backend_status(
     *,
     reuse_cached: bool,
     max_cache_age: Optional[float] = None,
-    full_check: bool = False,
 ) -> Dict[str, Any]:
     """Refresh both backends after rechecking the shared cache."""
 
@@ -6500,7 +6408,6 @@ def _refresh_backend_status(
         status = _probe_backends_unlocked(
             *endpoints,
             update_runtime=True,
-            full_check=full_check,
             previous_status=cached,
         )
         return _store_backend_status(status, endpoints)
@@ -6518,7 +6425,7 @@ def _refresh_selected_backend_status(
 
     requested_at = time.time()
     with BACKEND_PROBE_LOCK:
-        cached = _cached_backend_status(endpoints) or _unchecked_backend_status(endpoints)
+        cached = _cached_backend_status(endpoints) or _unchecked_backend_status()
         selected = (cached.get("backends") or {}).get(backend) or {}
         selected_checked_at = float(selected.get("checked_at") or 0.0)
         if selected_checked_at >= requested_at and selected.get("checked") is not False:
@@ -6548,9 +6455,7 @@ def _refresh_changed_backend_status(
     """Fully validate changed endpoints and retain unchanged results."""
 
     with BACKEND_PROBE_LOCK:
-        previous_status = previous_status or _unchecked_backend_status(
-            previous_endpoints
-        )
+        previous_status = previous_status or _unchecked_backend_status()
         previous = previous_status["backends"]
         old_host, old_comfy_port, old_forge_port = previous_endpoints
         host, comfy_port, forge_port = endpoints
@@ -6586,33 +6491,22 @@ def _refresh_changed_backend_status(
         )
 
 
-def detect_backends(*, force_full: bool = False) -> Dict[str, Any]:
-    """Return the monitor snapshot; synchronously probe only on cache miss/refresh."""
+def detect_backends() -> Dict[str, Any]:
+    """Return the monitor snapshot; synchronously probe only on cache miss."""
 
     endpoints = _backend_endpoints(
         RUNTIME.backend_host, RUNTIME.comfy_port, RUNTIME.forge_port
     )
-    if not force_full:
-        cached = _cached_backend_status(endpoints)
-        if cached is not None:
-            return cached
-    return _refresh_backend_status(
-        endpoints, reuse_cached=not force_full, full_check=force_full
-    )
+    cached = _cached_backend_status(endpoints)
+    if cached is not None:
+        return cached
+    return _refresh_backend_status(endpoints, reuse_cached=True)
 
 
-def _unchecked_backend_status(endpoints: Tuple[str, int, int]) -> Dict[str, Any]:
-    host, comfy_port, forge_port = endpoints
-    started = time.monotonic()
+def _unchecked_backend_status() -> Dict[str, Any]:
     status = _compose_backend_status(
-        _backend_probe_result(
-            "comfy", host, comfy_port, started, available=False,
-            error="Background status is not ready.", checked=False,
-        ),
-        _backend_probe_result(
-            "forge", host, forge_port, started, available=False,
-            error="Background status is not ready.", checked=False,
-        ),
+        _backend_probe_result(available=False, checked=False),
+        _backend_probe_result(available=False, checked=False),
     )
     status["checked_at"] = 0.0
     return status
@@ -6626,7 +6520,6 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     host = message.get("host")
     if host:
         RUNTIME.backend_host = normalize_comfy_host(host)
-        RUNTIME.comfy_host = RUNTIME.backend_host
     if message.get("comfyPort"):
         RUNTIME.comfy_port = int(message["comfyPort"])
     if message.get("forgePort"):
@@ -6653,17 +6546,14 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         invalidate_detected_comfy_input_folder()
         RUNTIME.comfy_output_folder = None
     status_mode = str(message.get("backendStatusMode") or "cached").lower()
-    refresh_backends = bool(message.get("refreshBackends"))
     verify_backend = str(message.get("verifyBackend") or "").strip().lower()
     tested_status = _take_backend_test_result(
         str(message.get("backendProbeToken") or ""), endpoints
     )
-    if refresh_backends:
-        status = detect_backends(force_full=True)
-    elif verify_backend in {"comfy", "forge"}:
+    if verify_backend in {"comfy", "forge"}:
         status = _refresh_selected_backend_status(endpoints, verify_backend)
     elif status_mode == "silent":
-        status = _cached_backend_status(endpoints) or _unchecked_backend_status(endpoints)
+        status = _cached_backend_status(endpoints) or _unchecked_backend_status()
     elif tested_status is not None:
         status = _store_backend_status(tested_status, endpoints)
     elif endpoints_changed:
@@ -6671,7 +6561,7 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
             previous_endpoints, endpoints, previous_status
         )
     else:
-        status = detect_backends(force_full=False)
+        status = detect_backends()
     _apply_comfy_runtime_status(status, endpoints)
     BACKEND_MONITOR_WAKE.set()
     runtime_data = {
@@ -6684,25 +6574,17 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         "generation_timeout": RUNTIME.generation_timeout,
         "idle_timeout_seconds": RUNTIME.idle_timeout_seconds,
         "backend_monitor_interval_seconds": RUNTIME.backend_monitor_interval_seconds,
-        "updated": time.time(),
     }
     try:
         RUNTIME_FILE.write_text(json.dumps(runtime_data, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         LOGGER.warning("Could not write runtime.json")
-    result = {
-        "ok": True,
-        "app_dir": str(APP_DIR),
-        "log_file": str(LOG_FILE),
+    return {
         "version": VERSION,
-        "protocol": API_PROTOCOL,
         "comfy_input_folder": str(RUNTIME.comfy_input_folder or ""),
-        "comfy_output_folder": str(RUNTIME.comfy_output_folder or ""),
-        "idle_timeout_seconds": RUNTIME.idle_timeout_seconds,
-        "backend_monitor_interval_seconds": RUNTIME.backend_monitor_interval_seconds,
+        "mode": status.get("mode", "none"),
+        "backends": status.get("backends", {}),
     }
-    result.update(status)
-    return result
 
 
 # ДИСПЕТЧЕР КОМАНД JSX И ЛОКАЛЬНЫЙ SOCKET-СЕРВЕР
@@ -6714,11 +6596,11 @@ def handle_command(command: Dict[str, Any]) -> None:
     command_started = time.monotonic()
     LOGGER.info("API command: type=%s request=%s", command_type, request_id)
     if not isinstance(message, dict):
-        message = {} if message in (None, "") else {"value": message}
+        message = {}
 
     try:
         protocol = command.get("protocol")
-        if protocol is not None and str(protocol) != str(API_PROTOCOL):
+        if str(protocol or "") != str(API_PROTOCOL):
             raise UserVisibleError(
                 f"Incompatible API protocol version: {protocol}; expected {API_PROTOCOL}."
             )
@@ -6726,8 +6608,6 @@ def handle_command(command: Dict[str, Any]) -> None:
         if command_type == "ping":
             startup = startup_status_snapshot()
             answer({
-                "ok": True,
-                "version": VERSION,
                 "protocol": API_PROTOCOL,
                 "startup_status": str(startup.get("status") or "starting"),
                 "startup_message": str(startup.get("message") or ""),
@@ -6757,10 +6637,6 @@ def handle_command(command: Dict[str, Any]) -> None:
             answer(apply_handshake(message), request_id)
             return
 
-        if command_type == "backend_status":
-            answer(detect_backends(force_full=False), request_id)
-            return
-
         if command_type == "probe_backends":
             # Ручная проверка сбрасывает Forge-каталог для нового endpoint.
             clear_forge_catalog_cache()
@@ -6787,7 +6663,7 @@ def handle_command(command: Dict[str, Any]) -> None:
             overrides = message.get("binding_overrides")
             if not isinstance(overrides, dict):
                 overrides = None
-            force = command_type == "workflow_reinitialize" or bool(message.get("force"))
+            force = command_type == "workflow_reinitialize"
             if force:
                 invalidate_workflow_cache(workflow_id)
             result = analyze_workflow(
@@ -6853,7 +6729,7 @@ def handle_command(command: Dict[str, Any]) -> None:
             return
 
         if command_type == "translate":
-            source_text = str(message.get("text") or message.get("value") or "").strip()
+            source_text = str(message.get("text") or "").strip()
             if not source_text:
                 answer("", request_id)
                 return
@@ -6959,29 +6835,6 @@ def handle_client(client_socket: socket.socket) -> None:
             pass
 
 
-def write_lock_file() -> None:
-    LOCK_FILE.write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "host": API_HOST,
-                "port": API_RECEIVE_PORT,
-                "started": time.time(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-
-def remove_lock_file() -> None:
-    try:
-        LOCK_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
 def backend_monitor_watcher() -> None:
     """Refresh both backend states without adding network work to JSX startup."""
 
@@ -7063,7 +6916,6 @@ def load_runtime_file() -> None:
             return
         data = json.loads(RUNTIME_FILE.read_text(encoding="utf-8"))
         RUNTIME.backend_host = normalize_comfy_host(data.get("host"))
-        RUNTIME.comfy_host = RUNTIME.backend_host
         RUNTIME.comfy_port = int(data.get("comfy_port") or RUNTIME.comfy_port)
         RUNTIME.forge_port = int(data.get("forge_port") or RUNTIME.forge_port)
         input_folder = str(data.get("comfy_input_folder") or "")
@@ -7138,9 +6990,6 @@ def start_local_server() -> None:
             pass
         return
 
-    write_lock_file()
-    atexit.register(remove_lock_file)
-
     server.listen(8)
     server.settimeout(1.0)
     write_startup_status("starting", "Preparing Python API")
@@ -7163,7 +7012,7 @@ def start_local_server() -> None:
         VERSION,
         API_HOST,
         API_RECEIVE_PORT,
-        RUNTIME.comfy_host,
+        RUNTIME.backend_host,
         RUNTIME.comfy_port,
         LOG_FILE,
     )
@@ -7191,7 +7040,6 @@ def start_local_server() -> None:
             server.close()
         except OSError:
             pass
-        remove_lock_file()
         remove_startup_status()
         LOGGER.info("%s stopped", APP_NAME)
 
@@ -7203,4 +7051,3 @@ if __name__ == "__main__":
     except Exception as exc:
         log_exception("Critical startup error")
         write_startup_status("error", str(exc) or exc.__class__.__name__)
-        remove_lock_file()
