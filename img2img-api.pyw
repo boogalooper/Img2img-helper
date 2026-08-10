@@ -44,7 +44,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.171"
+VERSION = "0.173"
 
 # Единый объект идентичности приложения. Пользовательские каталоги, имена
 # служебных файлов и расположение поставляемых схем вычисляются только отсюда.
@@ -56,6 +56,7 @@ APP = {
     "schema_folder": "forge-schemas",
     "lock_file": "img2img-api.lock",
     "runtime_file": "runtime.json",
+    "startup_file": "startup.json",
     "log_file": "img2img-api.log",
     "upload_subfolder": "img2img-helper",
 }
@@ -206,6 +207,7 @@ TEMP_DIR = APP_DIR / "temp"
 STATE_DIR = APP_DIR / "state"
 LOCK_FILE = STATE_DIR / APP["lock_file"]
 RUNTIME_FILE = STATE_DIR / APP["runtime_file"]
+STARTUP_FILE = STATE_DIR / APP["startup_file"]
 LOG_FILE = APP_DIR / APP["log_file"]
 
 for _directory in (APP_DIR, CACHE_DIR, WORKFLOW_CACHE_DIR, TEMP_DIR, STATE_DIR):
@@ -237,6 +239,48 @@ if sys.stderr is not None:
 
 if not LOGGER.handlers:
     LOGGER.addHandler(logging.NullHandler())
+
+
+STARTUP_PROCESS_STARTED_AT = time.time()
+STARTUP_STATUS_LOCK = threading.Lock()
+
+
+def write_startup_status(status: str, message: str = "") -> None:
+    """Atomically publish Python startup state for the waiting JSX process."""
+
+    payload = {
+        "status": str(status or "starting"),
+        "message": str(message or ""),
+        "pid": os.getpid(),
+        "started_at": STARTUP_PROCESS_STARTED_AT,
+        "updated_at": time.time(),
+        "log_file": str(LOG_FILE),
+        "protocol": API_PROTOCOL,
+        "version": VERSION,
+    }
+    temp_path = STARTUP_FILE.with_name(
+        f".{STARTUP_FILE.name}.{os.getpid()}.tmp"
+    )
+    try:
+        with STARTUP_STATUS_LOCK:
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, STARTUP_FILE)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        LOGGER.warning("Could not write Python startup status: %s", STARTUP_FILE)
+
+
+def remove_startup_status() -> None:
+    try:
+        STARTUP_FILE.unlink(missing_ok=True)
+    except OSError:
+        LOGGER.warning("Could not remove Python startup status: %s", STARTUP_FILE)
 
 
 def log_exception(prefix: str) -> None:
@@ -283,6 +327,7 @@ def ensure_python_module(import_name: str, package_name: str = "") -> Any:
 
     package = package_name or import_name
     LOGGER.info("Module %s was not found; starting automatic installation of %s", import_name, package)
+    write_startup_status("installing", f"Installing Python module: {package}")
 
     if not _run_python_module(["pip", "--version"], timeout=60):
         LOGGER.info("pip is unavailable; running ensurepip")
@@ -313,6 +358,7 @@ def ensure_python_module(import_name: str, package_name: str = "") -> Any:
             f"Restart {APP_NAME}. Log: {LOG_FILE}"
         ) from exc
     LOGGER.info("Module %s was installed and loaded successfully", package)
+    write_startup_status("starting", "Preparing required Python modules")
     return module
 
 
@@ -6019,6 +6065,10 @@ def start_local_server() -> None:
         # Lock-файл активного процесса не перезаписываем и не удаляем: второй
         # экземпляр просто завершается после неудачного bind.
         LOGGER.error("Could not bind port %s: %s", API_RECEIVE_PORT, exc)
+        write_startup_status(
+            "error",
+            f"Could not open local Python API port {API_RECEIVE_PORT}: {exc}",
+        )
         try:
             server.close()
         except OSError:
@@ -6035,6 +6085,7 @@ def start_local_server() -> None:
 
     server.listen(8)
     server.settimeout(1.0)
+    write_startup_status("ready", "Python API is ready")
     LOGGER.info(
         "%s %s started. API %s:%s, host %s, ComfyUI port %s, log=%s",
         APP_NAME,
@@ -6069,12 +6120,15 @@ def start_local_server() -> None:
         except OSError:
             pass
         remove_lock_file()
+        remove_startup_status()
         LOGGER.info("%s stopped", APP_NAME)
 
 
 if __name__ == "__main__":
+    write_startup_status("starting", "Starting Python API")
     try:
         start_local_server()
-    except Exception:
+    except Exception as exc:
         log_exception("Critical startup error")
+        write_startup_status("error", str(exc) or exc.__class__.__name__)
         remove_lock_file()
