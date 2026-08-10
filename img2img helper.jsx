@@ -21,6 +21,7 @@ var APP = {
     uuid: "5f6f57dc-80c8-49b4-9ea9-405d132b7b30",
     settingsFile: "img2img helper.desc",
     tempFolder: "img2img helper",
+    comfyUploadSubfolder: "img2img-helper",
     startupFile: "state/startup.json",
     generatedLayerName: "generated image",
     dialogEnvKey: "img2imgHelperDialogMode",
@@ -1775,7 +1776,19 @@ function GenerationRuntime() {
                 width = targetSize.width,
                 height = targetSize.height;
             app.activeDocument.suspendHistory(localize(str.historyPrepareSelection), "prepareSelectionLayer(selection)");
-            var exportedFiles = exportSelectionFiles(selection, width, height, requestId, inpaintMode);
+            var directComfyFolder = currentBackend == BACKEND_COMFY ? backend.comfyUploadFolder() : "",
+                exportedFiles;
+            if (directComfyFolder) {
+                try {
+                    exportedFiles = exportSelectionFiles(selection, width, height, requestId, inpaintMode, directComfyFolder);
+                } catch (_) {
+                    // Путь мог устареть после перезапуска ComfyUI или оказаться
+                    // недоступным Photoshop. Временный файл сохранит HTTP-fallback.
+                    exportedFiles = exportSelectionFiles(selection, width, height, requestId, inpaintMode, "");
+                }
+            } else {
+                exportedFiles = exportSelectionFiles(selection, width, height, requestId, inpaintMode, "");
+            }
             inputFile = exportedFiles.input;
             maskFile = exportedFiles.mask;
             var msg;
@@ -2008,13 +2021,15 @@ function GenerationRuntime() {
             doc.selectLayersByIDs([selection.junk]);
         }
     }
-    function exportSelectionFiles(selection, width, height, requestId, inpaintMode) {
+    function exportSelectionFiles(selection, width, height, requestId, inpaintMode, preferredFolder) {
         var hst = activeDocument.activeHistoryState,
             hiddenLayerIds = [],
             c = null;
         try { c = doc.getProperty("center").value; } catch (_) { }
-        var p = new Folder(Folder.temp.fsName + "/" + APP.tempFolder);
-        if (!p.exists) p.create();
+        var p = preferredFolder
+            ? new Folder(String(preferredFolder))
+            : new Folder(Folder.temp.fsName + "/" + APP.tempFolder);
+        if (!p.exists && !p.create()) throw new Error(str.errSaveJpeg);
         // Для обоих вариантов Comfy inpaint Photoshop экспортирует обычный
         // JPEG и отдельную маску. Это повторяет проверенную схему SD Helper и
         // не требует создавать вторую user mask после Merge Visible.
@@ -2049,6 +2064,10 @@ function GenerationRuntime() {
                 doc.deleteLayer();
             }
             doc.saveACopy(inputFile);
+        } catch (exportError) {
+            try { if (inputFile.exists) inputFile.remove(); } catch (_) { }
+            try { if (maskFile && maskFile.exists) maskFile.remove(); } catch (_) { }
+            throw exportError;
         } finally {
             activeDocument.activeHistoryState = hst;
             // History State обычно возвращает видимость, но Photoshop не всегда
@@ -2282,7 +2301,8 @@ function ActionRuntime() {
 // ============================================================================
 function BackendRuntime() {
     var status = { mode: "none", available_backends: [], backends: { comfy: { available: false }, forge: { available: false } } },
-        pendingNotices = [];
+        pendingNotices = [],
+        localComfyInputFolder = "";
     function pushNotice(key, msg) {
         key = String(key || msg || "");
         msg = String(msg || "");
@@ -2310,6 +2330,8 @@ function BackendRuntime() {
     }
     function applyStatus(response) {
         if (!response || typeof response != "object") return;
+        if (response.hasOwnProperty("comfy_input_folder"))
+            localComfyInputFolder = String(response.comfy_input_folder || "");
         var source = response.backends ? response : { mode: "none", available_backends: [], backends: {} };
         status = {
             mode: source.mode || "none",
@@ -2319,6 +2341,7 @@ function BackendRuntime() {
                 forge: source.backends && source.backends.forge ? source.backends.forge : { available: false }
             }
         };
+        if (!status.backends.comfy.available) localComfyInputFolder = "";
     }
     function isAvailable(name) {
         return !!(status && status.backends && status.backends[name] && status.backends[name].available);
@@ -2693,7 +2716,15 @@ function BackendRuntime() {
         return true;
     }
     this.applyStatus = applyStatus;
-    this.getStatus = function () { return cloneObj(status); };
+    this.getStatus = function () {
+        var snapshot = cloneObj(status);
+        snapshot.comfy_input_folder = localComfyInputFolder;
+        return snapshot;
+    };
+    this.comfyUploadFolder = function () {
+        if (!localComfyInputFolder) return "";
+        return new Folder(localComfyInputFolder + "/" + APP.comfyUploadSubfolder).fsName;
+    };
     this.hasAvailable = function () { return status.mode != "none"; };
     this.isAvailable = isAvailable;
     this.statusLabel = statusLabel;

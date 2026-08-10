@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+from collections import OrderedDict
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -45,7 +46,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 1
-VERSION = "0.172"
+VERSION = "0.173"
 
 # Единый объект идентичности приложения. Пользовательские каталоги, имена
 # служебных файлов и расположение поставляемых схем вычисляются только отсюда.
@@ -81,8 +82,11 @@ MAX_API_MESSAGE = 32 * 1024 * 1024
 # Через сколько секунд бездействия фоновый процесс завершается самостоятельно.
 IDLE_TIMEOUT_SECONDS = 15 * 60
 
-# Как часто проверять историю ComfyUI во время генерации.
-HISTORY_POLL_INTERVAL = 0.35
+# До начала выполнения очередь и история опрашиваются с прежним интервалом.
+# После перехода prompt в running запрашивается только история, поэтому более
+# частый poll почти не нагружает ComfyUI и быстрее замечает готовый результат.
+HISTORY_PREPARE_POLL_INTERVAL = 0.35
+HISTORY_RESULT_POLL_INTERVAL = 0.20
 
 # Максимальный возраст временных каталогов перед автоматической очисткой.
 TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -98,6 +102,11 @@ VALIDATION_SCHEMA_VERSION = 1
 # UUID анализатора не является версией схемы. Новое значение принудительно
 # сбрасывает только кеш анализа workflow после изменения правил распознавания.
 ANALYZER_UUID = "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
+
+# Кеш нормализованных ImageStitch-изображений существует только в памяти
+# Python-процесса и ограничен одновременно количеством и суммарным размером.
+IMAGESTITCH_CACHE_MAX_ITEMS = 12
+IMAGESTITCH_CACHE_MAX_BYTES = 128 * 1024 * 1024
 
 # Упрощённые теги, которые пользователь может дописать к названию ноды прямо
 # в интерфейсе ComfyUI.
@@ -827,8 +836,8 @@ def detect_comfy_output_folder(
 def cleanup_stale_comfy_outputs(output_folder: Optional[Path]) -> None:
     """Remove leftovers from the helper-owned ComfyUI output subfolder.
 
-    This runs before a new helper request is queued, so every file already
-    present under ``output/Img2imgHelper`` belongs to an older request.
+    Only files older than ``TEMP_MAX_AGE_SECONDS`` are removed. Current request
+    files are cleaned separately by ``generation_context`` using request_id.
     """
 
     root = _existing_directory(output_folder)
@@ -837,13 +846,14 @@ def cleanup_stale_comfy_outputs(output_folder: Optional[Path]) -> None:
     base = (root / OUTPUT_SUBFOLDER).resolve()
     if not base.is_dir():
         return
+    threshold = time.time() - TEMP_MAX_AGE_SECONDS
     try:
         for child in base.rglob("*"):
             try:
-                if child.is_file():
+                if child.is_file() and child.stat().st_mtime < threshold:
                     child.unlink(missing_ok=True)
             except OSError:
-                LOGGER.warning("Could not delete old ComfyUI output file: %s", child)
+                LOGGER.warning("Could not inspect or delete old ComfyUI output file: %s", child)
         for child in sorted((item for item in base.rglob("*") if item.is_dir()), key=lambda item: len(item.parts), reverse=True):
             try:
                 child.rmdir()
@@ -916,6 +926,44 @@ def cleanup_uploaded_images(input_folder: Optional[Path], images: Sequence[Dict[
             target.unlink(missing_ok=True)
         except OSError:
             LOGGER.warning("Could not delete ComfyUI input file: %s", target)
+
+
+COMFY_FOLDER_CLEANUP_LOCK = threading.Lock()
+COMFY_FOLDER_CLEANUP_PATHS: Set[Tuple[str, str]] = set()
+
+
+def schedule_comfy_folder_cleanup(
+    input_folder: Optional[Path], output_folder: Optional[Path]
+) -> None:
+    """Schedule one age-limited cleanup for each detected local ComfyUI pair."""
+
+    input_root = _existing_directory(input_folder)
+    output_root = _existing_directory(output_folder)
+    if not input_root and not output_root:
+        return
+    key = (
+        os.path.normcase(str(input_root.resolve())) if input_root else "",
+        os.path.normcase(str(output_root.resolve())) if output_root else "",
+    )
+    with COMFY_FOLDER_CLEANUP_LOCK:
+        if key in COMFY_FOLDER_CLEANUP_PATHS:
+            return
+        COMFY_FOLDER_CLEANUP_PATHS.add(key)
+
+    def worker() -> None:
+        try:
+            if input_root:
+                cleanup_stale_comfy_uploads(input_root)
+            if output_root:
+                cleanup_stale_comfy_outputs(output_root)
+        except Exception:
+            log_exception("Background ComfyUI folder cleanup failed")
+
+    threading.Thread(
+        target=worker,
+        name="ComfyFolderCleanup",
+        daemon=True,
+    ).start()
 
 
 class UserVisibleError(RuntimeError):
@@ -1118,6 +1166,7 @@ class ComfyClient:
         destination: Path,
         quality: int = 95,
         output_format: Any = "jpg",
+        local_output_folder: Optional[Path] = None,
     ) -> Path:
         """Скачивает output в формате, удобном для размещения в Photoshop.
 
@@ -1133,6 +1182,25 @@ class ComfyClient:
             "subfolder": image_info.get("subfolder", ""),
             "type": image_info.get("type", "output"),
         }
+
+        # Для локального ComfyUI читаем output прямо с диска. Любая ошибка,
+        # нестандартный type или небезопасный путь оставляют проверенный /view.
+        local_root = _existing_directory(local_output_folder)
+        if local_root and str(base_query["type"]) == "output":
+            try:
+                root = local_root.resolve()
+                local_source = (
+                    root
+                    / str(base_query["subfolder"] or "").replace("\\", "/").strip("/")
+                    / str(base_query["filename"] or "")
+                ).resolve()
+                local_source.relative_to(root)
+                if local_source.is_file():
+                    return _save_image_content_for_photoshop(
+                        local_source.read_bytes(), destination, requested_format
+                    )
+            except (OSError, ValueError, UserVisibleError) as exc:
+                LOGGER.debug("Direct ComfyUI output read failed; using /view: %s", exc)
 
         if requested_format == "png":
             raw = self._request(
@@ -1310,7 +1378,6 @@ class WorkflowRepository:
                 root = self.folder.resolve()
                 candidate = (self.folder / relative_path).resolve()
                 candidate.relative_to(root)
-                normalized = candidate.relative_to(root).as_posix()
                 if candidate.is_file() and candidate.suffix.lower() == ".json":
                     item = self._workflow_from_path(candidate, compute_hash=False)
                     if not workflow_id or item.workflow_id == workflow_id:
@@ -2905,6 +2972,111 @@ class SchemaCache:
             LOGGER.warning("Could not delete cache %s", workflow_id)
 
 
+class WorkflowRuntimeCache:
+    """Bounded process cache for parsed JSON and override-specific analysis."""
+
+    MAX_WORKFLOWS = 8
+    MAX_ANALYSES = 24
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._workflows: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
+        self._analyses: "OrderedDict[Tuple[Any, ...], Tuple[Dict[str, Any], Dict[str, Any]]]" = OrderedDict()
+
+    @staticmethod
+    def _file_key(workflow_file: WorkflowFile) -> Tuple[Any, ...]:
+        try:
+            absolute = workflow_file.absolute_path.resolve()
+        except OSError:
+            absolute = workflow_file.absolute_path.absolute()
+        return (
+            workflow_file.workflow_id,
+            os.path.normcase(str(absolute)),
+            int(workflow_file.size),
+            int(workflow_file.modified_ns),
+        )
+
+    @staticmethod
+    def _overrides_key(overrides: Optional[Dict[str, Any]]) -> str:
+        return json.dumps(
+            overrides or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+    def _discard_stale_path_locked(self, file_key: Tuple[Any, ...]) -> None:
+        absolute = file_key[1]
+        stale_files = [
+            key for key in self._workflows if key[1] == absolute and key != file_key
+        ]
+        for key in stale_files:
+            self._workflows.pop(key, None)
+        stale_analyses = [
+            key for key in self._analyses
+            if key[0][1] == absolute and key[0] != file_key
+        ]
+        for key in stale_analyses:
+            self._analyses.pop(key, None)
+
+    def load_json(
+        self, workflow_file: WorkflowFile, repository: WorkflowRepository
+    ) -> Dict[str, Any]:
+        file_key = self._file_key(workflow_file)
+        with self._lock:
+            cached = self._workflows.get(file_key)
+            if cached is not None:
+                self._workflows.move_to_end(file_key)
+                return cached
+
+        loaded = repository.load_json(workflow_file)
+        with self._lock:
+            self._discard_stale_path_locked(file_key)
+            existing = self._workflows.get(file_key)
+            if existing is not None:
+                self._workflows.move_to_end(file_key)
+                return existing
+            self._workflows[file_key] = loaded
+            while len(self._workflows) > self.MAX_WORKFLOWS:
+                evicted_key, _ = self._workflows.popitem(last=False)
+                for analysis_key in [
+                    key for key in self._analyses if key[0] == evicted_key
+                ]:
+                    self._analyses.pop(analysis_key, None)
+        return loaded
+
+    def get_analysis(
+        self, workflow_file: WorkflowFile, overrides: Optional[Dict[str, Any]]
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        key = (self._file_key(workflow_file), self._overrides_key(overrides))
+        with self._lock:
+            bundle = self._analyses.get(key)
+            if bundle is None:
+                return None
+            self._analyses.move_to_end(key)
+            return copy.deepcopy(bundle)
+
+    def put_analysis(
+        self,
+        workflow_file: WorkflowFile,
+        overrides: Optional[Dict[str, Any]],
+        analysis: Dict[str, Any],
+        validation_schema: Dict[str, Any],
+    ) -> None:
+        file_key = self._file_key(workflow_file)
+        key = (file_key, self._overrides_key(overrides))
+        with self._lock:
+            self._discard_stale_path_locked(file_key)
+            self._analyses[key] = copy.deepcopy((analysis, validation_schema))
+            self._analyses.move_to_end(key)
+            while len(self._analyses) > self.MAX_ANALYSES:
+                self._analyses.popitem(last=False)
+
+    def invalidate(self, workflow_id: str) -> None:
+        with self._lock:
+            for key in [key for key in self._workflows if key[0] == workflow_id]:
+                self._workflows.pop(key, None)
+            for key in [key for key in self._analyses if key[0][0] == workflow_id]:
+                self._analyses.pop(key, None)
+
+
 class WorkflowPatcher:
     def __init__(self, workflow: Dict[str, Any], object_info: Dict[str, Any]):
         self.workflow = copy.deepcopy(workflow)
@@ -3849,6 +4021,55 @@ def _file_data_url(path: Path) -> str:
     return f"data:{mime};base64," + base64.b64encode(content).decode("ascii")
 
 
+IMAGESTITCH_CACHE_LOCK = threading.RLock()
+IMAGESTITCH_CACHE: "OrderedDict[Tuple[str, int, int], str]" = OrderedDict()
+IMAGESTITCH_CACHE_BYTES = 0
+
+
+def _imagestitch_cache_key(path: Path) -> Optional[Tuple[str, int, int]]:
+    try:
+        resolved = path.resolve()
+        stat = resolved.stat()
+        return (
+            os.path.normcase(str(resolved)),
+            int(stat.st_size),
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+        )
+    except OSError:
+        return None
+
+
+def _imagestitch_cache_get(key: Optional[Tuple[str, int, int]]) -> Optional[str]:
+    if key is None:
+        return None
+    with IMAGESTITCH_CACHE_LOCK:
+        cached = IMAGESTITCH_CACHE.get(key)
+        if cached is not None:
+            IMAGESTITCH_CACHE.move_to_end(key)
+        return cached
+
+
+def _imagestitch_cache_put(key: Optional[Tuple[str, int, int]], value: str) -> None:
+    global IMAGESTITCH_CACHE_BYTES
+    if key is None or len(value) > IMAGESTITCH_CACHE_MAX_BYTES:
+        return
+    with IMAGESTITCH_CACHE_LOCK:
+        # Новые size/mtime того же пути вытесняют старую нормализацию сразу.
+        for stale_key in [item for item in IMAGESTITCH_CACHE if item[0] == key[0] and item != key]:
+            IMAGESTITCH_CACHE_BYTES -= len(IMAGESTITCH_CACHE.pop(stale_key))
+        previous = IMAGESTITCH_CACHE.pop(key, None)
+        if previous is not None:
+            IMAGESTITCH_CACHE_BYTES -= len(previous)
+        IMAGESTITCH_CACHE[key] = value
+        IMAGESTITCH_CACHE_BYTES += len(value)
+        while (
+            len(IMAGESTITCH_CACHE) > IMAGESTITCH_CACHE_MAX_ITEMS
+            or IMAGESTITCH_CACHE_BYTES > IMAGESTITCH_CACHE_MAX_BYTES
+        ):
+            _, evicted_value = IMAGESTITCH_CACHE.popitem(last=False)
+            IMAGESTITCH_CACHE_BYTES -= len(evicted_value)
+
+
 def _forge_reference_data_url(path: Path) -> str:
     """Normalizes an external ImageStitch file before sending it to Forge.
 
@@ -3862,6 +4083,11 @@ def _forge_reference_data_url(path: Path) -> str:
     serializes a clean PNG. This also removes metadata/container peculiarities
     while preserving RGB/RGBA pixels and transparency.
     """
+
+    cache_key = _imagestitch_cache_key(path)
+    cached = _imagestitch_cache_get(cache_key)
+    if cached is not None:
+        return cached
 
     image_module = PIL_IMAGE_MODULE
     image_ops_module = PIL_IMAGE_OPS_MODULE
@@ -3893,7 +4119,10 @@ def _forge_reference_data_url(path: Path) -> str:
         raise UserVisibleError(
             f"ImageStitch could not prepare a valid PNG image: {path}"
         )
-    return "data:image/png;base64," + base64.b64encode(content).decode("ascii")
+    result = "data:image/png;base64," + base64.b64encode(content).decode("ascii")
+    if _imagestitch_cache_key(path) == cache_key:
+        _imagestitch_cache_put(cache_key, result)
+    return result
 
 
 def _decode_forge_image(value: Any, destination_without_suffix: Path) -> Path:
@@ -4721,6 +4950,12 @@ def cancelled_answer(request_id: Optional[str] = None) -> None:
 OBJECT_INFO_LOCK = threading.Lock()
 OBJECT_INFO_CACHE: Dict[str, Any] = {"value": None, "server": None}
 SCHEMA_CACHE = SchemaCache()
+WORKFLOW_RUNTIME_CACHE = WorkflowRuntimeCache()
+
+
+def invalidate_workflow_cache(workflow_id: str) -> None:
+    SCHEMA_CACHE.invalidate(workflow_id)
+    WORKFLOW_RUNTIME_CACHE.invalidate(workflow_id)
 
 
 def current_client() -> ComfyClient:
@@ -4794,27 +5029,45 @@ def analyze_workflow(
     validation_schema = None
     workflow_data: Optional[Dict[str, Any]] = None
 
-    if not force and not overrides:
+    if force:
+        WORKFLOW_RUNTIME_CACHE.invalidate(workflow_file.workflow_id)
+    else:
+        runtime_bundle = WORKFLOW_RUNTIME_CACHE.get_analysis(workflow_file, overrides)
+        if runtime_bundle is not None:
+            analysis, validation_schema = runtime_bundle
+            LOGGER.info("Workflow analysis: process cache used")
+
+    if analysis is None and not force and not overrides:
         cached_bundle = SCHEMA_CACHE.load_fast_bundle(workflow_file)
         if cached_bundle is not None:
             analysis, validation_schema = cached_bundle
             LOGGER.info("Workflow analysis: disk cache used")
+            if validation_schema is not None:
+                WORKFLOW_RUNTIME_CACHE.put_analysis(
+                    workflow_file, overrides, analysis, validation_schema
+                )
 
     if analysis is None:
         object_info = get_object_info(force=force)
-        workflow_data = repository.load_json(workflow_file)
+        workflow_data = WORKFLOW_RUNTIME_CACHE.load_json(workflow_file, repository)
         LOGGER.info("Workflow analysis: JSON contains %s nodes", len(workflow_data))
         analysis = WorkflowAnalyzer(workflow_data, object_info).analyze(overrides)
         validation_schema = build_validation_schema(workflow_data, object_info)
+        WORKFLOW_RUNTIME_CACHE.put_analysis(
+            workflow_file, overrides, analysis, validation_schema
+        )
         if not overrides:
             SCHEMA_CACHE.save(workflow_file, analysis, validation_schema)
     elif validation_schema is None:
         # Legacy cache migration: keep its ready analysis, request /object_info
         # once, and append only the compact validation metadata.
         object_info = get_object_info(force=False)
-        workflow_data = repository.load_json(workflow_file)
+        workflow_data = WORKFLOW_RUNTIME_CACHE.load_json(workflow_file, repository)
         validation_schema = build_validation_schema(workflow_data, object_info)
         SCHEMA_CACHE.save(workflow_file, analysis, validation_schema)
+        WORKFLOW_RUNTIME_CACHE.put_analysis(
+            workflow_file, overrides, analysis, validation_schema
+        )
         LOGGER.info("Workflow analysis: legacy disk cache validation schema migrated")
 
     result = dict(analysis)
@@ -4854,10 +5107,22 @@ def save_workflow_values(
 
     repository = WorkflowRepository(RUNTIME.workflows_folder)
     workflow_file = repository.get(workflow_id, relative_path=relative_path)
-    workflow_data = repository.load_json(workflow_file)
-    object_info = get_object_info(force=False)
+    workflow_data = WORKFLOW_RUNTIME_CACHE.load_json(workflow_file, repository)
     normalized_overrides = normalize_binding_overrides(overrides)
-    analysis = WorkflowAnalyzer(workflow_data, object_info).analyze(normalized_overrides)
+    cached_bundle = WORKFLOW_RUNTIME_CACHE.get_analysis(
+        workflow_file, normalized_overrides
+    )
+    if cached_bundle is not None:
+        analysis, object_info = cached_bundle
+    else:
+        full_object_info = get_object_info(force=False)
+        analysis = WorkflowAnalyzer(workflow_data, full_object_info).analyze(
+            normalized_overrides
+        )
+        object_info = build_validation_schema(workflow_data, full_object_info)
+        WORKFLOW_RUNTIME_CACHE.put_analysis(
+            workflow_file, normalized_overrides, analysis, object_info
+        )
     if not analysis.get("valid"):
         messages = [
             str(item.get("message") or "")
@@ -4904,11 +5169,11 @@ def save_workflow_values(
     write_json_atomic(destination, patcher.workflow, "workflow JSON")
     try:
         saved_relative = destination.resolve().relative_to(repository.folder.resolve()).as_posix()
-        SCHEMA_CACHE.invalidate(stable_workflow_id(saved_relative))
+        invalidate_workflow_cache(stable_workflow_id(saved_relative))
     except (OSError, ValueError):
         saved_relative = ""
     if destination.resolve() == workflow_file.absolute_path.resolve():
-        SCHEMA_CACHE.invalidate(workflow_file.workflow_id)
+        invalidate_workflow_cache(workflow_file.workflow_id)
     return {
         "ok": True,
         "path": str(destination),
@@ -5266,6 +5531,93 @@ def run_generation(task: Dict[str, Any]) -> None:
         _run_comfy_generation(task, request_id)
 
 
+_COMFY_FOLDER_PROBE_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
+def verify_local_comfy_input_folder(
+    client: ComfyClient, input_folder: Optional[Path]
+) -> bool:
+    """Confirm that the active ComfyUI serves files from the detected folder."""
+
+    root = _existing_directory(input_folder)
+    if not root:
+        return False
+    base = (root / UPLOAD_SUBFOLDER).resolve()
+    probe = base / f".probe_{uuid.uuid4().hex}.png"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        probe.write_bytes(_COMFY_FOLDER_PROBE_PNG)
+        raw = client._request(
+            "GET",
+            "/view?" + urllib.parse.urlencode({
+                "filename": probe.name,
+                "subfolder": UPLOAD_SUBFOLDER,
+                "type": "input",
+            }),
+            timeout=5,
+        )
+        return raw.startswith(b"\x89PNG\r\n\x1a\n")
+    except (OSError, UserVisibleError):
+        return False
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def invalidate_detected_comfy_input_folder() -> None:
+    global COMFY_INPUT_FOLDER_ENDPOINT
+    RUNTIME.comfy_input_folder = None
+    COMFY_INPUT_FOLDER_ENDPOINT = None
+
+
+def stage_comfy_image(
+    client: ComfyClient,
+    source: Path,
+    remote_name: str,
+    input_folder: Optional[Path],
+    direct_verified: bool,
+) -> Dict[str, Any]:
+    """Use a local Comfy input file/copy, with multipart upload as fallback."""
+
+    root = _existing_directory(input_folder) if direct_verified else None
+    if root:
+        base = (root / UPLOAD_SUBFOLDER).resolve()
+        temp_target: Optional[Path] = None
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            resolved_source = source.resolve()
+            if resolved_source.parent == base:
+                return {
+                    "name": resolved_source.name,
+                    "subfolder": UPLOAD_SUBFOLDER,
+                    "type": "input",
+                }
+            target = (base / safe_filename(remote_name)).resolve()
+            if target.parent != base:
+                raise OSError("Unsafe ComfyUI input target")
+            temp_target = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            shutil.copy2(resolved_source, temp_target)
+            os.replace(temp_target, target)
+            return {
+                "name": target.name,
+                "subfolder": UPLOAD_SUBFOLDER,
+                "type": "input",
+            }
+        except OSError as exc:
+            LOGGER.debug("Direct ComfyUI input staging failed; using HTTP: %s", exc)
+        finally:
+            if temp_target is not None:
+                try:
+                    temp_target.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    return client.upload_image(source, remote_name, UPLOAD_SUBFOLDER)
+
+
 # ============================================================================
 # COMFY GENERATION
 # Загружает временные изображения, применяет bindings/values к копии workflow,
@@ -5298,22 +5650,34 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
 
     repository = WorkflowRepository(RUNTIME.workflows_folder)
     workflow_file = repository.get(workflow_id, relative_path=relative_path)
-    workflow_data = repository.load_json(workflow_file)
+    workflow_data = WORKFLOW_RUNTIME_CACHE.load_json(workflow_file, repository)
     raise_if_generation_cancelled(request_id)
 
     analysis = None
     validation_schema = None
 
-    if not overrides:
+    runtime_bundle = WORKFLOW_RUNTIME_CACHE.get_analysis(workflow_file, overrides)
+    if runtime_bundle is not None:
+        analysis, validation_schema = runtime_bundle
+        LOGGER.info("Comfy generation: process analysis cache used")
+
+    if analysis is None and not overrides:
         cached_bundle = SCHEMA_CACHE.load_fast_bundle(workflow_file)
         if cached_bundle is not None:
             analysis, validation_schema = cached_bundle
             LOGGER.info("Comfy generation: disk analysis cache used")
+            if validation_schema is not None:
+                WORKFLOW_RUNTIME_CACHE.put_analysis(
+                    workflow_file, overrides, analysis, validation_schema
+                )
 
     if analysis is None:
         object_info = get_object_info(force=False)
         analysis = WorkflowAnalyzer(workflow_data, object_info).analyze(overrides)
         validation_schema = build_validation_schema(workflow_data, object_info)
+        WORKFLOW_RUNTIME_CACHE.put_analysis(
+            workflow_file, overrides, analysis, validation_schema
+        )
         if not overrides:
             SCHEMA_CACHE.save(workflow_file, analysis, validation_schema)
     elif validation_schema is None:
@@ -5322,6 +5686,9 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         object_info = get_object_info(force=False)
         validation_schema = build_validation_schema(workflow_data, object_info)
         SCHEMA_CACHE.save(workflow_file, analysis, validation_schema)
+        WORKFLOW_RUNTIME_CACHE.put_analysis(
+            workflow_file, overrides, analysis, validation_schema
+        )
         LOGGER.info("Comfy generation: legacy disk cache validation schema migrated")
 
     # WorkflowPatcher always receives real ComfyUI type metadata. On a current
@@ -5366,18 +5733,23 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     client = current_client()
     input_folder = _existing_directory(RUNTIME.comfy_input_folder)
     output_folder = _existing_directory(RUNTIME.comfy_output_folder)
+    direct_input_verified = bool(
+        input_folder and verify_local_comfy_input_folder(client, input_folder)
+    )
+    if input_folder and not direct_input_verified:
+        LOGGER.warning(
+            "Detected ComfyUI input folder is no longer served; using HTTP upload"
+        )
+        invalidate_detected_comfy_input_folder()
+        input_folder = None
     GENERATION.input_folder = input_folder
     GENERATION.output_folder = output_folder
-    if input_folder:
-        cleanup_stale_comfy_uploads(input_folder)
-    if output_folder:
-        cleanup_stale_comfy_outputs(output_folder)
-
-    upload_subfolder = UPLOAD_SUBFOLDER
 
     input_suffix = input_path.suffix.lower() if input_path.suffix else ".jpg"
     remote_name = safe_filename(f"input_{request_id}{input_suffix}")
-    uploaded = client.upload_image(input_path, remote_name, upload_subfolder)
+    uploaded = stage_comfy_image(
+        client, input_path, remote_name, input_folder, direct_input_verified
+    )
     GENERATION.uploaded_images.append(uploaded)
     raise_if_generation_cancelled(request_id)
 
@@ -5385,7 +5757,9 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     if inpaint_mode and mask_path is not None:
         mask_suffix = mask_path.suffix.lower() if mask_path.suffix else ".png"
         remote_mask_name = safe_filename(f"mask_{request_id}{mask_suffix}")
-        uploaded_mask = client.upload_image(mask_path, remote_mask_name, upload_subfolder)
+        uploaded_mask = stage_comfy_image(
+            client, mask_path, remote_mask_name, input_folder, direct_input_verified
+        )
         GENERATION.uploaded_images.append(uploaded_mask)
         raise_if_generation_cancelled(request_id)
 
@@ -5422,7 +5796,13 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
             continue
         suffix = reference_path.suffix or ".jpg"
         remote_reference_name = safe_filename(f"reference_{reference_index + 1}_{request_id}{suffix}")
-        uploaded_reference = client.upload_image(reference_path, remote_reference_name, upload_subfolder)
+        uploaded_reference = stage_comfy_image(
+            client,
+            reference_path,
+            remote_reference_name,
+            input_folder,
+            direct_input_verified,
+        )
         uploaded_references[binding_id] = uploaded_reference
         GENERATION.uploaded_images.append(uploaded_reference)
         raise_if_generation_cancelled(request_id)
@@ -5503,7 +5883,11 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
                 # не должна прерывать уже поставленную генерацию.
                 LOGGER.debug("Comfy queue polling failed: %s", exc)
 
-        time.sleep(HISTORY_POLL_INTERVAL)
+        time.sleep(
+            HISTORY_RESULT_POLL_INTERVAL
+            if progress_stage_started
+            else HISTORY_PREPARE_POLL_INTERVAL
+        )
     else:
         try:
             client.interrupt(actual_prompt_id)
@@ -5522,6 +5906,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         destination,
         quality=95,
         output_format=output_format,
+        local_output_folder=output_folder,
     )
 
     # init/ACK уже выполнен либо при переходе prompt в queue_running, либо в
@@ -5601,6 +5986,9 @@ def _probe_comfy(host: str, port: int, *, update_runtime: bool) -> Dict[str, Any
             RUNTIME.comfy_input_folder = detect_comfy_input_folder(details, host, int(port))
             RUNTIME.comfy_output_folder = detect_comfy_output_folder(details, host, int(port))
             COMFY_INPUT_FOLDER_ENDPOINT = endpoint
+            schedule_comfy_folder_cleanup(
+                RUNTIME.comfy_input_folder, RUNTIME.comfy_output_folder
+            )
         # Полный /system_stats нужен Python для определения input-папки, но JSX
         # использует только available/latency. Не гоняем большой JSON обратно.
         public_details = {"ok": True}
@@ -5792,6 +6180,8 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         "log_file": str(LOG_FILE),
         "version": VERSION,
         "protocol": API_PROTOCOL,
+        "comfy_input_folder": str(RUNTIME.comfy_input_folder or ""),
+        "comfy_output_folder": str(RUNTIME.comfy_output_folder or ""),
     }
     result.update(status)
     return result
@@ -5882,7 +6272,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                 overrides = None
             force = command_type == "workflow_reinitialize" or bool(message.get("force"))
             if force:
-                SCHEMA_CACHE.invalidate(workflow_id)
+                invalidate_workflow_cache(workflow_id)
             result = analyze_workflow(
                 workflow_id,
                 overrides=overrides,
@@ -6133,6 +6523,9 @@ def initialize_server_runtime() -> None:
     # TEMP_MAX_AGE_SECONDS, поэтому параллельная генерация с ней не конфликтует.
     try:
         cleanup_old_temp_files()
+        schedule_comfy_folder_cleanup(
+            RUNTIME.comfy_input_folder, RUNTIME.comfy_output_folder
+        )
     except Exception:
         log_exception("Background temporary-file cleanup failed")
 
