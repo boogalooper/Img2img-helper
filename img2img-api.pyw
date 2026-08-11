@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 2
-VERSION = "0.183"
+VERSION = "0.189"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "7b8ac290-d69b-4b3e-aff4-69b238bfe71f"
+ANALYZER_UUID = "f27d2473-4ff3-4638-9334-344ee306054d"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -1919,6 +1919,10 @@ class WorkflowAnalyzer:
             is_mask_loader = "loadimagemask" in class_norm or ("loadimage" in class_norm and "mask" in class_norm)
             if is_mask_loader:
                 continue
+            # Preserve the pre-existing input-candidate scoring for custom
+            # LoadImage* classes. Only the exact standard LoadImage class is
+            # marked for the new neutralization feature.
+            is_load_image = class_norm == "loadimage"
             if "loadimage" in class_norm or "image_loader" in class_norm or class_norm == "imageinput":
                 score += 300
 
@@ -1951,7 +1955,7 @@ class WorkflowAnalyzer:
                             label=f"{self.node_label(str(node_id))} → {input_name}",
                             targets=[target],
                             score=score + (20 if input_name == "image" else 0) - (80 if is_reference else 0),
-                            meta={"reference": is_reference, "tagged": title_has_tag(title, "input"), "node_id": str(node_id), "input": input_name},
+                            meta={"reference": is_reference, "tagged": title_has_tag(title, "input"), "load_image": is_load_image, "node_id": str(node_id), "input": input_name},
                         )
                     )
                     if title_has_tag(title, "input"):
@@ -1968,7 +1972,7 @@ class WorkflowAnalyzer:
                                 label=f"{self.node_label(str(node_id))} → {input_name}",
                                 targets=[target],
                                 score=score - (80 if is_reference else 0),
-                                meta={"reference": is_reference, "tagged": title_has_tag(title, "input"), "node_id": str(node_id), "input": input_name},
+                                meta={"reference": is_reference, "tagged": title_has_tag(title, "input"), "load_image": is_load_image, "node_id": str(node_id), "input": input_name},
                             )
                         )
                         tagged_targets.append(target)
@@ -2880,10 +2884,12 @@ class WorkflowAnalyzer:
         self.validate_api_format()
 
         input_candidates = self.input_candidates()
-        if len(input_candidates) > 1:
-            self.warning(
-                "The workflow contains multiple LoadImage candidates. Open workflow settings and explicitly select the main input and optional reference inputs."
-            )
+        load_image_node_ids = sorted({
+            str(candidate.meta.get("node_id") or "")
+            for candidate in input_candidates
+            if candidate.meta.get("load_image") and not candidate.meta.get("grouped")
+            and candidate.meta.get("node_id")
+        })
         output_candidates = self.output_candidates()
         size_candidates = self.size_candidates()
         scored_sampler_candidates = self.sampler_candidates()
@@ -2891,11 +2897,27 @@ class WorkflowAnalyzer:
 
         main_input_candidates = [item for item in input_candidates if not item.meta.get("reference")] or input_candidates
         input_override = str(overrides.get("input") or "")
+        multiple_load_images_unassigned = len(load_image_node_ids) > 1 and not input_override
+        input_review_message = (
+            "The workflow contains more than one LoadImage node. Open workflow settings and explicitly select "
+            "the main input and any reference inputs."
+        ) if multiple_load_images_unassigned else ""
         input_choice = self.find_candidate(main_input_candidates, input_override) if input_override else self.choose_unique_candidate(main_input_candidates)
+        input_review_required = False
         if input_override and not input_choice:
             self.error("The selected image input no longer exists. Open workflow settings and select it again.")
         elif not input_choice and main_input_candidates:
-            self.error("Several possible image inputs were found. Select the main input in workflow settings or tag it #PS-INPUT.")
+            # Do not emit a warning and then a second error for the same LoadImage ambiguity.
+            # A blocking ambiguity is represented by this single, actionable error.
+            if multiple_load_images_unassigned:
+                self.error(input_review_message)
+            else:
+                self.error("Several possible image inputs were found. Select the main input in workflow settings or tag it #PS-INPUT.")
+        elif multiple_load_images_unassigned:
+            # Tags/grouping may make the workflow valid automatically, but with multiple
+            # standard LoadImage nodes the user is still asked once to review the mapping.
+            input_review_required = True
+            self.warning(input_review_message)
 
         mask_candidates = self.mask_candidates(input_choice)
         mask_override = str(overrides.get("mask") or "")
@@ -2985,14 +3007,16 @@ class WorkflowAnalyzer:
         bindings: Dict[str, Any] = {}
         if input_choice:
             bindings["input_image"] = [target.to_dict() for target in input_choice.targets]
-            bindings["input_image_id"] = input_choice.id
-            bindings["input_image_label"] = input_choice.label
         if reference_choices:
             bindings["reference_images"] = [
                 {
                     "id": candidate.id,
                     "label": candidate.label,
                     "targets": [target.to_dict() for target in candidate.targets],
+                    # Only the standard ComfyUI LoadImage participates in the
+                    # new blank-on-None behavior. Custom reference loaders keep
+                    # the pre-existing behavior when no file is supplied.
+                    "load_image": bool(candidate.meta.get("load_image")),
                 }
                 for candidate in reference_choices
             ]
@@ -3025,6 +3049,8 @@ class WorkflowAnalyzer:
             "size_mode": effective_size_mode,
             "size_selection_mode": requested_size_mode,
             "has_size_binding": bool(size_choice),
+            "input_review_required": input_review_required,
+            "input_review_message": input_review_message if input_review_required else "",
             "bindings": bindings,
             "controls": controls,
             "recommended_controls": [item["id"] for item in controls if item.get("recommended")],
@@ -3646,8 +3672,8 @@ class WorkflowPatcher:
             elif mask_binding.get("mode") == "input_alpha":
                 self._patch_input_alpha_with_mask_node(mask_binding, mask_remote_path)
 
-        # Selected reference slots receive either the chosen file or the
-        # neutral helper image when the slot was selected but left empty.
+        # A selected reference with no file receives the neutral image silently.
+        # Unselected LoadImage candidates are neutralized only when explicitly requested.
         uploaded_references = uploaded_references or {}
         neutral_remote_path = self._uploaded_remote_path(neutral_image)
         for reference_binding in bindings.get("reference_images", []):
@@ -3657,7 +3683,7 @@ class WorkflowPatcher:
                 reference_path = self._uploaded_remote_path(uploaded_reference)
                 for target in reference_binding.get("targets", []):
                     self.set_target_raw(target, reference_path)
-            elif neutral_remote_path:
+            elif neutral_remote_path and reference_binding.get("load_image"):
                 self._set_candidate_targets_raw(reference_binding, neutral_remote_path)
 
         for candidate in neutralized_inputs or []:
@@ -5407,8 +5433,6 @@ def normalize_binding_overrides(value: Optional[Dict[str, Any]]) -> Optional[Dic
     references = value.get("references")
     if isinstance(references, list):
         result["references"] = [str(item) for item in references if item not in (None, "")]
-    if to_bool(value.get("ignoreUnselectedLoadImages") if isinstance(value, dict) else False):
-        result["ignore_unselected_load_images"] = True
     return result or None
 
 
@@ -6006,16 +6030,43 @@ def stage_comfy_image(
 # Загружает временные изображения, применяет bindings/values к копии workflow,
 # ставит prompt в очередь и возвращает только первое подходящее output-изображение.
 # ============================================================================
-def _create_blank_helper_image(request_id: str) -> Path:
+def _create_blank_helper_image(request_id: str, width: int, height: int) -> Path:
+    image_module = PIL_IMAGE_MODULE
+    if image_module is None:
+        raise UserVisibleError(
+            "Pillow was not initialized during Python startup. "
+            f"Restart {APP_NAME}. Log: {LOG_FILE}"
+        )
+    safe_width = max(1, int(width or 1))
+    safe_height = max(1, int(height or 1))
     path = TEMP_DIR / safe_filename(f"blank_{request_id}.png")
-    Image.new("RGB", (8, 8), (255, 255, 255)).save(path, format="PNG")
+    try:
+        image_module.new("RGB", (safe_width, safe_height), (255, 255, 255)).save(
+            path, format="PNG", compress_level=6
+        )
+    except Exception as exc:
+        raise UserVisibleError(
+            "Could not create the neutral image for an unused LoadImage input. "
+            f"Check temporary-folder access and free disk space. Details: {LOG_FILE}"
+        ) from exc
     return path
 
 
-def _selected_reference_bindings(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
-    bindings = analysis.get("bindings", {}) if isinstance(analysis, dict) else {}
-    items = bindings.get("reference_images", []) if isinstance(bindings, dict) else []
-    return [item for item in items if isinstance(item, dict)]
+def _binding_target_keys(analysis: Dict[str, Any]) -> Set[Tuple[str, str]]:
+    if not isinstance(analysis, dict):
+        return set()
+    bindings = analysis.get("bindings", {}) if isinstance(analysis.get("bindings"), dict) else {}
+    keys: Set[Tuple[str, str]] = set()
+    for target in bindings.get("input_image", []):
+        if isinstance(target, dict):
+            keys.add((str(target.get("node_id") or ""), str(target.get("input") or "")))
+    for reference in bindings.get("reference_images", []):
+        if not isinstance(reference, dict):
+            continue
+        for target in reference.get("targets", []):
+            if isinstance(target, dict):
+                keys.add((str(target.get("node_id") or ""), str(target.get("input") or "")))
+    return keys
 
 
 def _unselected_load_image_candidates(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -6023,24 +6074,36 @@ def _unselected_load_image_candidates(analysis: Dict[str, Any]) -> List[Dict[str
         return []
     candidates = analysis.get("candidates", {}) if isinstance(analysis.get("candidates"), dict) else {}
     input_candidates = candidates.get("input", []) if isinstance(candidates.get("input"), list) else []
-    bindings = analysis.get("bindings", {}) if isinstance(analysis.get("bindings"), dict) else {}
-    main_id = str(bindings.get("input_image_id") or "")
-    reference_ids = {str(item.get("id") or "") for item in _selected_reference_bindings(analysis) if item.get("id")}
+    managed_targets = _binding_target_keys(analysis)
     result: List[Dict[str, Any]] = []
     for candidate in input_candidates:
         if not isinstance(candidate, dict):
             continue
-        candidate_id = str(candidate.get("id") or "")
-        if not candidate_id or candidate_id == main_id or candidate_id in reference_ids:
+        meta = candidate.get("meta") if isinstance(candidate.get("meta"), dict) else {}
+        if not meta.get("load_image") or meta.get("grouped"):
+            continue
+        candidate_targets = {
+            (str(target.get("node_id") or ""), str(target.get("input") or ""))
+            for target in candidate.get("targets", [])
+            if isinstance(target, dict)
+        }
+        if candidate_targets & managed_targets:
             continue
         result.append(candidate)
     return result
 
 
-def _stage_blank_helper_upload(client: ComfyClient, request_id: str, input_folder: Optional[Path], direct_input_verified: bool) -> Dict[str, Any]:
-    blank_path = _create_blank_helper_image(request_id)
+def _stage_blank_helper_upload(
+    client: ComfyClient,
+    request_id: str,
+    input_folder: Optional[Path],
+    direct_input_verified: bool,
+    width: int,
+    height: int,
+) -> Dict[str, Any]:
+    blank_path = _create_blank_helper_image(request_id, width, height)
     try:
-        uploaded = stage_comfy_image(
+        return stage_comfy_image(
             client,
             blank_path,
             safe_filename(f"blank_{request_id}.png"),
@@ -6049,11 +6112,9 @@ def _stage_blank_helper_upload(client: ComfyClient, request_id: str, input_folde
         )
     finally:
         try:
-            if blank_path.exists():
-                blank_path.unlink()
+            blank_path.unlink(missing_ok=True)
         except OSError:
             pass
-    return uploaded
 
 
 def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
@@ -6073,7 +6134,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     overrides = normalize_binding_overrides(
         message.get("binding_overrides") if isinstance(message.get("binding_overrides"), dict) else None
     )
-    ignore_unselected_load_images = bool(overrides and overrides.get("ignore_unselected_load_images"))
+    ignore_unselected_load_images = message.get("ignore_unselected_load_images") is True
 
     if not input_path.is_file():
         raise UserVisibleError(f"Photoshop temporary file was not found: {input_path}")
@@ -6229,28 +6290,22 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         GENERATION.uploaded_images.append(uploaded_reference)
         raise_if_generation_cancelled(request_id)
 
-    selected_reference_bindings = _selected_reference_bindings(analysis)
-    neutralized_map: Dict[str, Dict[str, Any]] = {}
-    for reference_binding in selected_reference_bindings:
-        binding_id = str(reference_binding.get("id") or "")
-        if not binding_id or binding_id in uploaded_references:
-            continue
-        neutralized_map[binding_id] = reference_binding
-    if ignore_unselected_load_images:
-        for candidate in _unselected_load_image_candidates(analysis):
-            candidate_id = str(candidate.get("id") or "")
-            if not candidate_id:
-                continue
-            neutralized_map.setdefault(candidate_id, candidate)
-    neutralized_inputs = list(neutralized_map.values())
+    reference_bindings = [
+        item for item in analysis.get("bindings", {}).get("reference_images", [])
+        if isinstance(item, dict)
+    ]
+    missing_selected_references = [
+        item for item in reference_bindings
+        if item.get("load_image")
+        and str(item.get("id") or "")
+        and str(item.get("id") or "") not in uploaded_references
+    ]
+    neutralized_inputs = _unselected_load_image_candidates(analysis) if ignore_unselected_load_images else []
 
     neutral_image: Optional[Dict[str, Any]] = None
-    if neutralized_inputs:
+    if missing_selected_references or neutralized_inputs:
         neutral_image = _stage_blank_helper_upload(
-            client,
-            request_id,
-            input_folder,
-            direct_input_verified,
+            client, request_id, input_folder, direct_input_verified, width, height
         )
         GENERATION.uploaded_images.append(neutral_image)
         raise_if_generation_cancelled(request_id)
