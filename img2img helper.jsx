@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.175",
+	VER = "0.176",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -1471,10 +1471,14 @@ function mainDialog(selection, initial, responseSeconds) {
 		brush.text = str.brushSettings;
 		var brushFields = ui.addCheckboxes(brush, [{ id: "selectBrush", text: str.selectBrush, value: temp.selectBrush }]),
 			selectBrush = brushFields.selectBrush,
-			opacityControl = ui.addSlider(brush, str.opacity, 1, 100, temp.brushOpacity, { displayValue: temp.brushOpacity, controlWidth: ui.settingsControlWidth });
-		function syncOpacityValue() { opacityControl.valueText.text = Math.round(opacityControl.slider.value); }
-		opacityControl.slider.onChange = syncOpacityValue;
-		opacityControl.slider.onChanging = syncOpacityValue;
+			opacityControl = ui.addSlider(brush, str.opacity, 1, 100, temp.brushOpacity, { displayValue: temp.brushOpacity, controlWidth: ui.settingsControlWidth }),
+			opacityStepper = createSliderStepper(opacityControl.slider, 1, 1);
+		function syncOpacityValue(finalize) {
+			var value = finalize ? opacityStepper.finish() : opacityStepper.sync(false);
+			opacityControl.valueText.text = Math.round(value);
+		}
+		opacityControl.slider.onChange = function () { syncOpacityValue(true); };
+		opacityControl.slider.onChanging = function () { syncOpacityValue(false); };
 		var generalFields = ui.addCheckboxes(w, [
 				{ id: "recordSettings", text: str.recordSettingsToAction, value: temp.recordSettingsToAction },
 				{ id: "metadata", text: str.layerMetadata, value: temp.writeLayerMetadata }
@@ -1581,10 +1585,8 @@ function mainDialog(selection, initial, responseSeconds) {
 					slider: slider,
 					value: valueText,
 					suffix: options.suffix,
-					step: options.step,
 					decimal: options.suffix == ' MP',
-					snappedValue: null,
-					pointerActive: false
+					stepper: null
 				};
 			label.text = options.title;
 			label.alignment = ['fill', 'center'];
@@ -1592,30 +1594,19 @@ function mainDialog(selection, initial, responseSeconds) {
 			slider.minvalue = options.min;
 			slider.maxvalue = options.max;
 			slider.value = options.value;
-			try { slider.addEventListener("mousedown", function () { control.pointerActive = true; }); } catch (_) { }
-			function syncValue(reset) {
-				syncPresetSlider(control, !!reset, !control.pointerActive);
+			control.stepper = createSliderStepper(slider, options.step, options.min);
+			try { ui.enableHoverFocus(slider); } catch (_) { }
+			function syncValue(reset, finalize) {
+				var value = reset
+					? control.stepper.reset()
+					: (finalize ? control.stepper.finish() : control.stepper.sync(false));
+				control.value.text = (control.decimal ? value / 100 : value) + control.suffix;
 			}
-			slider.onChanging = function () { syncValue(false); };
-			slider.onChange = function () {
-				syncValue(false);
-				control.pointerActive = false;
-			};
-			control.syncValue = syncValue;
-			syncValue(true);
+			slider.onChanging = function () { syncValue(false, false); };
+			slider.onChange = function () { syncValue(false, true); };
+			control.syncValue = function (reset) { syncValue(!!reset, false); };
+			syncValue(true, false);
 			return control;
-		}
-		// forceStep обеспечивает один дискретный шаг колеса или клавиши.
-		function syncPresetSlider(control, reset, forceStep) {
-			var raw = Number(control.slider.value),
-				previous = reset ? null : control.snappedValue,
-				value = Math.round(raw / control.step) * control.step;
-			if (forceStep && previous !== null && value == previous && raw != previous)
-				value = previous + (raw > previous ? control.step : -control.step);
-			value = clamp(value, control.slider.minvalue, control.slider.maxvalue);
-			control.slider.value = value;
-			control.snappedValue = value;
-			control.value.text = (control.decimal ? value / 100 : value) + control.suffix;
 		}
 		var accepted = false;
 		ui.addAcceptRow(w, str.saveChanges, function () {
@@ -3206,6 +3197,9 @@ function UI() {
 		title.text = labelText;
 		slider.value = value;
 		valueText.text = options.displayValue !== undefined ? options.displayValue : value;
+		// Слайдер должен получать focus по hover сразу после создания. Это важно
+		// для динамически добавленных контролов (например, LoRA после выбора).
+		try { self.enableHoverFocus(slider); } catch (_) { }
 		return { group: group, titleGroup: titleGroup, title: title, valueText: valueText, slider: slider };
 	};
 	this.normalizeMultiselect = function (schema, storedValue) {
@@ -3600,10 +3594,10 @@ function UI() {
 							});
 						setLabelTooltip(sliderControl.title, parsed.name);
 						sliderControl.valueText.helpTip = parsed.name;
+						var weightStepper = createSliderStepper(sliderControl.slider, 0.01, 0);
 						function syncWeight(finalize) {
-							var next = roundTo(roundByStep(Number(sliderControl.slider.value), 0.01, 0), 2);
-							next = clamp(next, 0, 1);
-							sliderControl.slider.value = next;
+							var next = finalize ? weightStepper.finish() : weightStepper.sync(false);
+							next = roundTo(next, 2);
 							sliderControl.valueText.text = formatForgeLoraWeight(next);
 							values[index] = formatForgeLoraEntry(parsed.name, next);
 							if (finalize) values = normalizeForgeLoraSelection(normalizedItems, values);
@@ -3805,8 +3799,9 @@ function UI() {
 			{ displayValue: formatNumber(value, integer, precision) }
 		);
 		sliderControl.title.helpTip = self.help(schema);
-		function syncSliderValue() {
-			var sliderPosition = roundByStep(sliderControl.slider.value, sliderStep, sliderMinimum),
+		var sliderStepper = createSliderStepper(sliderControl.slider, sliderStep, sliderMinimum);
+		function syncSliderValue(finalize) {
+			var sliderPosition = finalize ? sliderStepper.finish() : sliderStepper.sync(false),
 				cur;
 			sliderPosition = clamp(Math.round(sliderPosition), sliderMinimum, sliderMaximum);
 			sliderControl.slider.value = sliderPosition;
@@ -3814,11 +3809,11 @@ function UI() {
 			sliderControl.valueText.text = formatNumber(cur, integer, precision);
 			return cur;
 		}
-		sliderControl.slider.onChange = syncSliderValue;
-		sliderControl.slider.onChanging = syncSliderValue;
+		sliderControl.slider.onChange = function () { syncSliderValue(true); };
+		sliderControl.slider.onChanging = function () { syncSliderValue(false); };
 		return {
 			getValue: function () {
-				var cur = syncSliderValue();
+				var cur = syncSliderValue(false);
 				return integer ? Math.round(cur) : cur;
 			},
 			control: sliderControl.slider, container: sliderControl.group
@@ -4247,6 +4242,8 @@ function UI() {
 		self.setFixedWidth(valueText, self.sliderValueWidth);
 		var slider = group.add("slider{minvalue:1,maxvalue:400}");
 		self.setFixedWidth(slider, self.contentWidth());
+		var resizeStepper = createSliderStepper(slider, 1, 1);
+		try { self.enableHoverFocus(slider); } catch (_) { }
 		var presetGroup = group.add("group{orientation:'column',alignChildren:['fill','center'],spacing:0,margins:[0,5,0,0]}");
 		self.setFixedWidth(presetGroup, self.contentWidth());
 		var presetDropdown = presetGroup.add("dropdownlist{preferredSize:[" + self.contentWidth() + ",-1]}");
@@ -4257,9 +4254,16 @@ function UI() {
 		title.helpTip = schema.has_size_binding ? str.sizeWorkflowBinding : str.sizeFromInput;
 		fillPresetList();
 		setSliderValue();
-		function syncResizeValue() {
-			var sliderValue = Math.floor(slider.value),
-				scale = (sliderValue >= 97 && sliderValue <= 103) ? 1 : Math.max(0.01, sliderValue / 100);
+		function syncResizeValue(finalize) {
+			var pointerActive = resizeStepper.pointerActive,
+				sliderValue = finalize ? resizeStepper.finish() : resizeStepper.sync(false);
+			// При drag оставляем "магнит" около 100%, но клавиши/колесо должны
+			// менять значение строго на 0.01 за одно движение.
+			if (pointerActive && sliderValue >= 97 && sliderValue <= 103) {
+				sliderValue = 100;
+				resizeStepper.reset(100);
+			}
+			var scale = Math.max(0.01, Math.round(sliderValue) / 100);
 			// Ручное изменение масштаба означает явный переход из Auto в Manual.
 			// Значение становится постоянным manualScale и сохраняется в профиль/Action
 			// до тех пор, пока пользователь снова явно не включит Автомасштаб.
@@ -4272,8 +4276,8 @@ function UI() {
 			valueText.text = scale.toFixed(2);
 			title.text = setTitle();
 		}
-		slider.onChange = syncResizeValue;
-		slider.onChanging = syncResizeValue;
+		slider.onChange = function () { syncResizeValue(true); };
+		slider.onChanging = function () { syncResizeValue(false); };
 		checkbox.onClick = function () {
 			profile.autoResize = this.value;
 			presetGroup.enabled = this.value;
@@ -4307,12 +4311,12 @@ function UI() {
 		function setSliderValue() {
 			if (profile.autoResize) {
 				var scale = autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets));
-				slider.value = scale * 100;
+				resizeStepper.reset(scale * 100);
 				valueText.text = scale.toFixed(2);
 				title.text = setTitle();
 			} else {
-				slider.value = profile.manualScale * 100;
-				profile.manualScale = Math.floor(slider.value) / 100;
+				resizeStepper.reset(profile.manualScale * 100);
+				profile.manualScale = Math.round(slider.value) / 100;
 				valueText.text = profile.manualScale.toFixed(2);
 				title.text = setTitle();
 			}
@@ -6168,6 +6172,46 @@ function toBooleanValue(value) {
 }
 function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
 function roundTo(value, digits) { var k = Math.pow(10, digits || 0); return Math.round(value * k) / k; }
+// Единая дискретизация ScriptUI Slider.
+// Drag привязывается к сетке step, а клавиша/колесо вне drag всегда дают
+// ровно один логический шаг независимо от собственного native шага ScriptUI.
+function createSliderStepper(slider, step, origin) {
+	step = Math.abs(Number(step));
+	if (!isFinite(step) || step <= 0) step = 1;
+	origin = Number(origin);
+	if (!isFinite(origin)) origin = Number(slider.minvalue) || 0;
+	var state = {
+		slider: slider,
+		step: step,
+		origin: origin,
+		snappedValue: null,
+		pointerActive: false
+	};
+	try { slider.addEventListener("mousedown", function () { state.pointerActive = true; }); } catch (_) { }
+	state.sync = function (reset) {
+		var raw = Number(slider.value),
+			previous = reset ? null : state.snappedValue,
+			value;
+		if (!state.pointerActive && previous !== null && raw != previous)
+			value = roundByStep(previous + (raw > previous ? step : -step), step, origin);
+		else value = roundByStep(raw, step, origin);
+		value = clamp(value, Number(slider.minvalue), Number(slider.maxvalue));
+		slider.value = value;
+		state.snappedValue = value;
+		return value;
+	};
+	state.reset = function (value) {
+		if (value !== undefined) slider.value = value;
+		return state.sync(true);
+	};
+	state.finish = function () {
+		var value = state.sync(false);
+		state.pointerActive = false;
+		return value;
+	};
+	state.sync(true);
+	return state;
+}
 function roundByStep(value, step, origin) { return Math.round((value - origin) / step) * step + origin; }
 function numberPrecision(value) {
 	var text = String(Math.abs(Number(value))),
