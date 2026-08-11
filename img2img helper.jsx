@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.176",
+	VER = "0.177",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -293,8 +293,13 @@ function errorMessageText(value) {
 function itemData(source) {
 	var objectItem = source && typeof source == "object",
 		label = objectItem ? (source.label !== undefined ? source.label : source.value) : source,
-		value = objectItem && source.value !== undefined ? source.value : label;
-	return { label: String(label === undefined ? "" : label), value: value === undefined ? "" : value };
+		value = objectItem && source.value !== undefined ? source.value : label,
+		help = objectItem && source.help !== undefined ? source.help : "";
+	return {
+		label: String(label === undefined ? "" : label),
+		value: value === undefined ? "" : value,
+		help: String(help === undefined || help === null ? "" : help)
+	};
 }
 // Только обычный CFG Scale управляет доступностью Negative prompt.
 function findForgeCfgControlId(schema) {
@@ -2937,6 +2942,7 @@ function UI() {
 		for (var i = 0; i < items.length; i++) {
 			var data = itemData(items[i]), item = control.add("item", data.label);
 			item.controlValue = data.value;
+			item.itemHelp = data.help;
 		}
 		return control;
 	}
@@ -3643,6 +3649,14 @@ function UI() {
 			dropdownControl.title.helpTip = help(schema);
 			var selectedItem = self.selectDropdown(dropdownControl.dropdown, storedValue);
 			dropdownControl.dropdown.enabled = !!selectedItem && dropdownControl.dropdown.items.length > 0;
+			// Catalog items may carry an optional model-specific helpTip. Keep it on
+			// the dropdown itself so hovering the selected model shows its settings.
+			function updateSelectedItemHelp() {
+				var item = dropdownControl.dropdown.selection;
+				dropdownControl.dropdown.helpTip = item && item.itemHelp ? String(item.itemHelp) : "";
+			}
+			dropdownControl.dropdown.onChange = updateSelectedItemHelp;
+			updateSelectedItemHelp();
 			return {
 				getValue: function () { return read(dropdownControl.dropdown, false); },
 				control: dropdownControl.dropdown,
@@ -4707,7 +4721,8 @@ function BridgeApi() {
 	this.forgeCatalog = function (sources, force, progress) {
 		return call("forge_catalog", {
 			sources: sources instanceof Array ? sources : [],
-			force: !!force
+			force: !!force,
+			schema_folder: cfg.forgeSchemasFolder || ""
 		}, 5 * 60 * 1000, progress);
 	};
 	this.workflowGet = function (workflowId, overrides, relativePath, progress) {

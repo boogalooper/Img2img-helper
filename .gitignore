@@ -1,4 +1,6 @@
 ﻿__pycache__/
 workflow schemas/
+forge-schemas/*.py
+forge-schemas/*.bat
 README.txt
 *.zip

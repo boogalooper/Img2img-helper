@@ -1,0 +1,772 @@
+{
+  "kind": "img2img-helper-forge-model-hints",
+  "version": 2,
+  "description": "Optional Forge checkpoint helpTip database. Missing file or unmatched model means no model-specific helpTip.",
+  "behavior": {
+    "first_match_wins": true,
+    "match_target": "checkpoint basename; use Forge filename when available, otherwise catalog title",
+    "normalization": "lowercase and remove non-alphanumeric characters from both target and match tokens",
+    "unknown_model": "no_help_tip",
+    "use_folder_for_classification": false,
+    "schema_fallback": false
+  },
+  "profiles": {
+    "sd15": {
+      "family": "SD 1.x",
+      "settings": {
+        "sampler": "Euler a",
+        "scheduler": "Automatic",
+        "steps": "32",
+        "cfg": "6"
+      }
+    },
+    "sd15_inpaint": {
+      "family": "SD 1.x Inpainting",
+      "task": "inpaint",
+      "settings": {
+        "sampler": "Euler a",
+        "scheduler": "Automatic",
+        "steps": "32",
+        "cfg": "6"
+      }
+    },
+    "sdxl": {
+      "family": "SDXL",
+      "settings": {
+        "sampler": "Euler a",
+        "scheduler": "Automatic",
+        "steps": "24",
+        "cfg": "4.5"
+      }
+    },
+    "flux1": {
+      "family": "FLUX.1",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "20",
+        "cfg": "1",
+        "distilled_cfg": "3"
+      }
+    },
+    "flux1_edit": {
+      "family": "FLUX.1 image edit",
+      "task": "image_edit",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "20",
+        "cfg": "1",
+        "distilled_cfg": "3",
+        "denoise": "1.0"
+      }
+    },
+    "flux1_fill": {
+      "family": "FLUX.1 Fill",
+      "task": "inpaint",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "20",
+        "cfg": "1",
+        "distilled_cfg": "3",
+        "denoise": "1.0"
+      }
+    },
+    "qwen_image_full": {
+      "family": "Qwen-Image",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "50",
+        "cfg": "4"
+      }
+    },
+    "qwen_edit_full": {
+      "family": "Qwen-Image-Edit",
+      "task": "image_edit",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "40",
+        "cfg": "4",
+        "denoise": "1.0"
+      }
+    },
+    "qwen_edit_fast": {
+      "family": "Qwen-Image-Edit few-step",
+      "task": "image_edit",
+      "settings": {
+        "sampler": "LCM",
+        "scheduler": "Normal",
+        "steps": "8",
+        "cfg": "1",
+        "denoise": "1.0"
+      }
+    },
+    "klein_distilled": {
+      "family": "FLUX.2 Klein",
+      "task": "image_generation / image_edit",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "4",
+        "cfg": "1",
+        "denoise": "1.0"
+      }
+    },
+    "klein_base": {
+      "family": "FLUX.2 Klein Base",
+      "task": "image_generation / image_edit",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "50",
+        "cfg": "4",
+        "denoise": "1.0"
+      }
+    },
+    "zimage_turbo": {
+      "family": "Z-Image Turbo",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "9",
+        "cfg": "1",
+        "shift": "9"
+      }
+    },
+    "zimage_base": {
+      "family": "Z-Image Base",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "28–50 (40 start)",
+        "cfg": "3–5 (4 start)",
+        "shift": "6"
+      }
+    },
+    "ernie_turbo": {
+      "family": "ERNIE-Image Turbo",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "8",
+        "cfg": "1",
+        "shift": "3"
+      }
+    },
+    "ernie_base": {
+      "family": "ERNIE-Image",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "50",
+        "cfg": "4",
+        "shift": "3"
+      }
+    },
+    "anima_turbo": {
+      "family": "Anima Turbo",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "8–12 (10 start)",
+        "cfg": "1",
+        "shift": "3"
+      }
+    },
+    "anima_full": {
+      "family": "Anima",
+      "settings": {
+        "sampler": "ER SDE",
+        "scheduler": "Beta",
+        "steps": "30–50 (32 start)",
+        "cfg": "4–5",
+        "shift": "3"
+      }
+    },
+    "krea2_turbo": {
+      "family": "Krea 2 Turbo",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "8",
+        "cfg": "1",
+        "shift": "1.15"
+      }
+    },
+    "krea2_raw": {
+      "family": "Krea 2 Raw",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "52",
+        "cfg": "3.5"
+      },
+      "note": "Raw is primarily a training/fine-tuning base; Turbo is preferred for normal inference."
+    },
+    "pid": {
+      "family": "PiD",
+      "task": "decoder_upscale",
+      "settings": {
+        "sampler": "LCM",
+        "scheduler": "Simple",
+        "steps": "4",
+        "cfg": "1",
+        "shift": "1.5"
+      }
+    },
+    "wan22_fast": {
+      "family": "Wan 2.2 distilled",
+      "task": "video",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "4",
+        "cfg": "1",
+        "shift": "5"
+      }
+    },
+    "wan22_standard": {
+      "family": "Wan 2.2 14B",
+      "task": "video",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "~20 Forge reference",
+        "cfg": "4",
+        "shift": "5"
+      },
+      "note": "Use the matching HN/LN pair where applicable."
+    },
+    "mugen": {
+      "family": "Mugen / SDXL Rectified Flow",
+      "settings": {
+        "sampler": "Euler a",
+        "scheduler": "Normal",
+        "steps": "20–28 (24 start)",
+        "cfg": "4–7 (5 start)",
+        "shift": "8–12 (9 start)"
+      }
+    },
+    "chroma": {
+      "family": "Chroma / FLUX.1 derivative",
+      "settings": {
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "40",
+        "cfg": "3",
+        "shift": "3"
+      },
+      "note": "Uses standard CFG; do not use the usual FLUX.1 CFG 1 / Distilled CFG 3 recipe."
+    },
+    "lumina2": {
+      "family": "Lumina-Image-2.0",
+      "settings": {
+        "sampler": "Res Multistep",
+        "scheduler": "Simple",
+        "steps": "32–50 (32 start)",
+        "cfg": "4",
+        "shift": "6"
+      }
+    },
+    "boogu_edit_turbo": {
+      "family": "Boogu Image Edit Turbo",
+      "task": "image_edit",
+      "forge_support": "unverified",
+      "note": "Model family is recognized by filename, but native Forge Neo support should not be assumed."
+    },
+    "joyai_edit": {
+      "family": "JoyAI-Image-Edit",
+      "task": "image_edit",
+      "forge_support": "unverified",
+      "settings": {
+        "steps": "30–40",
+        "cfg": "4"
+      },
+      "note": "Model family is recognized by filename, but native Forge Neo support should not be assumed."
+    }
+  },
+  "rules": [
+    {
+      "id": "firered",
+      "match": {
+        "all": [
+          "firered"
+        ]
+      },
+      "profile": "qwen_edit_full",
+      "label": "FireRed Image Edit",
+      "note": "Qwen-Image-Edit-compatible full-step model."
+    },
+    {
+      "id": "redcraft",
+      "match": {
+        "all": [
+          "redcraft"
+        ]
+      },
+      "profile": "flux1_edit",
+      "label": "RedCraft",
+      "note": "FLUX.1 Kontext finetune."
+    },
+    {
+      "id": "boogu_edit_turbo",
+      "match": {
+        "all": [
+          "boogu",
+          "image",
+          "edit",
+          "turbo"
+        ]
+      },
+      "profile": "boogu_edit_turbo"
+    },
+    {
+      "id": "joyai_edit",
+      "match": {
+        "all": [
+          "joyai",
+          "image",
+          "edit"
+        ]
+      },
+      "profile": "joyai_edit"
+    },
+    {
+      "id": "qwen_edit_lightning",
+      "match": {
+        "all": [
+          "qwen",
+          "image",
+          "edit"
+        ],
+        "any": [
+          "lightning",
+          "4step",
+          "8step"
+        ]
+      },
+      "profile": "qwen_edit_fast"
+    },
+    {
+      "id": "qwen_edit_2511",
+      "match": {
+        "all": [
+          "qwen",
+          "image",
+          "edit",
+          "2511"
+        ],
+        "not": [
+          "lightning"
+        ]
+      },
+      "profile": "qwen_edit_full"
+    },
+    {
+      "id": "qwen_edit_2509",
+      "match": {
+        "all": [
+          "qwen",
+          "image",
+          "edit",
+          "2509"
+        ],
+        "not": [
+          "lightning"
+        ]
+      },
+      "profile": "qwen_edit_full"
+    },
+    {
+      "id": "qwen_edit_generic",
+      "match": {
+        "all": [
+          "qwen",
+          "image",
+          "edit"
+        ],
+        "not": [
+          "lightning",
+          "4step",
+          "8step"
+        ]
+      },
+      "profile": "qwen_edit_full"
+    },
+    {
+      "id": "qwen_image",
+      "match": {
+        "all": [
+          "qwen",
+          "image"
+        ],
+        "not": [
+          "edit",
+          "pid"
+        ]
+      },
+      "profile": "qwen_image_full"
+    },
+    {
+      "id": "klein_base",
+      "match": {
+        "all": [
+          "flux2",
+          "klein",
+          "base"
+        ],
+        "not": [
+          "pid"
+        ]
+      },
+      "profile": "klein_base"
+    },
+    {
+      "id": "klein_distilled",
+      "match": {
+        "all": [
+          "flux2",
+          "klein"
+        ],
+        "not": [
+          "base",
+          "pid"
+        ]
+      },
+      "profile": "klein_distilled"
+    },
+    {
+      "id": "zimage_turbo",
+      "match": {
+        "all": [
+          "zimage",
+          "turbo"
+        ]
+      },
+      "profile": "zimage_turbo"
+    },
+    {
+      "id": "zimage_base",
+      "match": {
+        "all": [
+          "zimage"
+        ],
+        "not": [
+          "turbo"
+        ]
+      },
+      "profile": "zimage_base"
+    },
+    {
+      "id": "ernie_turbo",
+      "match": {
+        "all": [
+          "ernie",
+          "image",
+          "turbo"
+        ]
+      },
+      "profile": "ernie_turbo"
+    },
+    {
+      "id": "ernie_base",
+      "match": {
+        "all": [
+          "ernie",
+          "image"
+        ],
+        "not": [
+          "turbo"
+        ]
+      },
+      "profile": "ernie_base"
+    },
+    {
+      "id": "anima_turbo",
+      "match": {
+        "all": [
+          "anima",
+          "turbo"
+        ]
+      },
+      "profile": "anima_turbo"
+    },
+    {
+      "id": "anima_full",
+      "match": {
+        "all": [
+          "anima"
+        ],
+        "not": [
+          "turbo",
+          "edit"
+        ]
+      },
+      "profile": "anima_full"
+    },
+    {
+      "id": "krea2_turbo",
+      "match": {
+        "all": [
+          "krea2",
+          "turbo"
+        ]
+      },
+      "profile": "krea2_turbo"
+    },
+    {
+      "id": "krea2_raw",
+      "match": {
+        "all": [
+          "krea2",
+          "raw"
+        ]
+      },
+      "profile": "krea2_raw"
+    },
+    {
+      "id": "pid_sdxl",
+      "match": {
+        "starts": "pid",
+        "all": [
+          "sdxl"
+        ],
+        "not": [
+          "sd3",
+          "pixeldit"
+        ]
+      },
+      "profile": "pid",
+      "label": "PiD SDXL"
+    },
+    {
+      "id": "pid_flux1",
+      "match": {
+        "starts": "pid",
+        "all": [
+          "flux1"
+        ],
+        "not": [
+          "sd3",
+          "pixeldit"
+        ]
+      },
+      "profile": "pid",
+      "label": "PiD FLUX.1"
+    },
+    {
+      "id": "pid_flux2",
+      "match": {
+        "starts": "pid",
+        "all": [
+          "flux2"
+        ],
+        "not": [
+          "sd3",
+          "pixeldit"
+        ]
+      },
+      "profile": "pid",
+      "label": "PiD FLUX.2"
+    },
+    {
+      "id": "pid_qwen",
+      "match": {
+        "starts": "pid",
+        "all": [
+          "qwenimage"
+        ],
+        "not": [
+          "sd3",
+          "pixeldit"
+        ]
+      },
+      "profile": "pid",
+      "label": "PiD Qwen-Image"
+    },
+    {
+      "id": "wan22_fast",
+      "match": {
+        "all": [
+          "wan",
+          "22"
+        ],
+        "any": [
+          "lightx2v",
+          "4step"
+        ],
+        "not": [
+          "5b"
+        ]
+      },
+      "profile": "wan22_fast"
+    },
+    {
+      "id": "wan22_t2v",
+      "match": {
+        "all": [
+          "wan",
+          "22",
+          "t2v",
+          "14b"
+        ],
+        "not": [
+          "5b",
+          "lightx2v",
+          "4step"
+        ]
+      },
+      "profile": "wan22_standard",
+      "label": "Wan 2.2 T2V 14B"
+    },
+    {
+      "id": "wan22_i2v",
+      "match": {
+        "all": [
+          "wan",
+          "22",
+          "i2v",
+          "14b"
+        ],
+        "not": [
+          "5b",
+          "lightx2v",
+          "4step"
+        ]
+      },
+      "profile": "wan22_standard",
+      "label": "Wan 2.2 I2V 14B"
+    },
+    {
+      "id": "mugen",
+      "match": {
+        "all": [
+          "mugen"
+        ]
+      },
+      "profile": "mugen"
+    },
+    {
+      "id": "chroma",
+      "match": {
+        "all": [
+          "chroma"
+        ]
+      },
+      "profile": "chroma"
+    },
+    {
+      "id": "lumina_neta",
+      "match": {
+        "any": [
+          "netalumina",
+          "netayume"
+        ]
+      },
+      "profile": "lumina2"
+    },
+    {
+      "id": "flux1_kontext",
+      "match": {
+        "all": [
+          "kontext"
+        ],
+        "not": [
+          "redcraft"
+        ]
+      },
+      "profile": "flux1_edit",
+      "label": "FLUX.1 Kontext"
+    },
+    {
+      "id": "flux1_fill",
+      "match": {
+        "all": [
+          "flux1",
+          "fill"
+        ]
+      },
+      "profile": "flux1_fill"
+    },
+    {
+      "id": "flux1_krea",
+      "match": {
+        "all": [
+          "flux1",
+          "krea"
+        ],
+        "not": [
+          "krea2",
+          "kontext"
+        ]
+      },
+      "profile": "flux1",
+      "label": "FLUX.1 Krea Dev"
+    },
+    {
+      "id": "cyberrealistic_flux",
+      "match": {
+        "all": [
+          "cyberrealisticflux"
+        ]
+      },
+      "profile": "flux1",
+      "label": "CyberRealistic FLUX"
+    },
+    {
+      "id": "flux1_dev",
+      "match": {
+        "all": [
+          "flux1",
+          "dev"
+        ],
+        "not": [
+          "kontext",
+          "krea",
+          "fill",
+          "depth",
+          "canny"
+        ]
+      },
+      "profile": "flux1",
+      "label": "FLUX.1 Dev"
+    },
+    {
+      "id": "realvisxl",
+      "match": {
+        "all": [
+          "realvisxl"
+        ]
+      },
+      "profile": "sdxl",
+      "label": "RealVisXL"
+    },
+    {
+      "id": "realistic_vision",
+      "match": {
+        "all": [
+          "realisticvision"
+        ]
+      },
+      "profile": "sd15",
+      "label": "Realistic Vision"
+    },
+    {
+      "id": "epicrealism_inpaint",
+      "match": {
+        "all": [
+          "epicrealism"
+        ],
+        "any": [
+          "inpaint",
+          "inpainting"
+        ]
+      },
+      "profile": "sd15_inpaint",
+      "label": "EpicRealism Inpainting"
+    }
+  ]
+}

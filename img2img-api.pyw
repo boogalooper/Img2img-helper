@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 2
-VERSION = "0.182"
+VERSION = "0.183"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -67,6 +67,9 @@ DEFAULT_FORGE_SCHEMA_DIRS = (
 )
 FORGE_SCHEMA_KIND = "photoshop-helper-forge-schema"
 FORGE_SCHEMA_VERSION = 1
+FORGE_MODEL_HINTS_FILENAME = "forge_model_hints.json"
+FORGE_MODEL_HINTS_KIND = "img2img-helper-forge-model-hints"
+FORGE_MODEL_HINTS_VERSION = 2
 FORGE_REFERENCE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
@@ -3858,6 +3861,171 @@ def resolve_forge_schema_dir(schema_folder: Any = "") -> Path:
     raise UserVisibleError("Forge schema folder was not found. Select it in the script settings.")
 
 
+def _normalize_forge_model_hint_text(value: Any) -> str:
+    """Normalize checkpoint names and rule tokens for filename-only matching."""
+
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _forge_model_hint_basename(value: Any) -> str:
+    """Return a portable basename even when a Windows path is parsed on another OS."""
+
+    text = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+    if "." in text:
+        text = text.rsplit(".", 1)[0]
+    return text
+
+
+def _load_forge_model_hints(schema_folder: Any = "") -> Dict[str, Any]:
+    """Load the optional model helpTip database.
+
+    This file is deliberately non-critical. Missing, malformed or incompatible
+    data only disables model-specific helpTips and is written to the Python log.
+    """
+
+    try:
+        schema_dir = resolve_forge_schema_dir(schema_folder)
+        path = schema_dir / FORGE_MODEL_HINTS_FILENAME
+        if not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            raise ValueError("root must be a JSON object")
+        if data.get("kind") != FORGE_MODEL_HINTS_KIND:
+            raise ValueError(f"unexpected kind: {data.get('kind')!r}")
+        if int(data.get("version") or 0) != FORGE_MODEL_HINTS_VERSION:
+            raise ValueError(
+                f"unsupported version: {data.get('version')!r}; "
+                f"expected {FORGE_MODEL_HINTS_VERSION}"
+            )
+        if not isinstance(data.get("profiles"), dict) or not isinstance(data.get("rules"), list):
+            raise ValueError("profiles must be an object and rules must be an array")
+        return data
+    except Exception as exc:
+        LOGGER.warning("Ignoring optional Forge model hints: %s", exc)
+        return {}
+
+
+def _forge_model_hint_rule_matches(target: str, match: Any) -> bool:
+    if not target or not isinstance(match, dict):
+        return False
+
+    def tokens(key: str) -> List[str]:
+        value = match.get(key)
+        if not isinstance(value, list):
+            return []
+        return [
+            token for token in (_normalize_forge_model_hint_text(item) for item in value)
+            if token
+        ]
+
+    required = tokens("all")
+    optional = tokens("any")
+    excluded = tokens("not")
+    starts = _normalize_forge_model_hint_text(match.get("starts"))
+    if required and any(token not in target for token in required):
+        return False
+    if optional and not any(token in target for token in optional):
+        return False
+    if excluded and any(token in target for token in excluded):
+        return False
+    if starts and not target.startswith(starts):
+        return False
+    return bool(required or optional or starts)
+
+
+def _render_forge_model_hint(rule: Dict[str, Any], profile: Dict[str, Any]) -> str:
+    explicit = rule.get("help") or profile.get("help")
+    if explicit:
+        return str(explicit).strip()
+
+    family = str(profile.get("family") or "").strip()
+    label = str(rule.get("label") or family).strip()
+    lines: List[str] = []
+    if label and family and label.lower() != family.lower():
+        lines.append(f"{label} — {family}")
+    elif label or family:
+        lines.append(label or family)
+
+    support = str(profile.get("forge_support") or "").strip()
+    if support:
+        lines.append(f"Forge Neo support: {support}")
+
+    settings = profile.get("settings") if isinstance(profile.get("settings"), dict) else {}
+    setting_labels = (
+        ("sampler", "Sampler"),
+        ("scheduler", "Scheduler"),
+        ("steps", "Steps"),
+        ("cfg", "CFG"),
+        ("distilled_cfg", "Distilled CFG"),
+        ("shift", "Shift"),
+        ("denoise", "Denoise"),
+    )
+    parts = []
+    for key, caption in setting_labels:
+        value = settings.get(key)
+        if value not in (None, ""):
+            parts.append(f"{caption}: {value}")
+    if parts:
+        lines.append(" · ".join(parts))
+
+    notes: List[str] = []
+    for value in (rule.get("note"), profile.get("note")):
+        note = str(value or "").strip()
+        if note and note not in notes:
+            notes.append(note)
+    lines.extend(notes)
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _forge_model_help_tip(hints: Dict[str, Any], *candidates: Any) -> str:
+    if not hints:
+        return ""
+    target = ""
+    for candidate in candidates:
+        basename = _forge_model_hint_basename(candidate)
+        normalized = _normalize_forge_model_hint_text(basename)
+        if normalized:
+            target = normalized
+            break
+    if not target:
+        return ""
+
+    profiles = hints.get("profiles") if isinstance(hints.get("profiles"), dict) else {}
+    for rule in hints.get("rules") if isinstance(hints.get("rules"), list) else []:
+        if not isinstance(rule, dict) or not _forge_model_hint_rule_matches(target, rule.get("match")):
+            continue
+        profile = profiles.get(str(rule.get("profile") or ""))
+        if not isinstance(profile, dict):
+            LOGGER.warning("Forge model hint rule %s refers to missing profile %s", rule.get("id"), rule.get("profile"))
+            return ""
+        return _render_forge_model_hint(rule, profile)
+    return ""
+
+
+def _forge_catalog_with_model_hints(catalog: Dict[str, Any], schema_folder: Any = "") -> Dict[str, Any]:
+    """Return a public catalog copy decorated from the current optional hints file.
+
+    Checkpoint metadata stays cached, while editing forge_model_hints.json takes
+    effect on the next catalog request without another /sd-models call.
+    """
+
+    result = copy.deepcopy(catalog)
+    checkpoints = result.get("checkpoints")
+    if not isinstance(checkpoints, list):
+        return result
+    hints = _load_forge_model_hints(schema_folder)
+    for item in checkpoints:
+        if not isinstance(item, dict):
+            continue
+        source = item.pop("_hint_source", "") or item.get("value") or item.get("label")
+        item.pop("help", None)
+        help_tip = _forge_model_help_tip(hints, source)
+        if help_tip:
+            item["help"] = help_tip
+    return result
+
+
 def _read_forge_schema_file(
     path: Path,
     schema_dir: Path,
@@ -3915,6 +4083,10 @@ def list_forge_schemas(
         LOGGER.warning("Skipped invalid Forge schema %s: %s", path, rendered)
 
     for path in sorted(schema_dir.glob("*.json"), key=lambda item: item.name.lower()):
+        # Optional checkpoint helpTip database is not a Forge UI schema. Skip it
+        # before JSON parsing so even a malformed hints file stays non-critical.
+        if path.name.lower() == FORGE_MODEL_HINTS_FILENAME.lower():
+            continue
         try:
             raw = json.loads(path.read_text(encoding="utf-8-sig"))
         except OSError as exc:
@@ -4055,7 +4227,8 @@ def _update_forge_catalog_current(options: Dict[str, Any]) -> None:
 
 
 def forge_catalog(
-    sources: Optional[Sequence[str]] = None, *, force: bool = False
+    sources: Optional[Sequence[str]] = None, *, force: bool = False,
+    schema_folder: Any = "",
 ) -> Dict[str, Any]:
     """Load only catalog sources required by the selected Forge schema.
 
@@ -4077,7 +4250,7 @@ def forge_catalog(
             FORGE_CATALOG_CACHE_SERVER = server_key
 
         if not requested:
-            return copy.deepcopy(FORGE_CATALOG_CACHE)
+            return _forge_catalog_with_model_hints(FORGE_CATALOG_CACHE, schema_folder)
 
         refresh_sources = set(requested) if force else {
             source for source in requested if source not in FORGE_CATALOG_CACHE
@@ -4095,7 +4268,7 @@ def forge_catalog(
 
         if "checkpoints" in refresh_sources:
             models = client.get_json("sdapi/v1/sd-models", timeout=60)
-            model_items: List[Dict[str, str]] = []
+            model_items: List[Dict[str, Any]] = []
             for item in models if isinstance(models, list) else []:
                 if not isinstance(item, dict):
                     continue
@@ -4103,7 +4276,19 @@ def forge_catalog(
                     item.get("title") or item.get("model_name") or item.get("filename")
                 )
                 if title:
-                    model_items.append({"label": title, "value": title})
+                    # Keep only a private matching source in the process cache. It
+                    # is removed before the catalog is returned to JSX.
+                    hint_source = (
+                        item.get("filename")
+                        or item.get("model_name")
+                        or item.get("title")
+                        or title
+                    )
+                    model_items.append({
+                        "label": title,
+                        "value": title,
+                        "_hint_source": str(hint_source or title),
+                    })
             model_items.sort(key=lambda item: item["label"].lower())
             FORGE_CATALOG_CACHE["checkpoints"] = model_items
 
@@ -4188,7 +4373,7 @@ def forge_catalog(
                     lora_names.add(name)
             FORGE_CATALOG_CACHE["loras"] = sorted(lora_names, key=str.lower)
 
-        return copy.deepcopy(FORGE_CATALOG_CACHE)
+        return _forge_catalog_with_model_hints(FORGE_CATALOG_CACHE, schema_folder)
 
 # ============================================================================
 # FORGE: IMAGESTITCH, НОРМАЛИЗАЦИЯ И ПРОВЕРКА ЗНАЧЕНИЙ UI
@@ -6725,7 +6910,11 @@ def handle_command(command: Dict[str, Any]) -> None:
         if command_type == "forge_catalog":
             raw_sources = message.get("sources")
             sources = raw_sources if isinstance(raw_sources, list) else None
-            answer(forge_catalog(sources, force=bool(message.get("force"))), request_id)
+            answer(forge_catalog(
+                sources,
+                force=bool(message.get("force")),
+                schema_folder=message.get("schema_folder"),
+            ), request_id)
             return
 
         if command_type == "translate":
