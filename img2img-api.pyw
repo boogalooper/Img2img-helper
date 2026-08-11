@@ -2880,6 +2880,10 @@ class WorkflowAnalyzer:
         self.validate_api_format()
 
         input_candidates = self.input_candidates()
+        if len(input_candidates) > 1:
+            self.warning(
+                "The workflow contains multiple LoadImage candidates. Open workflow settings and explicitly select the main input and optional reference inputs."
+            )
         output_candidates = self.output_candidates()
         size_candidates = self.size_candidates()
         scored_sampler_candidates = self.sampler_candidates()
@@ -2981,6 +2985,8 @@ class WorkflowAnalyzer:
         bindings: Dict[str, Any] = {}
         if input_choice:
             bindings["input_image"] = [target.to_dict() for target in input_choice.targets]
+            bindings["input_image_id"] = input_choice.id
+            bindings["input_image_label"] = input_choice.label
         if reference_choices:
             bindings["reference_images"] = [
                 {
@@ -3524,6 +3530,19 @@ class WorkflowPatcher:
             candidate += 1
         return str(candidate)
 
+    @staticmethod
+    def _uploaded_remote_path(uploaded: Optional[Dict[str, Any]]) -> str:
+        if not uploaded:
+            return ""
+        name = str(uploaded.get("name") or "")
+        subfolder = str(uploaded.get("subfolder") or "")
+        path = f"{subfolder}/{name}" if subfolder else name
+        return path.replace("\\", "/")
+
+    def _set_candidate_targets_raw(self, candidate: Dict[str, Any], remote_path: str) -> None:
+        for target in candidate.get("targets", []):
+            self.set_target_raw(target, remote_path)
+
     def _patch_input_alpha_with_mask_node(
         self,
         mask_binding: Dict[str, Any],
@@ -3593,6 +3612,8 @@ class WorkflowPatcher:
         uploaded_image: Dict[str, Any],
         uploaded_mask: Optional[Dict[str, Any]],
         uploaded_references: Optional[Dict[str, Dict[str, Any]]],
+        neutral_image: Optional[Dict[str, Any]],
+        neutralized_inputs: Optional[List[Dict[str, Any]]],
         width: Optional[int],
         height: Optional[int],
         request_id: str,
@@ -3625,20 +3646,23 @@ class WorkflowPatcher:
             elif mask_binding.get("mode") == "input_alpha":
                 self._patch_input_alpha_with_mask_node(mask_binding, mask_remote_path)
 
-        # Independent reference slots are patched only when Photoshop supplied
-        # a file for that slot. Otherwise the original workflow value is kept.
+        # Selected reference slots receive either the chosen file or the
+        # neutral helper image when the slot was selected but left empty.
         uploaded_references = uploaded_references or {}
+        neutral_remote_path = self._uploaded_remote_path(neutral_image)
         for reference_binding in bindings.get("reference_images", []):
             binding_id = str(reference_binding.get("id") or "")
             uploaded_reference = uploaded_references.get(binding_id)
-            if not uploaded_reference:
-                continue
-            reference_name = uploaded_reference.get("name", "")
-            reference_subfolder = uploaded_reference.get("subfolder", "")
-            reference_path = f"{reference_subfolder}/{reference_name}" if reference_subfolder else reference_name
-            reference_path = reference_path.replace("\\", "/")
-            for target in reference_binding.get("targets", []):
-                self.set_target_raw(target, reference_path)
+            if uploaded_reference:
+                reference_path = self._uploaded_remote_path(uploaded_reference)
+                for target in reference_binding.get("targets", []):
+                    self.set_target_raw(target, reference_path)
+            elif neutral_remote_path:
+                self._set_candidate_targets_raw(reference_binding, neutral_remote_path)
+
+        for candidate in neutralized_inputs or []:
+            if neutral_remote_path:
+                self._set_candidate_targets_raw(candidate, neutral_remote_path)
         dimension_issues: List[str] = []
         if bindings.get("width"):
             if not width or width <= 0:
@@ -5383,6 +5407,8 @@ def normalize_binding_overrides(value: Optional[Dict[str, Any]]) -> Optional[Dic
     references = value.get("references")
     if isinstance(references, list):
         result["references"] = [str(item) for item in references if item not in (None, "")]
+    if to_bool(value.get("ignoreUnselectedLoadImages") if isinstance(value, dict) else False):
+        result["ignore_unselected_load_images"] = True
     return result or None
 
 
@@ -5980,6 +6006,56 @@ def stage_comfy_image(
 # Загружает временные изображения, применяет bindings/values к копии workflow,
 # ставит prompt в очередь и возвращает только первое подходящее output-изображение.
 # ============================================================================
+def _create_blank_helper_image(request_id: str) -> Path:
+    path = TEMP_DIR / safe_filename(f"blank_{request_id}.png")
+    Image.new("RGB", (8, 8), (255, 255, 255)).save(path, format="PNG")
+    return path
+
+
+def _selected_reference_bindings(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    bindings = analysis.get("bindings", {}) if isinstance(analysis, dict) else {}
+    items = bindings.get("reference_images", []) if isinstance(bindings, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _unselected_load_image_candidates(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(analysis, dict):
+        return []
+    candidates = analysis.get("candidates", {}) if isinstance(analysis.get("candidates"), dict) else {}
+    input_candidates = candidates.get("input", []) if isinstance(candidates.get("input"), list) else []
+    bindings = analysis.get("bindings", {}) if isinstance(analysis.get("bindings"), dict) else {}
+    main_id = str(bindings.get("input_image_id") or "")
+    reference_ids = {str(item.get("id") or "") for item in _selected_reference_bindings(analysis) if item.get("id")}
+    result: List[Dict[str, Any]] = []
+    for candidate in input_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("id") or "")
+        if not candidate_id or candidate_id == main_id or candidate_id in reference_ids:
+            continue
+        result.append(candidate)
+    return result
+
+
+def _stage_blank_helper_upload(client: ComfyClient, request_id: str, input_folder: Optional[Path], direct_input_verified: bool) -> Dict[str, Any]:
+    blank_path = _create_blank_helper_image(request_id)
+    try:
+        uploaded = stage_comfy_image(
+            client,
+            blank_path,
+            safe_filename(f"blank_{request_id}.png"),
+            input_folder,
+            direct_input_verified,
+        )
+    finally:
+        try:
+            if blank_path.exists():
+                blank_path.unlink()
+        except OSError:
+            pass
+    return uploaded
+
+
 def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     # generation_context отмечает задачу активной до анализа workflow и upload.
     # Поэтому interrupt первого progress-сегмента не теряется до prompt_id.
@@ -5997,6 +6073,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     overrides = normalize_binding_overrides(
         message.get("binding_overrides") if isinstance(message.get("binding_overrides"), dict) else None
     )
+    ignore_unselected_load_images = bool(overrides and overrides.get("ignore_unselected_load_images"))
 
     if not input_path.is_file():
         raise UserVisibleError(f"Photoshop temporary file was not found: {input_path}")
@@ -6152,6 +6229,32 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         GENERATION.uploaded_images.append(uploaded_reference)
         raise_if_generation_cancelled(request_id)
 
+    selected_reference_bindings = _selected_reference_bindings(analysis)
+    neutralized_map: Dict[str, Dict[str, Any]] = {}
+    for reference_binding in selected_reference_bindings:
+        binding_id = str(reference_binding.get("id") or "")
+        if not binding_id or binding_id in uploaded_references:
+            continue
+        neutralized_map[binding_id] = reference_binding
+    if ignore_unselected_load_images:
+        for candidate in _unselected_load_image_candidates(analysis):
+            candidate_id = str(candidate.get("id") or "")
+            if not candidate_id:
+                continue
+            neutralized_map.setdefault(candidate_id, candidate)
+    neutralized_inputs = list(neutralized_map.values())
+
+    neutral_image: Optional[Dict[str, Any]] = None
+    if neutralized_inputs:
+        neutral_image = _stage_blank_helper_upload(
+            client,
+            request_id,
+            input_folder,
+            direct_input_verified,
+        )
+        GENERATION.uploaded_images.append(neutral_image)
+        raise_if_generation_cancelled(request_id)
+
     patcher = WorkflowPatcher(workflow_data, object_info)
     patched = patcher.apply(
         bindings=analysis["bindings"],
@@ -6160,6 +6263,8 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         uploaded_image=uploaded,
         uploaded_mask=uploaded_mask,
         uploaded_references=uploaded_references,
+        neutral_image=neutral_image,
+        neutralized_inputs=neutralized_inputs,
         width=width,
         height=height,
         request_id=request_id,

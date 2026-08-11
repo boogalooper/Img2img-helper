@@ -2,7 +2,7 @@
 /*
 // BEGIN__HARVEST_EXCEPTION_ZSTRING
 <javascriptresource>
-<name>img2img helper</name>
+<name>img2img helper (hold SHIFT to view dialog window)</name>
 <eventid>5f6f57dc-80c8-49b4-9ea9-405d132b7b30</eventid>
 <terminology><![CDATA[<< /Version 1
 						/Events <<
@@ -428,6 +428,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			saveCurrentValues();
 			if (!state.schema) return;
 			if (!state.schema.valid) throw new Error(str.errWorkflowInvalid);
+			if (state.backend == BACKEND_COMFY) warnAboutUnmanagedLoadImages(state.schema, backend.schemaProfile(state.schema));
 			state.result = { cancelled: false, backend: state.backend, schema: state.schema, values: collectValues() };
 			w.close(1);
 		} catch (e) { ui.showErrorMessage(e); }
@@ -483,6 +484,54 @@ function mainDialog(selection, initial, responseSeconds) {
 		state.notices = [];
 		if (lines.length) ui.showWarningMessage(str.savedValuesRequireAttention + "\n\n• " + lines.join("\n• "), APP.name);
 	}
+	function schemaWarningNotices(schema) {
+		var notices = [], diagnostics = schema && schema.diagnostics instanceof Array ? schema.diagnostics : [];
+		for (var i = 0; i < diagnostics.length; i++) {
+			var item = diagnostics[i], level = String(item && item.level || "").toLowerCase(), message = String(item && item.message || "");
+			if (level != "warning" || !message) continue;
+			notices.push({ key: "schema-warning:" + message, message: message });
+		}
+		return notices;
+	}
+	function resolveSelectedReferenceBindingIds(schema, profile) {
+		var stored = profile && profile.bindingOverrides && profile.bindingOverrides.references instanceof Array ? profile.bindingOverrides.references : [],
+			res = [], i, id, automatic = schema && schema.bindings ? (schema.bindings.reference_images || []) : [];
+		if (stored.length) {
+			for (i = 0; i < stored.length; i++) {
+				id = String(stored[i] || "");
+				if (id && !arrayContains(res, id)) res.push(id);
+			}
+			return res;
+		}
+		for (i = 0; i < automatic.length; i++) {
+			id = String(automatic[i] && automatic[i].id || "");
+			if (id && !arrayContains(res, id)) res.push(id);
+		}
+		return res;
+	}
+	function unmanagedWorkflowLoadImages(schema, profile) {
+		var candidates = schema && schema.candidates ? (schema.candidates.input || []) : [],
+			bindings = schema && schema.bindings ? schema.bindings : {},
+			mainInputId = profile && profile.bindingOverrides && profile.bindingOverrides.input ? String(profile.bindingOverrides.input) : String(bindings.input_image_id || ""),
+			referenceIds = resolveSelectedReferenceBindingIds(schema, profile),
+			res = [], i, candidate, id;
+		for (i = 0; i < candidates.length; i++) {
+			candidate = candidates[i] || {};
+			id = String(candidate.id || "");
+			if (!id || id == mainInputId || arrayContains(referenceIds, id)) continue;
+			res.push(candidate);
+		}
+		return res;
+	}
+	function warnAboutUnmanagedLoadImages(schema, profile) {
+		if (!schema || !profile || !profile.bindingOverrides || toBooleanValue(profile.bindingOverrides.ignoreUnselectedLoadImages)) return;
+		var unmanaged = unmanagedWorkflowLoadImages(schema, profile);
+		if (!unmanaged.length) return;
+		var labels = [], i;
+		for (i = 0; i < unmanaged.length && i < 6; i++) labels.push(String(unmanaged[i].label || unmanaged[i].id || (i + 1)));
+		if (unmanaged.length > 6) labels.push("…");
+		ui.showWarningMessage(str.unselectedLoadImageWarning + "\n\n• " + labels.join("\n• "), APP.name);
+	}
 	// LOAD из XMP сначала переключает backend/workflow, затем переносит
 	// сохранённые значения в соответствующий профиль и заново строит UI.
 	function loadLayerGenerationSettings(metadata, progress) {
@@ -510,12 +559,13 @@ function mainDialog(selection, initial, responseSeconds) {
 		cfg.selectedWorkflow = cfg.data.selectedWorkflow = workflow.id;
 		var profile = cfg.getProfile(workflow.id), previous = cloneObj(profile.bindingOverrides);
 		applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat", "selectedPromptPresets"]);
-		if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" };
+		if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "", ignoreUnselectedLoadImages: false };
 		if (profile.bindingOverrides.mask === undefined) profile.bindingOverrides.mask = "";
 		if (!(profile.bindingOverrides.references instanceof Array)) profile.bindingOverrides.references = [];
 		if (profile.bindingOverrides.sizeMode !== "source_image" && profile.bindingOverrides.sizeMode !== "binding")
 			profile.bindingOverrides.sizeMode = "auto";
 		if (profile.bindingOverrides.sizeMode != "binding") profile.bindingOverrides.size = "";
+		profile.bindingOverrides.ignoreUnselectedLoadImages = toBooleanValue(profile.bindingOverrides.ignoreUnselectedLoadImages);
 		if (!bindingOverridesEqual(previous, profile.bindingOverrides)) {
 			profile.schemaCache = null;
 			profile.schemaCacheStamp = null;
@@ -584,6 +634,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		var profile = backend.schemaProfile(state.schema),
 			selectionValidation = backend.validateSchemaSelections(state.schema, profile);
 		appendNotices(selectionValidation.notices);
+		appendNotices(schemaWarningNotices(state.schema));
 		state.emptyDropdownIds = selectionValidation.emptyDropdownIds;
 		fitSelectionBounds(selection, resolveProfileSizeMultiple(state.schema, profile)); updateSelectionSummary();
 		var visible = state.backend == BACKEND_FORGE
@@ -1273,7 +1324,24 @@ function mainDialog(selection, initial, responseSeconds) {
 			item.candidateId = candidate.id;
 			item.selected = arrayContains(selectedReferences, candidate.id);
 		}
+		function syncReferenceListMainInput() {
+			var selectedMainId = candidateId(inputDropdown), j, listItem;
+			for (j = 0; j < referenceList.items.length; j++) {
+				listItem = referenceList.items[j];
+				if (!listItem) continue;
+				if (selectedMainId && listItem.candidateId == selectedMainId) {
+					listItem.selected = false;
+					try { listItem.enabled = false; } catch (_) { }
+				} else {
+					try { listItem.enabled = true; } catch (_) { }
+				}
+			}
+		}
+		if (inputDropdown) inputDropdown.onChange = syncReferenceListMainInput;
+		syncReferenceListMainInput();
 		ui.addMultilineNote(referencePanel, str.referenceInputsHelp, 520, 32);
+		var workflowFlags = ui.addCheckboxes(referencePanel, [{ id: "ignoreUnselectedLoadImages", text: str.ignoreUnselectedLoadImages, value: profile.bindingOverrides.ignoreUnselectedLoadImages }]);
+		ui.addMultilineNote(referencePanel, str.ignoreUnselectedLoadImagesHelp, 520, 30);
 		var outputDropdown = addCandidateDropdown(parent, str.outputImage, candidates.output || [], profile.bindingOverrides.output, true),
 			sizeModeDropdown = addCandidateDropdown(parent, str.sizeControlMode, [
 				{ id: "auto", label: str.sizeModeAuto },
@@ -1331,6 +1399,7 @@ function mainDialog(selection, initial, responseSeconds) {
 				}
 				profile.bindingOverrides.mask = candidateId(maskDropdown);
 				profile.bindingOverrides.output = candidateId(outputDropdown);
+				profile.bindingOverrides.ignoreUnselectedLoadImages = !!(workflowFlags.ignoreUnselectedLoadImages && workflowFlags.ignoreUnselectedLoadImages.value);
 				profile.bindingOverrides.sizeMode = nextSizeMode;
 				profile.bindingOverrides.size = nextSizeId;
 				return true;
@@ -5499,7 +5568,7 @@ function Config() {
 		var profiles = profileStore("workflowProfiles"), profile = profiles[workflowId];
 		if (!isObjectMap(profile)) profile = profiles[workflowId] = {
 			relativePath: "", values: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null,
-			bindingOverrides: { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" },
+			bindingOverrides: { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "", ignoreUnselectedLoadImages: false },
 			referenceFiles: {}, sizeMultiple: self.sizeMultiple,
 			autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
 			outputFormat: "jpg", manualScale: 1,
@@ -5507,12 +5576,13 @@ function Config() {
 		};
 		normalizeBaseProfile(profile);
 		if (!isObjectMap(profile.bindingOverrides))
-			profile.bindingOverrides = { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "" };
+			profile.bindingOverrides = { input: "", mask: "", references: [], output: "", sizeMode: "auto", size: "", ignoreUnselectedLoadImages: false };
 		var bindings = profile.bindingOverrides;
 		if (bindings.input === undefined) bindings.input = "";
 		if (bindings.mask === undefined) bindings.mask = "";
 		if (!(bindings.references instanceof Array)) bindings.references = [];
 		if (bindings.output === undefined) bindings.output = "";
+		bindings.ignoreUnselectedLoadImages = toBooleanValue(bindings.ignoreUnselectedLoadImages);
 		if (bindings.sizeMode !== "source_image" && bindings.sizeMode !== "binding") bindings.sizeMode = "auto";
 		if (bindings.size === undefined || bindings.sizeMode != "binding") bindings.size = "";
 		if (!isObjectMap(profile.referenceFiles)) profile.referenceFiles = {};
@@ -5987,6 +6057,9 @@ function Locale() {
 		historyPrepareSelection: ["Подготовить выделение", "Prepare selection"], inputImage: ["Входное изображение", "Input image"], inpaintMask: ["Маска inpaint", "Inpaint mask"],
 		imageReference: ["Референс", "Reference image"], referenceInputs: ["Входы референсов", "Reference inputs"],
 		referenceInputsHelp: ["Выберите LoadImage-ноды, которые должны получать отдельные файлы-референсы. Основной вход Photoshop здесь выбирать не нужно.", "Select LoadImage nodes that should receive separate reference files. Do not select the main Photoshop input here."],
+		ignoreUnselectedLoadImages: ["Ignore unselected LoadImage nodes", "Ignore unselected LoadImage nodes"],
+		ignoreUnselectedLoadImagesHelp: ["Если включено, все дополнительные LoadImage-ноды без явного выбора main/reference получают пустое служебное изображение. Если отключено, перед генерацией показывается предупреждение.", "If enabled, every additional LoadImage node that is not explicitly selected as the main input or a reference receives a blank helper image. If disabled, the script shows a warning before generation."],
+		unselectedLoadImageWarning: ["В workflow найдены дополнительные LoadImage-ноды, которые не выбраны как основная Input image или Reference input. Их исходные значения из workflow будут использованы как есть. Откройте настройки workflow и либо назначьте их явно, либо включите Ignore unselected LoadImage nodes.", "The workflow contains additional LoadImage nodes that are not selected as the main Input image or as Reference inputs. Their original workflow values will be used as-is. Open workflow settings and either assign them explicitly or enable Ignore unselected LoadImage nodes."],
 		noneReference: ["нет", "none"], selectReferenceImage: ["Выберите референсное изображение", "Select reference image"],
 		errReferenceImageFormat: ["Поддерживаются только изображения JPG, JPEG, PNG и WebP.", "Only JPG, JPEG, PNG and WebP images are supported."],
 		saveChanges: ["Сохранить изменения", "Save changes"], dialogYes: ["Да", "Yes"], dialogNo: ["Нет", "No"],
@@ -6260,7 +6333,8 @@ function normalizedBindingOverrides(value) {
 		references: references,
 		output: String(value.output || ""),
 		sizeMode: value.sizeMode == "source_image" || value.sizeMode == "binding" ? String(value.sizeMode) : "auto",
-		size: value.sizeMode == "binding" ? String(value.size || "") : ""
+		size: value.sizeMode == "binding" ? String(value.size || "") : "",
+		ignoreUnselectedLoadImages: toBooleanValue(value.ignoreUnselectedLoadImages)
 	};
 }
 function bindingOverridesEqual(first, second) {
