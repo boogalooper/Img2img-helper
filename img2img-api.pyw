@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 2
-VERSION = "0.190"
+VERSION = "0.191"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "019af055-f845-432e-990c-0ad7a183d1f6"
+ANALYZER_UUID = "d62b1218-eb3d-4b80-869e-d8598cf70056"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -1955,7 +1955,7 @@ class WorkflowAnalyzer:
                             label=f"{self.node_label(str(node_id))} → {input_name}",
                             targets=[target],
                             score=score + (20 if input_name == "image" else 0) - (80 if is_reference else 0),
-                            meta={"reference": is_reference, "tagged": title_has_tag(title, "input"), "load_image": is_load_image, "node_id": str(node_id), "input": input_name},
+                            meta={"reference": is_reference, "tagged": title_has_tag(title, "input"), "load_image": is_load_image, "node_id": str(node_id), "input": input_name, "source_value": value},
                         )
                     )
                     if title_has_tag(title, "input"):
@@ -1972,7 +1972,7 @@ class WorkflowAnalyzer:
                                 label=f"{self.node_label(str(node_id))} → {input_name}",
                                 targets=[target],
                                 score=score - (80 if is_reference else 0),
-                                meta={"reference": is_reference, "tagged": title_has_tag(title, "input"), "load_image": is_load_image, "node_id": str(node_id), "input": input_name},
+                                meta={"reference": is_reference, "tagged": title_has_tag(title, "input"), "load_image": is_load_image, "node_id": str(node_id), "input": input_name, "source_value": value},
                             )
                         )
                         tagged_targets.append(target)
@@ -2902,7 +2902,7 @@ class WorkflowAnalyzer:
             "The workflow contains more than one LoadImage node. Open workflow settings and explicitly select "
             "the main input and any reference inputs."
         ) if multiple_load_images_unassigned else ""
-        input_choice = self.find_candidate(main_input_candidates, input_override) if input_override else self.choose_unique_candidate(main_input_candidates)
+        input_choice = self.find_candidate(input_candidates, input_override) if input_override else self.choose_unique_candidate(main_input_candidates)
         input_review_required = False
         if input_override and not input_choice:
             self.error("The selected image input no longer exists. Open workflow settings and select it again.")
@@ -2927,7 +2927,7 @@ class WorkflowAnalyzer:
         # represents the input selected for this analysis.
         mask_candidates_by_input = {
             candidate.id: [item.to_dict() for item in self.mask_candidates(candidate)]
-            for candidate in main_input_candidates
+            for candidate in input_candidates
         }
         mask_override = str(overrides.get("mask") or "")
         mask_choice = self.choose_mask_candidate(mask_candidates, mask_override)
@@ -2949,6 +2949,41 @@ class WorkflowAnalyzer:
             self.warning(
                 "Some selected reference inputs no longer exist and were ignored: "
                 + ", ".join(missing_reference_ids[:10])
+            )
+
+        # Explicit per-LoadImage empty roles replace the former global
+        # ignore_unselected_load_images switch. Keep them in the analysis
+        # overrides so stale ids and role conflicts are caught before prompt
+        # submission. Old clients may omit this key and retain legacy behavior.
+        empty_input_ids = overrides.get("empty_inputs") if isinstance(overrides.get("empty_inputs"), list) else []
+        input_by_id = {candidate.id: candidate for candidate in input_candidates}
+        managed_target_keys: Set[Tuple[str, str]] = set()
+        if input_choice:
+            managed_target_keys.update((target.node_id, target.input_name) for target in input_choice.targets)
+        for candidate in reference_choices:
+            managed_target_keys.update((target.node_id, target.input_name) for target in candidate.targets)
+        missing_empty_ids: List[str] = []
+        for empty_id in empty_input_ids:
+            empty_candidate = input_by_id.get(str(empty_id))
+            if not empty_candidate or empty_candidate.meta.get("grouped"):
+                missing_empty_ids.append(str(empty_id))
+                continue
+            if not empty_candidate.meta.get("load_image"):
+                self.error(
+                    f"{empty_candidate.label} cannot use the empty-image role because it is not a standard LoadImage node."
+                )
+                continue
+            empty_target_keys = {
+                (target.node_id, target.input_name) for target in empty_candidate.targets
+            }
+            if empty_target_keys & managed_target_keys:
+                self.error(
+                    f"{empty_candidate.label} has conflicting image roles. Choose only one role in workflow settings."
+                )
+        if missing_empty_ids:
+            self.warning(
+                "Some LoadImage empty roles no longer exist and were ignored: "
+                + ", ".join(missing_empty_ids[:10])
             )
 
         output_override = str(overrides.get("output") or "")
@@ -5443,6 +5478,13 @@ def normalize_binding_overrides(value: Optional[Dict[str, Any]]) -> Optional[Dic
     references = value.get("references")
     if isinstance(references, list):
         result["references"] = [str(item) for item in references if item not in (None, "")]
+    empty_inputs = value.get("emptyInputs")
+    if not isinstance(empty_inputs, list):
+        empty_inputs = value.get("empty_inputs")
+    if isinstance(empty_inputs, list):
+        # Preserve an explicit empty list: it means that every unassigned
+        # LoadImage should keep the file stored in the workflow.
+        result["empty_inputs"] = [str(item) for item in empty_inputs if item not in (None, "")]
     return result or None
 
 
@@ -6103,6 +6145,24 @@ def _unselected_load_image_candidates(analysis: Dict[str, Any]) -> List[Dict[str
     return result
 
 
+def _selected_empty_load_image_candidates(
+    analysis: Dict[str, Any], candidate_ids: Sequence[str]
+) -> List[Dict[str, Any]]:
+    """Resolve explicit empty-image roles to physical standard LoadImage nodes."""
+
+    candidates = analysis.get("candidates", {}) if isinstance(analysis, dict) else {}
+    input_candidates = candidates.get("input", []) if isinstance(candidates, dict) else []
+    selected = {str(item) for item in candidate_ids if str(item)}
+    result: List[Dict[str, Any]] = []
+    for candidate in input_candidates if isinstance(input_candidates, list) else []:
+        if not isinstance(candidate, dict) or str(candidate.get("id") or "") not in selected:
+            continue
+        meta = candidate.get("meta") if isinstance(candidate.get("meta"), dict) else {}
+        if meta.get("load_image") and not meta.get("grouped"):
+            result.append(candidate)
+    return result
+
+
 def _stage_blank_helper_upload(
     client: ComfyClient,
     request_id: str,
@@ -6310,7 +6370,13 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         and str(item.get("id") or "")
         and str(item.get("id") or "") not in uploaded_references
     ]
-    neutralized_inputs = _unselected_load_image_candidates(analysis) if ignore_unselected_load_images else []
+    if isinstance(overrides, dict) and "empty_inputs" in overrides:
+        neutralized_inputs = _selected_empty_load_image_candidates(
+            analysis, overrides.get("empty_inputs") or []
+        )
+    else:
+        # Backward compatibility for old JSX, saved profiles and Actions.
+        neutralized_inputs = _unselected_load_image_candidates(analysis) if ignore_unselected_load_images else []
 
     neutral_image: Optional[Dict[str, Any]] = None
     if missing_selected_references or neutralized_inputs:
