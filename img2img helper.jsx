@@ -15,7 +15,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 $.localize = true; // ScriptUI/Photoshop автоматически локализует объекты Locale.
-$.locale = 'ru'
+//$.locale = 'ru'
 var APP = {
 	name: "img2img helper",
 	uuid: "5f6f57dc-80c8-49b4-9ea9-405d132b7b30",
@@ -33,11 +33,11 @@ var APP = {
 	},
 	cache: {
 		schemaVersion: 1,
-		comfyAnalysisUuid: "e38ea4da-e4f8-4596-a4ec-ece879da9c60",
+		comfyAnalysisUuid: "a174cecf-c02f-42e5-b6dc-cabca3772a66",
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.188",
+	VER = "0.189",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -166,9 +166,10 @@ function init() {
 	settingsReady = true;
 	cfg.cleanReferenceHistory();
 	var environmentMode = DEBUG_FIRST_LAUNCH_WITH_INTERFACE ? null : $.getenv(APP.dialogEnvKey),
-		// В Action dialog-флаг действует только на текущую итерацию.
+		// После ошибки или отмены dialog-флаг открывает следующий запуск также
+		// внутри Action; успешная генерация снова переводит его в silent mode.
 		showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
-			? forceDialog || app.playbackDisplayDialogs == DialogModes.ALL
+			? forceDialog || environmentMode == "true" || app.playbackDisplayDialogs == DialogModes.ALL
 			: forceDialog || environmentMode == "true" || environmentMode == null);
 	var selection = {
 		result: false,
@@ -277,7 +278,43 @@ function init() {
 			silentValues = backend.profileValues(initial.schema, silentProfile);
 		if (!actionPlaybackMode) cfg.saveToAction();
 		$.setenv(APP.dialogEnvKey, "false");
-		generation.run(selection, initial.schema, silentValues);
+		try {
+			generation.run(selection, initial.schema, silentValues);
+		} catch (silentGenerationError) {
+			if (String(silentGenerationError.message || silentGenerationError) == APP.cancelToken)
+				throw silentGenerationError;
+			// GenerationRuntime may temporarily change layers and channels. Restore
+			// the document before presenting controls for a corrected retry.
+			restoreInitialDocumentState();
+			$.setenv(APP.dialogEnvKey, "true");
+			var generationNotice = {
+				key: "silent-generation-error:" + errorMessageText(silentGenerationError),
+				level: "error",
+				message: errorMessageText(silentGenerationError)
+			};
+			if (initial.fastPath) {
+				try {
+					var expandedInitial = backend.loadInitialData(null, false);
+					expandedInitial.notices = (expandedInitial.notices instanceof Array ? expandedInitial.notices : []).concat([generationNotice]);
+					initial = expandedInitial;
+				} catch (_) {
+					initial.notices = (initial.notices instanceof Array ? initial.notices : []).concat([generationNotice]);
+				}
+			} else {
+				initial.notices = (initial.notices instanceof Array ? initial.notices : []).concat([generationNotice]);
+			}
+			initial.forceDialog = true;
+			var retryResult = mainDialog(selection, initial, responseSeconds);
+			if (!retryResult || retryResult.cancelled) {
+				if (retryResult && retryResult.saveSettings) action.saveAcceptedSettings();
+				else if (!actionPlaybackMode) cfg.save();
+				isCancelled = true;
+				return;
+			}
+			action.saveAcceptedSettings();
+			$.setenv(APP.dialogEnvKey, "false");
+			generation.run(selection, retryResult.schema, retryResult.values);
+		}
 	} finally {
 		if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
 	}
@@ -331,6 +368,13 @@ function itemData(source) {
 		value: value === undefined ? "" : value,
 		help: String(help === undefined || help === null ? "" : help)
 	};
+}
+function defaultComfyImageRole(candidate, ignoreUnselected) {
+	var meta = candidate && candidate.meta ? candidate.meta : {},
+		source = String(meta.source_value === undefined || meta.source_value === null ? "" : meta.source_value)
+			.replace(/^\s+|\s+$/g, "");
+	if (meta.load_image && (ignoreUnselected || !source)) return "empty";
+	return "workflow";
 }
 // Только обычный CFG Scale управляет доступностью Negative prompt.
 function findForgeCfgControlId(schema) {
@@ -505,12 +549,15 @@ function mainDialog(selection, initial, responseSeconds) {
 		}
 	}
 	function showPendingNotices(schema) {
-		var warnings = [], errors = [], diagnostics = schema && schema.diagnostics instanceof Array ? schema.diagnostics : [];
+		var warnings = [], errors = [], diagnostics = schema && schema.diagnostics instanceof Array ? schema.diagnostics : [],
+			diagnosticTitle = str.workflowDiagnostics;
 		for (var i = 0; i < state.notices.length; i++) {
 			var msg = errorMessageText(state.notices[i]), key = noticeKey(state.notices[i]);
 			if (!msg || state.noticeKeysShown[key]) continue;
 			state.noticeKeysShown[key] = true;
-			warnings.push(msg);
+			if (key.indexOf("silent-generation-error:") == 0) diagnosticTitle = str.generationDiagnostics;
+			if (state.notices[i] && String(state.notices[i].level || "").toLowerCase() == "error") errors.push(msg);
+			else warnings.push(msg);
 		}
 		state.notices = [];
 		for (i = 0; i < diagnostics.length; i++) {
@@ -527,7 +574,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		}
 		if (signature == state.workflowDiagnosticSignature) return;
 		state.workflowDiagnosticSignature = signature;
-		ui.showDiagnosticSummary({ title: str.workflowDiagnostics, errors: errors, warnings: warnings });
+		ui.showDiagnosticSummary({ title: diagnosticTitle, errors: errors, warnings: warnings });
 	}
 	function workflowInputReviewNotices(schema) {
 		if (!schema || !schema.input_review_required || !schema.input_review_message) return [];
@@ -1337,6 +1384,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		roleTitle.text = str.selectedInputRole;
 		var maskRow = addCandidateDropdownRow(parent, str.inpaintMask),
 			maskDropdown = maskRow.dropdown;
+		maskRow.label.helpTip = maskDropdown.helpTip = str.maskUsageHelp;
 		function candidateById(items, id) {
 			for (var ci = 0; ci < items.length; ci++)
 				if (String(items[ci].id || "") == String(id || "")) return items[ci];
@@ -1418,8 +1466,7 @@ function mainDialog(selection, initial, responseSeconds) {
 				if (!(inputCandidates[i].meta && inputCandidates[i].meta.grouped)) roleCandidates.push(inputCandidates[i]);
 			for (i = 0; i < roleCandidates.length; i++) {
 				candidate = roleCandidates[i];
-				roleById[candidate.id] = profile.ignoreUnselectedLoadImages && candidate.meta && candidate.meta.load_image
-					? "empty" : "workflow";
+				roleById[candidate.id] = defaultComfyImageRole(candidate, profile.ignoreUnselectedLoadImages);
 				if (main && candidatesOverlap(main, candidate)) roleById[candidate.id] = "photoshop";
 				for (j = 0; j < referenceIds.length; j++) {
 					selected = candidateById(inputCandidates, referenceIds[j]);
@@ -1504,7 +1551,7 @@ function mainDialog(selection, initial, responseSeconds) {
 					maskLabel = maskMeta.mode == "input_alpha"
 						? "MASK: " + displayCandidateName(main)
 						: String(maskCandidates[i].label || maskCandidates[i].id || "");
-				maskLabel += " — " + (maskMeta.connected ? str.connected : str.notConnected);
+				maskLabel += " — " + (maskMeta.connected ? str.maskUsedByWorkflow : str.maskUnusedByWorkflow);
 				item = maskDropdown.add("item", maskLabel);
 				item.candidateId = maskCandidates[i].id;
 				item.maskConnected = !!maskMeta.connected;
@@ -2286,8 +2333,12 @@ function GenerationRuntime() {
 					APP.name
 				);
 			}
-			if (typeof answer == "object" && answer.warnings instanceof Array && answer.warnings.length)
-				ui.showDiagnosticSummary({ title: str.generationDiagnostics, warnings: answer.warnings });
+			if (typeof answer == "object" && answer.warnings instanceof Array && answer.warnings.length) {
+				var localizedGenerationWarnings = [];
+				for (var warningIndex = 0; warningIndex < answer.warnings.length; warningIndex++)
+					localizedGenerationWarnings.push(workflowDiagnosticText(answer.warnings[warningIndex]));
+				ui.showDiagnosticSummary({ title: str.generationDiagnostics, warnings: localizedGenerationWarnings });
+			}
 		} finally {
 			if (inputFile && inputFile.exists) try { inputFile.remove(); } catch (_) { }
 			if (maskFile && maskFile.exists) try { maskFile.remove(); } catch (_) { }
@@ -6280,7 +6331,6 @@ function Locale() {
 		errSettingsUnreadable: ["Основной файл настроек повреждён или недоступен. Настройки по умолчанию не были загружены, чтобы не перезаписать пользовательские данные.", "The main settings file is damaged or unavailable. Defaults were not loaded, so the user's data will not be overwritten."],
 		settingsBackupRecovered: ["Основной файл настроек прочитать не удалось. Загружена резервная копия:", "The main settings file could not be read. The backup was loaded:"],
 		settingsPrimaryReadError: ["Ошибка основного файла:", "Main-file error:"],
-		savedValuesRequireAttention: ["Некоторые сохранённые или доступные значения требуют проверки:", "Some saved or available values require review:"],
 		noAvailableValues: ["нет доступных значений; генерация отключена", "no available values; generation is disabled"],
 		invalidForgeSchema: ["Ошибка схемы Forge", "Invalid Forge schema"], unknownFile: ["неизвестный файл", "unknown file"],
 		errorOccurred: ["Произошла ошибка", "An error occurred"],
@@ -6306,28 +6356,25 @@ function Locale() {
 		errSaveJpeg: ["Photoshop не смог сохранить временный JPEG.", "Photoshop could not save the temporary JPEG."],
 		errSavePng: ["Photoshop не смог сохранить временный PNG с маской.", "Photoshop could not save the temporary PNG with a mask."],
 		errSaveMask: ["Photoshop не смог сохранить временную маску PNG.", "Photoshop could not save the temporary PNG mask."],
-		errInpaintMaskMissing: ["Для этого workflow не настроен вход маски. Откройте настройки workflow и выберите MASK основной ноды LoadImage или LoadImageMask.", "No mask input is configured for this workflow. Open workflow settings and select the main LoadImage MASK or a LoadImageMask node."],
-		errInpaintInputDisconnected: ["Workflow не использует MASK основной ноды LoadImage. Подключите выход MASK к inpaint-ветке или выберите LoadImageMask в настройках workflow.", "The workflow does not use the main LoadImage MASK output. Connect MASK to the inpaint branch or select a LoadImageMask node in workflow settings."],
-		errInpaintNodeDisconnected: ["Выбранная нода LoadImageMask не подключена к workflow. Подключите её выход MASK к inpaint-ветке.", "The selected LoadImageMask node is not connected to the workflow. Connect its MASK output to the inpaint branch."],
+		errInpaintMaskMissing: ["Для параметра «Маска inpaint» не найден подходящий вариант. В настройках workflow выберите MASK основной ноды LoadImage или ноду LoadImageMask.", "No suitable option was found for Inpaint mask. In Workflow settings, select the main LoadImage MASK or a LoadImageMask node."],
+		errInpaintInputDisconnected: ["MASK основной ноды LoadImage не используется в workflow. Подключите выход MASK к inpaint-ветке в ComfyUI или выберите другой вариант для параметра «Маска inpaint».", "The main LoadImage MASK is not used by the workflow. Connect its MASK output to the inpaint branch in ComfyUI or select another Inpaint mask option."],
+		errInpaintNodeDisconnected: ["MASK выбранной ноды LoadImageMask не используется в workflow. Подключите её выход MASK к inpaint-ветке в ComfyUI или выберите другой вариант для параметра «Маска inpaint».", "The selected LoadImageMask MASK is not used by the workflow. Connect its MASK output to the inpaint branch in ComfyUI or select another Inpaint mask option."],
 		errSelectedWorkflowMissing: ["Выбранный workflow больше не найден.", "The selected workflow can no longer be found."],
 		errWorkflowInvalid: ["Workflow не прошёл проверку. Откройте ⚙ или добавьте метки к названиям нод.", "Workflow validation failed. Open ⚙ or add tags to node titles."],
 		generate: ["Генерировать", "Generate"], generationTimeout: ["Таймаут генерации, с:", "Generation timeout, s:"],
-		generationWarnings: ["Генерация завершена, но некоторые параметры не были применены:", "Generation completed, but some parameters were not applied:"],
 		historyCheckSelection: ["Проверить выделение", "Check selection"], historyPlaceResult: ["Вставить результат генерации", "Place generated result"],
-		historyPrepareSelection: ["Подготовить выделение", "Prepare selection"], inputImage: ["Входное изображение", "Input image"], inpaintMask: ["Маска inpaint", "Inpaint mask"],
+		historyPrepareSelection: ["Подготовить выделение", "Prepare selection"], inpaintMask: ["Маска inpaint", "Inpaint mask"],
 		imageInputRoles: ["Входы изображений", "Image inputs"], selectedInputRole: ["Назначение выбранной ноды", "Selected node role"],
 		rolePhotoshop: ["Изображение Photoshop", "Photoshop image"], roleReference: ["Референс", "Reference"],
 		roleWorkflowFile: ["Файл из workflow", "Workflow file"], roleEmpty: ["Пустое изображение", "Empty image"],
 		workflowStoredFile: ["Файл в workflow: ", "Workflow file: "], fileNotSpecified: ["файл не указан", "file not specified"],
-		connected: ["подключено", "connected"], notConnected: ["не подключено", "not connected"],
-		errMainImageRoleRequired: ["Назначьте хотя бы одну LoadImage как изображение Photoshop.", "Assign at least one LoadImage as the Photoshop image."],
-		errMainImageRoleConflict: ["Несколько нод назначены как изображение Photoshop, но они не образуют единую группу #PS-INPUT.", "Several nodes are assigned as the Photoshop image, but they do not form one #PS-INPUT group."],
-		errSelectedMaskDisconnected: ["Выбранный вход маски не подключён к inpaint-ветке workflow.", "The selected mask input is not connected to the workflow inpaint branch."],
-		errEmptyRoleUnsupported: ["пустое изображение поддерживается только стандартной нодой LoadImage", "the empty-image role is supported only for the standard LoadImage node"],
-		imageReference: ["Референс", "Reference image"], referenceInputs: ["Входы референсов", "Reference inputs"],
-		referenceInputsHelp: ["Выберите LoadImage-ноды, которые должны получать отдельные файлы-референсы. Основной вход Photoshop здесь выбирать не нужно.", "Select LoadImage nodes that should receive separate reference files. Do not select the main Photoshop input here."],
-		ignoreUnselectedLoadImages: ["Ignore unselected LoadImage nodes", "Ignore unselected LoadImage nodes"],
-		ignoreUnselectedLoadImagesHelp: ["Если включено, дополнительные стандартные LoadImage-ноды, не назначенные как main/reference, получают пустое служебное изображение. Если отключено, их исходные значения workflow используются как есть.", "If enabled, additional standard LoadImage nodes not assigned as main/reference receive a blank helper image. If disabled, their original workflow values are used as-is."],
+		maskUsedByWorkflow: ["используется в workflow", "used by workflow"], maskUnusedByWorkflow: ["не используется в workflow", "not used by workflow"],
+		maskUsageHelp: ["Статус показывает, используется ли выход MASK этой ноды в workflow. Выбор пункта не изменяет соединения нод в ComfyUI.", "The status shows whether this node's MASK output is used by the workflow. Selecting an option does not change node connections in ComfyUI."],
+		errMainImageRoleRequired: ["Назначьте одной ноде LoadImage роль «Изображение Photoshop».", "Assign the Photoshop image role to one LoadImage node."],
+		errMainImageRoleConflict: ["Роль «Изображение Photoshop» назначена нескольким нодам, которые не образуют единую группу #PS-INPUT.", "The Photoshop image role is assigned to multiple nodes that do not form a single #PS-INPUT group."],
+		errSelectedMaskDisconnected: ["Выбранная «Маска inpaint» не используется в workflow. Выберите вариант со статусом «используется в workflow» или исправьте соединения в ComfyUI.", "The selected Inpaint mask is not used by the workflow. Select an option marked “used by workflow” or fix the connections in ComfyUI."],
+		errEmptyRoleUnsupported: ["роль «Пустое изображение» поддерживается только стандартной нодой LoadImage", "the Empty image role is supported only for a standard LoadImage node"],
+		imageReference: ["Референс", "Reference image"],
 		noneReference: ["нет", "none"], selectReferenceImage: ["Выберите референсное изображение", "Select reference image"],
 		errReferenceImageFormat: ["Поддерживаются только изображения JPG, JPEG, PNG и WebP.", "Only JPG, JPEG, PNG and WebP images are supported."],
 		saveChanges: ["Сохранить изменения", "Save changes"], dialogYes: ["Да", "Yes"], dialogNo: ["Нет", "No"],
@@ -6399,26 +6446,33 @@ function Locale() {
 		workflowDiagnostics: ["Проверка workflow", "Workflow validation"], generationDiagnostics: ["Результат генерации", "Generation result"],
 		diagnosticsErrors: ["Необходимо исправить:", "Must be fixed:"], diagnosticsWarnings: ["Обратите внимание:", "Please note:"],
 		diagnosticsNeedAttention: ["Обнаружены проблемы", "Problems found"], diagnosticsInformation: ["Информация", "Information"],
-		multiple_load_images_legacy: ["Запущенная версия Python API всё ещё использует прежнюю проверку нескольких LoadImage. Завершите процесс img2img-api и снова запустите скрипт — после перезапуска одна входная нода будет выбрана автоматически.", "The running Python API still uses the previous multiple-LoadImage validation. Stop the img2img-api process and run the script again; one input node will then be selected automatically."],
+		multiple_load_images_legacy: ["Запущенная версия Python API всё ещё использует прежнюю проверку нескольких LoadImage. Завершите процесс img2img-api и снова запустите скрипт — после перезапуска одной ноде LoadImage автоматически будет назначена роль «Изображение Photoshop».", "The running Python API still uses the previous multiple-LoadImage validation. Stop the img2img-api process and run the script again; one LoadImage node will then automatically receive the Photoshop image role."],
 		missing_node_class: ["В ComfyUI не установлена нода: %1", "The ComfyUI node is not installed: %1"],
 		sampler_inputs_ambiguous: ["В сэмплере #%1 найдено несколько входов типа %2: %3. В качестве основного используется %4; остальные доступны как дополнительные поля.", "Sampler #%1 contains several inputs matching %2: %3. %4 is used as the standard control; the others remain available as advanced fields."],
 		prompt_fields_ambiguous: ["Перед сэмплером #%2 найдено несколько равнозначных полей %1. Использовано первое найденное поле; чтобы выбрать другое, переименуйте нужную ноду или добавьте метку.", "Several equivalent %1 fields were found upstream of sampler #%2. The first deterministic match is used; rename or tag the intended node to make the workflow unambiguous."],
-		selected_input_missing: ["Ранее выбранная входная нода изображения больше не существует. Откройте настройки workflow и выберите её заново.", "The selected image input no longer exists. Open workflow settings and select it again."],
-		selected_mask_missing: ["Ранее выбранный вход маски больше не существует. Откройте настройки workflow и выберите его заново.", "The selected inpaint mask input no longer exists. Open workflow settings and select it again."],
-		selected_references_missing: ["Некоторые выбранные входы референсов больше не существуют и были пропущены: %1", "Some selected reference inputs no longer exist and were ignored: %1"],
+		selected_input_missing: ["Нода с ранее выбранной ролью «Изображение Photoshop» больше не существует. Откройте настройки workflow и назначьте эту роль заново.", "The node previously assigned the Photoshop image role no longer exists. Open Workflow settings and assign the role again."],
+		selected_mask_missing: ["Ранее выбранный вариант параметра «Маска inpaint» больше не существует. Откройте настройки workflow и выберите его заново.", "The previously selected Inpaint mask option no longer exists. Open Workflow settings and select it again."],
+		selected_references_missing: ["Некоторые ноды с ролью «Референс» больше не существуют и были пропущены: %1", "Some nodes assigned the Reference role no longer exist and were ignored: %1"],
 		empty_role_unsupported: ["%1: роль «Пустое изображение» поддерживается только стандартной нодой LoadImage.", "%1 cannot use the empty-image role because it is not a standard LoadImage node."],
 		image_role_conflict: ["%1 имеет конфликтующие назначения. Выберите для ноды только одну роль в настройках workflow.", "%1 has conflicting image roles. Choose only one role in workflow settings."],
 		empty_roles_missing: ["Некоторые ноды с ролью «Пустое изображение» больше не существуют и были пропущены: %1", "Some LoadImage empty roles no longer exist and were ignored: %1"],
-		selected_output_missing: ["Ранее выбранная выходная нода больше не существует. Откройте настройки workflow и выберите её заново.", "The selected output node no longer exists. Open workflow settings and select it again."],
-		output_ambiguous: ["Найдено несколько возможных выходных нод. Выберите ноду результата в настройках workflow или добавьте к её названию #PS-OUTPUT.", "Several possible output nodes were found. Select the result node in workflow settings or tag it #PS-OUTPUT."],
-		size_binding_required: ["Выбран режим записи размера в поля width/height, но пара полей не указана.", "Size mode is set to selected width/height fields, but no size pair is selected."],
-		selected_size_missing: ["Ранее выбранные поля width/height больше не существуют. Откройте настройки workflow и выберите их заново.", "The selected width/height fields no longer exist. Open workflow settings and select them again."],
-		size_ambiguous: ["Найдено несколько возможных пар width/height. В автоматическом режиме будет использован размер входного изображения. Если workflow требует фиксированных полей размера, выберите пару вручную.", "Several possible width/height pairs were found. Automatic mode will use the input image size. Select a pair explicitly in workflow settings if the workflow requires fixed size fields."],
+		selected_output_missing: ["Ранее выбранное «Выходное изображение» больше не существует. Откройте настройки workflow и выберите его заново.", "The previously selected Output image no longer exists. Open Workflow settings and select it again."],
+		output_ambiguous: ["Найдено несколько вариантов для параметра «Выходное изображение». Выберите нужный вариант в настройках workflow или добавьте #PS-OUTPUT к названию соответствующей ноды.", "Several options were found for Output image. Select the required option in Workflow settings or add #PS-OUTPUT to the corresponding node title."],
+		size_binding_required: ["Для параметра «Управление размером» выбраны «Поля width / height», но сама пара полей не указана.", "Width / height fields is selected under Size control, but no field pair is specified."],
+		selected_size_missing: ["Ранее выбранная пара «Поля width / height» больше не существует. Откройте настройки workflow и выберите её заново.", "The previously selected Width / height fields pair no longer exists. Open Workflow settings and select it again."],
+		size_ambiguous: ["Найдено несколько вариантов для параметра «Поля width / height». При автоматическом «Управлении размером» будет использован «Размер входного изображения». Если workflow требует изменения конкретных полей, выберите пару вручную.", "Several options were found for Width / height fields. Automatic Size control will use Input image size. If the workflow requires specific fields to be changed, select a pair manually."],
 		sampler_ambiguous: ["Найдено несколько равнозначных сэмплеров. Основным назначен первый найденный. Чтобы выбрать другой, добавьте к названию нужного сэмплера #PS-MAIN.", "Several equivalent sampler nodes were found. The first deterministic node is treated as primary. Add #PS-MAIN to the intended sampler title to make the choice explicit."],
-		input_not_found: ["В workflow не найдена входная нода изображения. Добавьте #PS-INPUT к названию нужной ноды.", "No image input node was found. Add #PS-INPUT to its title."],
-		output_not_found: ["В workflow не найдена выходная нода. Добавьте #PS-OUTPUT к названию Save Image или Preview Image.", "No output node was found. Add #PS-OUTPUT to Save/Preview Image."],
-		size_not_found: ["Не найдена доступная для изменения пара width/height. Скрипт отправит изображение правильного размера, но итоговый размер зависит от логики workflow.", "No editable width/height pair was found. The script will send a correctly sized JPEG, but the final size depends on workflow logic."],
+		input_not_found: ["Не найдена нода, которой можно назначить роль «Изображение Photoshop». Добавьте #PS-INPUT к названию нужной ноды.", "No node was found that can use the Photoshop image role. Add #PS-INPUT to the required node title."],
+		output_not_found: ["Не найден вариант для параметра «Выходное изображение». Добавьте #PS-OUTPUT к названию нужной ноды Save Image или Preview Image.", "No option was found for Output image. Add #PS-OUTPUT to the required Save Image or Preview Image node title."],
+		size_not_found: ["Не найден вариант для параметра «Поля width / height». Скрипт отправит изображение Photoshop правильного размера, но итоговый размер зависит от логики workflow.", "No option was found for Width / height fields. The script will send a correctly sized Photoshop image, but the final size depends on the workflow logic."],
 		sampler_not_found: ["Основной сэмплер не распознан; часть стандартных параметров может быть недоступна.", "The primary sampler was not recognized; standard parameters may be incomplete."],
+		generation_reference_invalid: ["Референс №%1 не применён: повреждены сохранённые данные файла.", "Reference #%1 was not applied because its saved file data is invalid."],
+		generation_reference_binding_missing: ["Референс №%1 не применён: не сохранено назначение ноде с ролью «Референс».", "Reference #%1 was not applied because no node assigned the Reference role was saved for it."],
+		generation_reference_input_missing: ["Референс %1 не применён: соответствующая нода с ролью «Референс» отсутствует в текущей схеме. Повторно проанализируйте workflow.", "Reference %1 was not applied because its node assigned the Reference role is missing from the current schema. Reanalyze the workflow."],
+		generation_reference_file_missing: ["Референс %1 не применён: файл не найден (%2).", "Reference %1 was not applied because the file was not found (%2)."],
+		generation_size_binding_skipped: ["Автоматическая запись размера в «Поля width / height» пропущена: выбранная пара не принимает размер изображения Photoshop. Использован «Размер входного изображения».", "Automatic writing to Width / height fields was skipped because the selected pair cannot accept the Photoshop image size. Input image size was used instead."],
+		generation_parameter_missing: ["Параметр %1 не применён: он отсутствует в текущей схеме. Повторно проанализируйте workflow.", "Parameter %1 was not applied because it is missing from the current schema. Reanalyze the workflow."],
+		generation_parameter_no_targets: ["Параметр %1 не применён: в схеме для него нет целевых полей. Повторно проанализируйте workflow.", "Parameter %1 was not applied because the schema contains no target fields for it. Reanalyze the workflow."],
 		forgePort: ["Порт Forge Neo:", "Forge Neo port:"], refreshForgeCatalog: ["Обновить текущую схему и её данные", "Refresh current schema and its data"],
 		rebuildForgeSchema: ["Повторно загрузить или полностью сбросить схему Forge", "Reload or fully reset the Forge schema"],
 		rebuildForgeSchemaConfirm: ["Выполнить полный сброс выбранной схемы Forge?\n\nДа — удалить все данные этой схемы и заново загрузить её из JSON.\nНет — только повторно загрузить схему из JSON, сохранив значения параметров, состав интерфейса, выбранные LoRA, ImageStitch inputs и настройки размера.", "Fully reset the selected Forge schema?\n\nYes — remove all data for this schema and load it again from JSON.\nNo — only reload the schema from JSON while preserving parameter values, the interface layout, selected LoRAs, ImageStitch inputs and size settings."],

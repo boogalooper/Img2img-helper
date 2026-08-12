@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 2
-VERSION = "0.192"
+VERSION = "0.193"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "e38ea4da-e4f8-4596-a4ec-ece879da9c60"
+ANALYZER_UUID = "a174cecf-c02f-42e5-b6dc-cabca3772a66"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -2956,7 +2956,7 @@ class WorkflowAnalyzer:
         input_review_message = ""
         if input_override and not input_choice:
             self.error(
-                "The selected image input no longer exists. Open workflow settings and select it again.",
+                "The node previously assigned the Photoshop image role no longer exists. Open Workflow settings and assign the role again.",
                 "selected_input_missing",
             )
 
@@ -2974,7 +2974,7 @@ class WorkflowAnalyzer:
         mask_choice = self.choose_mask_candidate(mask_candidates, mask_override)
         if mask_override and not mask_choice:
             self.error(
-                "The selected inpaint mask input no longer exists. Open workflow settings and select it again.",
+                "The previously selected Inpaint mask option no longer exists. Open Workflow settings and select it again.",
                 "selected_mask_missing",
             )
 
@@ -3038,16 +3038,31 @@ class WorkflowAnalyzer:
                 [", ".join(missing_empty_ids[:10])],
             )
 
+        # Additional standard LoadImage nodes with no file stored in the API
+        # JSON cannot provide useful workflow content. Treat them as empty by
+        # default even when the settings window has never been opened. Main
+        # Photoshop and Reference targets are excluded through managed keys.
+        automatic_empty_input_ids: List[str] = []
+        for candidate in input_candidates:
+            if candidate.meta.get("grouped") or not candidate.meta.get("load_image"):
+                continue
+            source_value = str(candidate.meta.get("source_value") or "").strip()
+            candidate_target_keys = {
+                (target.node_id, target.input_name) for target in candidate.targets
+            }
+            if not source_value and not (candidate_target_keys & managed_target_keys):
+                automatic_empty_input_ids.append(candidate.id)
+
         output_override = str(overrides.get("output") or "")
         output_choice = self.find_candidate(output_candidates, output_override) if output_override else self.choose_unique_candidate(output_candidates)
         if output_override and not output_choice:
             self.error(
-                "The selected output node no longer exists. Open workflow settings and select it again.",
+                "The previously selected Output image no longer exists. Open Workflow settings and select it again.",
                 "selected_output_missing",
             )
         elif not output_choice and output_candidates:
             self.error(
-                "Several possible output nodes were found. Select the result node in workflow settings or tag it #PS-OUTPUT.",
+                "Several options were found for Output image. Select the required option in Workflow settings or add #PS-OUTPUT to the corresponding node title.",
                 "output_ambiguous",
             )
 
@@ -3059,22 +3074,22 @@ class WorkflowAnalyzer:
         if requested_size_mode == "binding":
             if not size_override:
                 self.error(
-                    "Size mode is set to selected width/height fields, but no size pair is selected.",
+                    "Width / height fields is selected under Size control, but no field pair is specified.",
                     "size_binding_required",
                 )
             else:
                 size_choice = self.find_candidate(size_candidates, size_override)
                 if not size_choice:
                     self.error(
-                        "The selected width/height fields no longer exist. Open workflow settings and select them again.",
+                        "The previously selected Width / height fields pair no longer exists. Open Workflow settings and select it again.",
                         "selected_size_missing",
                     )
         elif requested_size_mode == "auto":
             size_choice = self.choose_unique_candidate(size_candidates)
             if not size_choice and size_candidates:
                 self.warning(
-                    "Several possible width/height pairs were found. Automatic mode will use the input image size. "
-                    "Select a pair explicitly in workflow settings if the workflow requires fixed size fields.",
+                    "Several options were found for Width / height fields. Automatic Size control will use Input image size. "
+                    "If the workflow requires specific fields to be changed, select a pair manually.",
                     "size_ambiguous",
                 )
 
@@ -3090,13 +3105,13 @@ class WorkflowAnalyzer:
 
         if not input_choice and not main_input_candidates:
             self.error(
-                "No image input node was found. Add #PS-INPUT to its title.",
+                "No node was found that can use the Photoshop image role. Add #PS-INPUT to the required node title.",
                 "input_not_found",
             )
 
         if not output_choice and not output_candidates:
             self.error(
-                "No output node was found. Add #PS-OUTPUT to Save/Preview Image.",
+                "No option was found for Output image. Add #PS-OUTPUT to the required Save Image or Preview Image node title.",
                 "output_not_found",
             )
 
@@ -3111,8 +3126,8 @@ class WorkflowAnalyzer:
             and not self.input_drives_sampler_latent(input_choice, primary_sampler)
         ):
             self.warning(
-                "No editable width/height pair was found. The script will send a correctly sized JPEG, "
-                "but the final size depends on workflow logic.",
+                "No option was found for Width / height fields. The script will send a correctly sized Photoshop image, "
+                "but the final size depends on the workflow logic.",
                 "size_not_found",
             )
 
@@ -3170,6 +3185,7 @@ class WorkflowAnalyzer:
             "has_size_binding": bool(size_choice),
             "input_review_required": input_review_required,
             "input_review_message": input_review_message if input_review_required else "",
+            "automatic_empty_inputs": automatic_empty_input_ids,
             "bindings": bindings,
             "controls": controls,
             "recommended_controls": [item["id"] for item in controls if item.get("recommended")],
@@ -3447,12 +3463,25 @@ class WorkflowPatcher:
         self.generated_seeds: Dict[str, int] = {}
         # Неприменённые необязательные параметры не должны теряться молча.
         # Список возвращается Photoshop вместе с успешным результатом.
-        self.warnings: List[str] = []
+        self.warnings: List[Dict[str, Any]] = []
 
-    def warning(self, message: str) -> None:
+    def warning(
+        self,
+        message: str,
+        code: str = "",
+        params: Optional[Sequence[Any]] = None,
+    ) -> None:
         normalized = str(message or "").strip()
-        if normalized and normalized not in self.warnings:
-            self.warnings.append(normalized)
+        if not normalized:
+            return
+        if any(str(item.get("message") or "") == normalized for item in self.warnings):
+            return
+        item: Dict[str, Any] = {"message": normalized}
+        if code:
+            item["code"] = code
+        if params:
+            item["params"] = [str(value) for value in params]
+        self.warnings.append(item)
 
     def _resolve_target(self, target: Dict[str, str]) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
         """Возвращает (node, input_name, inputs) и централизованно проверяет binding.
@@ -3736,8 +3765,8 @@ class WorkflowPatcher:
 
         if not rewired:
             raise UserVisibleError(
-                "The selected Main LoadImage MASK output is no longer connected. "
-                "Reanalyze the workflow."
+                "The selected Inpaint mask is no longer used by the workflow. "
+                "Reanalyze the workflow or fix the MASK connections in ComfyUI."
             )
 
         self.workflow[runtime_node_id] = {
@@ -3831,7 +3860,8 @@ class WorkflowPatcher:
                 self.warning(
                     "Automatic width/height binding was skipped because it cannot accept the requested Photoshop size:\n• "
                     + details
-                    + "\nThe input image size is used instead."
+                    + "\nThe input image size is used instead.",
+                    "generation_size_binding_skipped",
                 )
                 apply_dimensions = False
             else:
@@ -3860,7 +3890,9 @@ class WorkflowPatcher:
                 if control_id in control_values:
                     self.warning(
                         f"Parameter {control_id} was not applied: the schema has no target inputs. "
-                        "Reanalyze the workflow."
+                        "Reanalyze the workflow.",
+                        "generation_parameter_no_targets",
+                        [control_id],
                     )
                 continue
             supplied = control_id in control_values and str(control_values[control_id]).strip().lower() not in {"", "random", "-1"}
@@ -3876,7 +3908,9 @@ class WorkflowPatcher:
             if not control:
                 self.warning(
                     f"Parameter {control_id} was not applied: it is missing from the current schema. "
-                    "Reanalyze the workflow."
+                    "Reanalyze the workflow.",
+                    "generation_parameter_missing",
+                    [control_id],
                 )
                 continue
             if self._control_is_seed(control):
@@ -3885,7 +3919,9 @@ class WorkflowPatcher:
             if not targets:
                 self.warning(
                     f"Parameter {control_id} was not applied: the schema has no target inputs. "
-                    "Reanalyze the workflow."
+                    "Reanalyze the workflow.",
+                    "generation_parameter_no_targets",
+                    [control_id],
                 )
                 continue
             for target in targets:
@@ -5904,7 +5940,7 @@ def select_output_image(
     node_output = outputs.get(node_id)
     if not isinstance(node_output, dict):
         raise UserVisibleError(
-            f"The workflow completed, but selected output node #{node_id} is missing from history."
+            f"The workflow completed, but the selected Output image node #{node_id} is missing from history."
         )
 
     images = node_output.get("images")
@@ -6335,19 +6371,20 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     if inpaint_mode:
         if not isinstance(mask_binding, dict) or not mask_binding.get("mode"):
             raise UserVisibleError(
-                "No mask input is configured for this workflow. Open workflow settings "
-                "and select the main LoadImage MASK or a LoadImageMask node."
+                "No suitable option was found for Inpaint mask. In Workflow settings, "
+                "select the main LoadImage MASK or a LoadImageMask node."
             )
         if str(mask_binding.get("mode")) != inpaint_mode:
             raise UserVisibleError("The workflow mask configuration changed. Reopen the main script window.")
         if not mask_binding.get("connected"):
             if inpaint_mode == "input_alpha":
                 raise UserVisibleError(
-                    "The workflow does not use the main LoadImage MASK output. Connect MASK "
-                    "to the inpaint branch or select a LoadImageMask node in workflow settings."
+                    "The main LoadImage MASK is not used by the workflow. Connect its MASK output "
+                    "to the inpaint branch in ComfyUI or select another Inpaint mask option."
                 )
             raise UserVisibleError(
-                "The selected LoadImageMask node is not connected to the workflow. Connect its MASK output to the inpaint branch."
+                "The selected LoadImageMask MASK is not used by the workflow. Connect its MASK output "
+                "to the inpaint branch in ComfyUI or select another Inpaint mask option."
             )
 
     # Если JSX/другой клиент не передал dimensions и workflow наследует размер
@@ -6392,7 +6429,24 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         raise_if_generation_cancelled(request_id)
 
     uploaded_references: Dict[str, Dict[str, Any]] = {}
-    generation_warnings: List[str] = []
+    generation_warnings: List[Dict[str, Any]] = []
+    def add_generation_warning(
+        message: str,
+        code: str = "",
+        params: Optional[Sequence[Any]] = None,
+    ) -> None:
+        normalized = str(message or "").strip()
+        if not normalized or any(
+            str(item.get("message") or "") == normalized for item in generation_warnings
+        ):
+            return
+        item: Dict[str, Any] = {"message": normalized}
+        if code:
+            item["code"] = code
+        if params:
+            item["params"] = [str(value) for value in params]
+        generation_warnings.append(item)
+
     valid_reference_ids = {
         str(item.get("id"))
         for item in analysis.get("bindings", {}).get("reference_images", [])
@@ -6400,26 +6454,34 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     }
     for reference_index, reference in enumerate(reference_files):
         if not isinstance(reference, dict):
-            generation_warnings.append(
-                f"Reference #{reference_index + 1} was not applied: invalid file metadata."
+            add_generation_warning(
+                f"Reference #{reference_index + 1} was not applied: invalid file metadata.",
+                "generation_reference_invalid",
+                [reference_index + 1],
             )
             continue
         binding_id = str(reference.get("binding_id") or "")
         reference_path = Path(str(reference.get("path") or ""))
         if not binding_id:
-            generation_warnings.append(
-                f"Reference #{reference_index + 1} was not applied: binding_id is missing."
+            add_generation_warning(
+                f"Reference #{reference_index + 1} was not applied: binding_id is missing.",
+                "generation_reference_binding_missing",
+                [reference_index + 1],
             )
             continue
         if binding_id not in valid_reference_ids:
-            generation_warnings.append(
+            add_generation_warning(
                 f"Reference {binding_id} was not applied: the input is missing from the current schema. "
-                "Reanalyze the workflow."
+                "Reanalyze the workflow.",
+                "generation_reference_input_missing",
+                [binding_id],
             )
             continue
         if not reference_path.is_file():
-            generation_warnings.append(
-                f"Reference {binding_id} was not applied: file not found ({reference_path})."
+            add_generation_warning(
+                f"Reference {binding_id} was not applied: file not found ({reference_path}).",
+                "generation_reference_file_missing",
+                [binding_id, reference_path],
             )
             continue
         suffix = reference_path.suffix or ".jpg"
@@ -6446,12 +6508,24 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         and str(item.get("id") or "") not in uploaded_references
     ]
     if isinstance(overrides, dict) and "empty_inputs" in overrides:
+        selected_empty_ids = list(overrides.get("empty_inputs") or [])
+        for automatic_empty_id in analysis.get("automatic_empty_inputs", []):
+            if automatic_empty_id not in selected_empty_ids:
+                selected_empty_ids.append(automatic_empty_id)
         neutralized_inputs = _selected_empty_load_image_candidates(
-            analysis, overrides.get("empty_inputs") or []
+            analysis, selected_empty_ids
         )
     else:
         # Backward compatibility for old JSX, saved profiles and Actions.
         neutralized_inputs = _unselected_load_image_candidates(analysis) if ignore_unselected_load_images else []
+        automatic_empty_ids = analysis.get("automatic_empty_inputs", [])
+        if automatic_empty_ids:
+            existing_ids = {str(item.get("id") or "") for item in neutralized_inputs}
+            neutralized_inputs.extend(
+                item
+                for item in _selected_empty_load_image_candidates(analysis, automatic_empty_ids)
+                if str(item.get("id") or "") not in existing_ids
+            )
 
     neutral_image: Optional[Dict[str, Any]] = None
     if missing_selected_references or neutralized_inputs:
@@ -6476,11 +6550,17 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         request_id=request_id,
         size_selection_mode=str(analysis.get("size_selection_mode") or "auto"),
     )
-    for warning_message in patcher.warnings:
-        if warning_message not in generation_warnings:
-            generation_warnings.append(warning_message)
-    for warning_message in generation_warnings:
-        LOGGER.warning("Generation parameter was not applied: %s", warning_message)
+    for warning_item in patcher.warnings:
+        add_generation_warning(
+            str(warning_item.get("message") or ""),
+            str(warning_item.get("code") or ""),
+            warning_item.get("params") if isinstance(warning_item.get("params"), list) else None,
+        )
+    for warning_item in generation_warnings:
+        LOGGER.warning(
+            "Generation parameter was not applied: %s",
+            warning_item.get("message"),
+        )
 
     raise_if_generation_cancelled(request_id)
     client_id = "photoshop-" + uuid.uuid4().hex
