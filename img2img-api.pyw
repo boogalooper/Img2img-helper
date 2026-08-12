@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 2
-VERSION = "0.189"
+VERSION = "0.190"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "f27d2473-4ff3-4638-9334-344ee306054d"
+ANALYZER_UUID = "019af055-f845-432e-990c-0ad7a183d1f6"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -2920,6 +2920,15 @@ class WorkflowAnalyzer:
             self.warning(input_review_message)
 
         mask_candidates = self.mask_candidates(input_choice)
+        # The settings dialog can switch the main input without closing and
+        # reanalyzing the workflow. Return the mask candidates for every
+        # possible main input so JSX can rebuild Main LoadImage MASK
+        # immediately. The ordinary mask list remains for compatibility and
+        # represents the input selected for this analysis.
+        mask_candidates_by_input = {
+            candidate.id: [item.to_dict() for item in self.mask_candidates(candidate)]
+            for candidate in main_input_candidates
+        }
         mask_override = str(overrides.get("mask") or "")
         mask_choice = self.choose_mask_candidate(mask_candidates, mask_override)
         if mask_override and not mask_choice:
@@ -3058,6 +3067,7 @@ class WorkflowAnalyzer:
             "candidates": {
                 "input": [item.to_dict() for item in input_candidates],
                 "mask": [item.to_dict() for item in mask_candidates],
+                "mask_by_input": mask_candidates_by_input,
                 "reference": [item.to_dict() for item in input_candidates],
                 "output": [item.to_dict() for item in output_candidates],
                 "size": [item.to_dict() for item in size_candidates],
