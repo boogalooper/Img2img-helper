@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 2
-VERSION = "0.191"
+VERSION = "0.192"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "d62b1218-eb3d-4b80-869e-d8598cf70056"
+ANALYZER_UUID = "e38ea4da-e4f8-4596-a4ec-ece879da9c60"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -1831,7 +1831,7 @@ class WorkflowAnalyzer:
         self.workflow = workflow
         self.schema = ObjectInfoSchema(object_info)
         self.graph = WorkflowGraph(workflow)
-        self.diagnostics: List[Dict[str, str]] = []
+        self.diagnostics: List[Dict[str, Any]] = []
 
 
     def validate_api_format(self) -> None:
@@ -1859,7 +1859,11 @@ class WorkflowAnalyzer:
             )
         if missing_classes:
             for class_type in sorted(missing_classes):
-                self.error(f"The ComfyUI node is not installed: {class_type}")
+                self.error(
+                    f"The ComfyUI node is not installed: {class_type}",
+                    "missing_node_class",
+                    [class_type],
+                )
 
     def node_title(self, node_id: str) -> str:
         node = self.workflow.get(str(node_id), {})
@@ -1890,17 +1894,31 @@ class WorkflowAnalyzer:
             return f"{title} — {class_type} [#{node_id}]"
         return f"{class_type} [#{node_id}]"
 
-    def info(self, message: str) -> None:
+    def _add_diagnostic(
+        self,
+        level: str,
+        message: str,
+        code: str = "",
+        params: Optional[Sequence[Any]] = None,
+    ) -> None:
+        item: Dict[str, Any] = {"level": level, "message": message}
+        if code:
+            item["code"] = code
+        if params:
+            item["params"] = [str(value) for value in params]
+        self.diagnostics.append(item)
+
+    def info(self, message: str, code: str = "", params: Optional[Sequence[Any]] = None) -> None:
         LOGGER.info("Workflow analysis: %s", message)
-        self.diagnostics.append({"level": "info", "message": message})
+        self._add_diagnostic("info", message, code, params)
 
-    def warning(self, message: str) -> None:
+    def warning(self, message: str, code: str = "", params: Optional[Sequence[Any]] = None) -> None:
         LOGGER.warning("Workflow analysis: %s", message)
-        self.diagnostics.append({"level": "warning", "message": message})
+        self._add_diagnostic("warning", message, code, params)
 
-    def error(self, message: str) -> None:
+    def error(self, message: str, code: str = "", params: Optional[Sequence[Any]] = None) -> None:
         LOGGER.error("Workflow analysis: %s", message)
-        self.diagnostics.append({"level": "error", "message": message})
+        self._add_diagnostic("error", message, code, params)
 
 
     def input_candidates(self) -> List[Candidate]:
@@ -2658,7 +2676,9 @@ class WorkflowAnalyzer:
                     self.warning(
                         f"Sampler #{node_id} contains several inputs matching {semantic_id}: "
                         + ", ".join(matching_inputs)
-                        + f". {matching_inputs[0]} is used as the standard control; the others remain available as advanced fields."
+                        + f". {matching_inputs[0]} is used as the standard control; the others remain available as advanced fields.",
+                        "sampler_inputs_ambiguous",
+                        [node_id, semantic_id, ", ".join(matching_inputs), matching_inputs[0]],
                     )
                 for input_name in matching_inputs:
                     value = inputs[input_name]
@@ -2755,7 +2775,9 @@ class WorkflowAnalyzer:
                 if len(prompt_candidates) > 1 and prompt_candidates[0][0] == prompt_candidates[1][0]:
                     self.warning(
                         f"Several equivalent {semantic_id.replace('_', ' ')} fields were found upstream of sampler #{primary_sampler}. "
-                        "The first deterministic match is used; rename or tag the intended node to make the workflow unambiguous."
+                        "The first deterministic match is used; rename or tag the intended node to make the workflow unambiguous.",
+                        "prompt_fields_ambiguous",
+                        [semantic_id.replace("_", " "), primary_sampler],
                     )
                 target = prompt_candidates[0][1]
                 target_key = (target.node_id, target.input_name)
@@ -2879,45 +2901,64 @@ class WorkflowAnalyzer:
         tagged = [candidate for candidate in candidates if candidate.meta.get("tagged")]
         return tagged[0] if len(tagged) == 1 else None
 
+    @staticmethod
+    def choose_preferred_input_candidate(candidates: List[Candidate]) -> Optional[Candidate]:
+        """Choose one Photoshop source while preserving deterministic priority.
+
+        Explicit #PS-INPUT grouping/tagging wins. Without tags, semantic score,
+        numeric node id and label provide a stable automatic default. Other
+        LoadImage nodes keep their workflow or reference roles and remain
+        editable in the JSX settings.
+        """
+
+        if not candidates:
+            return None
+        grouped = [candidate for candidate in candidates if candidate.meta.get("grouped")]
+        if len(grouped) == 1:
+            return grouped[0]
+        tagged = [candidate for candidate in candidates if candidate.meta.get("tagged")]
+        if len(tagged) == 1:
+            return tagged[0]
+        def priority(candidate: Candidate) -> Tuple[int, int, str]:
+            node_id = str(candidate.meta.get("node_id") or "")
+            numeric_node_id = int(node_id) if node_id.isdigit() else 2**31 - 1
+            return (-int(candidate.score), numeric_node_id, candidate.label.lower())
+
+        return sorted(candidates, key=priority)[0]
+
     def analyze(self, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         overrides = overrides or {}
         self.validate_api_format()
 
         input_candidates = self.input_candidates()
-        load_image_node_ids = sorted({
-            str(candidate.meta.get("node_id") or "")
-            for candidate in input_candidates
-            if candidate.meta.get("load_image") and not candidate.meta.get("grouped")
-            and candidate.meta.get("node_id")
-        })
         output_candidates = self.output_candidates()
         size_candidates = self.size_candidates()
         scored_sampler_candidates = self.sampler_candidates()
         sampler_candidates = [node_id for _score, node_id in scored_sampler_candidates]
 
+        # A source that actually feeds the primary sampler latent branch is a
+        # better automatic Photoshop input than a detached/reference loader.
+        primary_sampler = sampler_candidates[0] if sampler_candidates else None
+
         main_input_candidates = [item for item in input_candidates if not item.meta.get("reference")] or input_candidates
         input_override = str(overrides.get("input") or "")
-        multiple_load_images_unassigned = len(load_image_node_ids) > 1 and not input_override
-        input_review_message = (
-            "The workflow contains more than one LoadImage node. Open workflow settings and explicitly select "
-            "the main input and any reference inputs."
-        ) if multiple_load_images_unassigned else ""
-        input_choice = self.find_candidate(input_candidates, input_override) if input_override else self.choose_unique_candidate(main_input_candidates)
+        sampler_input_candidates = [
+            item
+            for item in main_input_candidates
+            if primary_sampler and self.input_drives_sampler_latent(item, primary_sampler)
+        ]
+        input_choice = (
+            self.find_candidate(input_candidates, input_override)
+            if input_override
+            else self.choose_preferred_input_candidate(sampler_input_candidates or main_input_candidates)
+        )
         input_review_required = False
+        input_review_message = ""
         if input_override and not input_choice:
-            self.error("The selected image input no longer exists. Open workflow settings and select it again.")
-        elif not input_choice and main_input_candidates:
-            # Do not emit a warning and then a second error for the same LoadImage ambiguity.
-            # A blocking ambiguity is represented by this single, actionable error.
-            if multiple_load_images_unassigned:
-                self.error(input_review_message)
-            else:
-                self.error("Several possible image inputs were found. Select the main input in workflow settings or tag it #PS-INPUT.")
-        elif multiple_load_images_unassigned:
-            # Tags/grouping may make the workflow valid automatically, but with multiple
-            # standard LoadImage nodes the user is still asked once to review the mapping.
-            input_review_required = True
-            self.warning(input_review_message)
+            self.error(
+                "The selected image input no longer exists. Open workflow settings and select it again.",
+                "selected_input_missing",
+            )
 
         mask_candidates = self.mask_candidates(input_choice)
         # The settings dialog can switch the main input without closing and
@@ -2932,7 +2973,10 @@ class WorkflowAnalyzer:
         mask_override = str(overrides.get("mask") or "")
         mask_choice = self.choose_mask_candidate(mask_candidates, mask_override)
         if mask_override and not mask_choice:
-            self.error("The selected inpaint mask input no longer exists. Open workflow settings and select it again.")
+            self.error(
+                "The selected inpaint mask input no longer exists. Open workflow settings and select it again.",
+                "selected_mask_missing",
+            )
 
         reference_ids = overrides.get("references") if isinstance(overrides.get("references"), list) else []
         reference_choices: List[Candidate] = []
@@ -2948,7 +2992,9 @@ class WorkflowAnalyzer:
         if missing_reference_ids:
             self.warning(
                 "Some selected reference inputs no longer exist and were ignored: "
-                + ", ".join(missing_reference_ids[:10])
+                + ", ".join(missing_reference_ids[:10]),
+                "selected_references_missing",
+                [", ".join(missing_reference_ids[:10])],
             )
 
         # Explicit per-LoadImage empty roles replace the former global
@@ -2970,7 +3016,9 @@ class WorkflowAnalyzer:
                 continue
             if not empty_candidate.meta.get("load_image"):
                 self.error(
-                    f"{empty_candidate.label} cannot use the empty-image role because it is not a standard LoadImage node."
+                    f"{empty_candidate.label} cannot use the empty-image role because it is not a standard LoadImage node.",
+                    "empty_role_unsupported",
+                    [empty_candidate.label],
                 )
                 continue
             empty_target_keys = {
@@ -2978,20 +3026,30 @@ class WorkflowAnalyzer:
             }
             if empty_target_keys & managed_target_keys:
                 self.error(
-                    f"{empty_candidate.label} has conflicting image roles. Choose only one role in workflow settings."
+                    f"{empty_candidate.label} has conflicting image roles. Choose only one role in workflow settings.",
+                    "image_role_conflict",
+                    [empty_candidate.label],
                 )
         if missing_empty_ids:
             self.warning(
                 "Some LoadImage empty roles no longer exist and were ignored: "
-                + ", ".join(missing_empty_ids[:10])
+                + ", ".join(missing_empty_ids[:10]),
+                "empty_roles_missing",
+                [", ".join(missing_empty_ids[:10])],
             )
 
         output_override = str(overrides.get("output") or "")
         output_choice = self.find_candidate(output_candidates, output_override) if output_override else self.choose_unique_candidate(output_candidates)
         if output_override and not output_choice:
-            self.error("The selected output node no longer exists. Open workflow settings and select it again.")
+            self.error(
+                "The selected output node no longer exists. Open workflow settings and select it again.",
+                "selected_output_missing",
+            )
         elif not output_choice and output_candidates:
-            self.error("Several possible output nodes were found. Select the result node in workflow settings or tag it #PS-OUTPUT.")
+            self.error(
+                "Several possible output nodes were found. Select the result node in workflow settings or tag it #PS-OUTPUT.",
+                "output_ambiguous",
+            )
 
         requested_size_mode = str(overrides.get("size_mode") or "auto").lower()
         if requested_size_mode not in {"auto", "source_image", "binding"}:
@@ -3000,34 +3058,47 @@ class WorkflowAnalyzer:
         size_choice: Optional[Candidate] = None
         if requested_size_mode == "binding":
             if not size_override:
-                self.error("Size mode is set to selected width/height fields, but no size pair is selected.")
+                self.error(
+                    "Size mode is set to selected width/height fields, but no size pair is selected.",
+                    "size_binding_required",
+                )
             else:
                 size_choice = self.find_candidate(size_candidates, size_override)
                 if not size_choice:
-                    self.error("The selected width/height fields no longer exist. Open workflow settings and select them again.")
+                    self.error(
+                        "The selected width/height fields no longer exist. Open workflow settings and select them again.",
+                        "selected_size_missing",
+                    )
         elif requested_size_mode == "auto":
             size_choice = self.choose_unique_candidate(size_candidates)
             if not size_choice and size_candidates:
                 self.warning(
                     "Several possible width/height pairs were found. Automatic mode will use the input image size. "
-                    "Select a pair explicitly in workflow settings if the workflow requires fixed size fields."
+                    "Select a pair explicitly in workflow settings if the workflow requires fixed size fields.",
+                    "size_ambiguous",
                 )
 
         # Primary sampler определяется анализатором автоматически. Все найденные
         # sampler-контролы всё равно выводятся отдельно; неоднозначность влияет
         # только на то, какой sampler считается главным и получает короткие ID.
-        primary_sampler = sampler_candidates[0] if sampler_candidates else None
         if len(scored_sampler_candidates) > 1 and scored_sampler_candidates[0][0] == scored_sampler_candidates[1][0]:
             self.warning(
                 "Several equivalent sampler nodes were found. The first deterministic node is treated as primary. "
-                "Add #PS-MAIN to the intended sampler title to make the choice explicit."
+                "Add #PS-MAIN to the intended sampler title to make the choice explicit.",
+                "sampler_ambiguous",
             )
 
         if not input_choice and not main_input_candidates:
-            self.error("No image input node was found. Add #PS-INPUT to its title.")
+            self.error(
+                "No image input node was found. Add #PS-INPUT to its title.",
+                "input_not_found",
+            )
 
         if not output_choice and not output_candidates:
-            self.error("No output node was found. Add #PS-OUTPUT to Save/Preview Image.")
+            self.error(
+                "No output node was found. Add #PS-OUTPUT to Save/Preview Image.",
+                "output_not_found",
+            )
 
         # В source_image и в неоднозначном auto-режиме width/height не меняются.
         # Photoshop всё равно экспортирует JPEG нужного размера; дальнейшее
@@ -3041,11 +3112,15 @@ class WorkflowAnalyzer:
         ):
             self.warning(
                 "No editable width/height pair was found. The script will send a correctly sized JPEG, "
-                "but the final size depends on workflow logic."
+                "but the final size depends on workflow logic.",
+                "size_not_found",
             )
 
         if not primary_sampler:
-            self.warning("The primary sampler was not recognized; standard parameters may be incomplete.")
+            self.warning(
+                "The primary sampler was not recognized; standard parameters may be incomplete.",
+                "sampler_not_found",
+            )
 
         controls = self.discover_controls(primary_sampler)
         bindings: Dict[str, Any] = {}

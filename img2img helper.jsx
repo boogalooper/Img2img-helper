@@ -15,7 +15,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 $.localize = true; // ScriptUI/Photoshop автоматически локализует объекты Locale.
-//$.locale = 'ru'
+$.locale = 'ru'
 var APP = {
 	name: "img2img helper",
 	uuid: "5f6f57dc-80c8-49b4-9ea9-405d132b7b30",
@@ -33,13 +33,13 @@ var APP = {
 	},
 	cache: {
 		schemaVersion: 1,
-		comfyAnalysisUuid: "d62b1218-eb3d-4b80-869e-d8598cf70056",
+		comfyAnalysisUuid: "e38ea4da-e4f8-4596-a4ec-ece879da9c60",
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.186",
+	VER = "0.188",
 	// true всегда открывает окно и отключает распознавание Actions.
-	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = true,
+	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
 	API_HOST = "127.0.0.1",
 	API_PORT_SEND = 6370,
@@ -290,6 +290,37 @@ function errorMessageText(value) {
 	if (value.message !== undefined) return String(value.message);
 	return String(value);
 }
+function workflowDiagnosticText(item) {
+	item = item && typeof item == "object" ? item : {};
+	var sourceMessage = String(item.message || ""),
+		code = String(item.code || legacyWorkflowDiagnosticCode(sourceMessage)), template = code && str[code] !== undefined
+		? String(str[code])
+		: sourceMessage,
+		params = item.params instanceof Array ? item.params : [];
+	if (!params.length && code == "missing_node_class")
+		params = [sourceMessage.substring(sourceMessage.lastIndexOf(":") + 1).replace(/^\s+|\s+$/g, "")];
+	for (var i = 0; i < params.length; i++)
+		template = template.split("%" + (i + 1)).join(String(params[i]));
+	return template;
+}
+function legacyWorkflowDiagnosticCode(message) {
+	message = String(message || "");
+	if (message.indexOf("The workflow contains more than one LoadImage node.") == 0) return "multiple_load_images_legacy";
+	if (message.indexOf("The ComfyUI node is not installed:") == 0) return "missing_node_class";
+	if (message.indexOf("The selected image input no longer exists.") == 0) return "selected_input_missing";
+	if (message.indexOf("The selected inpaint mask input no longer exists.") == 0) return "selected_mask_missing";
+	if (message.indexOf("The selected output node no longer exists.") == 0) return "selected_output_missing";
+	if (message.indexOf("Several possible output nodes were found.") == 0) return "output_ambiguous";
+	if (message.indexOf("Size mode is set to selected width/height fields") == 0) return "size_binding_required";
+	if (message.indexOf("The selected width/height fields no longer exist.") == 0) return "selected_size_missing";
+	if (message.indexOf("Several possible width/height pairs were found.") == 0) return "size_ambiguous";
+	if (message.indexOf("Several equivalent sampler nodes were found.") == 0) return "sampler_ambiguous";
+	if (message.indexOf("No image input node was found.") == 0) return "input_not_found";
+	if (message.indexOf("No output node was found.") == 0) return "output_not_found";
+	if (message.indexOf("No editable width/height pair was found.") == 0) return "size_not_found";
+	if (message.indexOf("The primary sampler was not recognized") == 0) return "sampler_not_found";
+	return "";
+}
 function itemData(source) {
 	var objectItem = source && typeof source == "object",
 		label = objectItem ? (source.label !== undefined ? source.label : source.value) : source,
@@ -483,7 +514,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		}
 		state.notices = [];
 		for (i = 0; i < diagnostics.length; i++) {
-			var diagnosticText = String(diagnostics[i].message || ""),
+			var diagnosticText = workflowDiagnosticText(diagnostics[i]),
 				level = String(diagnostics[i].level || "").toLowerCase();
 			if (!diagnosticText) continue;
 			if (level == "error") errors.push(diagnosticText);
@@ -1264,9 +1295,7 @@ function mainDialog(selection, initial, responseSeconds) {
 				sizeValue: resolveProfileSizeMultiple(schema, profile),
 				isRequired: isRequiredForgeControl,
 				itemLabel: function (definition, required) {
-					var suffix = required
-						? str.alwaysVisible
-						: (arrayContains(schema.recommended_controls || [], definition.id) ? str.recommendedSingle : "");
+					var suffix = required ? str.alwaysVisible : "";
 					return forgeSettingsGroup(definition).label + " · " + ui.label(definition) +
 						"  [" + definition.id + "]" + (suffix ? " — " + suffix : "");
 				},
@@ -1290,6 +1319,11 @@ function mainDialog(selection, initial, responseSeconds) {
 			inputCandidates = candidates.input || [],
 			roleCandidates = [],
 			roleById = {},
+			storedMainId = String(profile.bindingOverrides.input || ""),
+			automaticInputTargets = schema && schema.bindings && schema.bindings.input_image instanceof Array
+				? schema.bindings.input_image : [],
+			automaticReferenceBindings = schema && schema.bindings && schema.bindings.reference_images instanceof Array
+				? schema.bindings.reference_images : [],
 			rolesPanel = parent.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
 		rolesPanel.text = str.imageInputRoles;
 		var roleList = rolesPanel.add("listbox"),
@@ -1321,6 +1355,16 @@ function mainDialog(selection, initial, responseSeconds) {
 			for (var i = 0; i < targets.length; i++)
 				res[String(targets[i].node_id || "") + ":" + String(targets[i].input || "")] = true;
 			return res;
+		}
+		function targetsEqual(candidate, targets) {
+			var first = targetKeys(candidate), second = targetKeys({ targets: targets }), key,
+				firstCount = 0, secondCount = 0;
+			for (key in first) if (first.hasOwnProperty(key)) firstCount++;
+			for (key in second) if (second.hasOwnProperty(key)) {
+				secondCount++;
+				if (!first[key]) return false;
+			}
+			return firstCount == secondCount && firstCount > 0;
 		}
 		function selectedMainCandidates() {
 			var res = [];
@@ -1358,10 +1402,6 @@ function mainDialog(selection, initial, responseSeconds) {
 			var meta = candidate && candidate.meta ? candidate.meta : {};
 			return String(meta.source_value === undefined || meta.source_value === null ? "" : meta.source_value);
 		}
-		function baseFileName(path) {
-			path = String(path || "").replace(/\\/g, "/");
-			return path ? path.substring(path.lastIndexOf("/") + 1) : "";
-		}
 		function roleLabel(role) {
 			if (role == "photoshop") return str.rolePhotoshop;
 			if (role == "reference") return str.roleReference;
@@ -1369,7 +1409,9 @@ function mainDialog(selection, initial, responseSeconds) {
 			return str.roleWorkflowFile;
 		}
 		function initializeRoles() {
-			var main = candidateById(inputCandidates, profile.bindingOverrides.input),
+			var main = storedMainId
+					? candidateById(inputCandidates, storedMainId)
+					: (automaticInputTargets.length ? { targets: automaticInputTargets } : null),
 				referenceIds = profile.bindingOverrides.references || [],
 				emptyIds = profile.bindingOverrides.emptyInputs || [], i, j, candidate, selected;
 			for (i = 0; i < inputCandidates.length; i++)
@@ -1383,6 +1425,12 @@ function mainDialog(selection, initial, responseSeconds) {
 					selected = candidateById(inputCandidates, referenceIds[j]);
 					if (selected && candidatesOverlap(selected, candidate)) roleById[candidate.id] = "reference";
 				}
+				if (!referenceIds.length && roleById[candidate.id] != "photoshop")
+					for (j = 0; j < automaticReferenceBindings.length; j++)
+						if (candidatesOverlap(candidate, { targets: automaticReferenceBindings[j].targets || [] })) {
+							roleById[candidate.id] = "reference";
+							break;
+						}
 				for (j = 0; j < emptyIds.length; j++) {
 					selected = candidateById(inputCandidates, emptyIds[j]);
 					if (selected && candidatesOverlap(selected, candidate)) roleById[candidate.id] = "empty";
@@ -1393,11 +1441,12 @@ function mainDialog(selection, initial, responseSeconds) {
 			roleList.removeAll();
 			var selectedIndex = 0;
 			for (var i = 0; i < roleCandidates.length; i++) {
-				var candidate = roleCandidates[i], source = workflowSource(candidate),
-					fileLabel = baseFileName(source) || str.fileNotSpecified,
-					item = roleList.add("item", displayCandidateName(candidate) + "  —  " + roleLabel(roleById[candidate.id]) + "  —  " + fileLabel);
+				var candidate = roleCandidates[i], role = roleById[candidate.id],
+					label = displayCandidateName(candidate) + "  —  " + roleLabel(role),
+					item;
+				item = roleList.add("item", label);
 				item.candidateId = candidate.id;
-				item.helpTip = source || str.fileNotSpecified;
+				item.helpTip = "";
 				if (candidate.id == selectedId) selectedIndex = i;
 			}
 			if (roleList.items.length) roleList.selection = selectedIndex;
@@ -1424,9 +1473,11 @@ function mainDialog(selection, initial, responseSeconds) {
 			}
 			if (roleDropdown.items.length) roleDropdown.selection = selectedIndex;
 			roleDropdown.enabled = !!candidate;
-			var source = workflowSource(candidate);
-			workflowFile.text = str.workflowStoredFile + (source || str.fileNotSpecified);
-			workflowFile.helpTip = source || str.fileNotSpecified;
+			var source = workflowSource(candidate), showWorkflowFile = !!candidate && role == "workflow";
+			workflowFile.text = showWorkflowFile ? str.workflowStoredFile + (source || str.fileNotSpecified) : "";
+			workflowFile.helpTip = showWorkflowFile ? (source || str.fileNotSpecified) : "";
+			workflowFile.visible = showWorkflowFile;
+			try { rolesPanel.layout.layout(true); } catch (_) { }
 			roleEditorBusy = false;
 		}
 		function currentMaskCandidates() {
@@ -1535,7 +1586,8 @@ function mainDialog(selection, initial, responseSeconds) {
 				if (errors.length)
 					ui.showDiagnosticSummary({ title: str.workflowDiagnostics, errors: errors });
 				if (errors.length) return false;
-				profile.bindingOverrides.input = main ? main.id : "";
+				profile.bindingOverrides.input = main && (!storedMainId && targetsEqual(main, automaticInputTargets))
+					? "" : (main ? main.id : "");
 				profile.bindingOverrides.references = [];
 				profile.bindingOverrides.emptyInputs = [];
 				for (i = 0; i < roleCandidates.length; i++) {
@@ -3091,7 +3143,8 @@ function BackendRuntime() {
 			: { notices: [], emptyDropdownIds: [] };
 		res.notices = takeNotices().concat(validation.notices);
 		res.emptyDropdownIds = validation.emptyDropdownIds;
-		res.forceDialog = !!(res.notices.length || res.emptyDropdownIds.length);
+		res.forceDialog = !!(res.notices.length || res.emptyDropdownIds.length ||
+			(res.schema && !res.schema.valid));
 		return res;
 	}
 	this.loadInitialData = function (progress, allowFastPath) {
@@ -6340,12 +6393,32 @@ function Locale() {
 		forgeSchemaSettings: ["Настройки схемы Forge", "Forge schema settings"],
 		forgeSchemaSettingsNote: ["Поля сгруппированы по назначению. Скрытые поля используют значения по умолчанию из JSON-схемы. Модель и VAE / Text encoders всегда видимы.", "Fields are grouped by purpose. Hidden fields use defaults from the JSON schema. Model and VAE / Text encoders are always visible."],
 		alwaysVisible: ["всегда видно", "always visible"], backendLabel: ["Бэкенд", "Backend"], host: ["IP / хост:", "IP / host:"],
-		recommendedSingle: ["рекомендуется", "recommended"], schemaDefaultValue: ["Значение схемы: ", "Schema default: "],
+		schemaDefaultValue: ["Значение схемы: ", "Schema default: "],
 		forgeGroupModel: ["Модель", "Model"], forgeGroupPrompt: ["Промпты", "Prompts"], forgeGroupSampling: ["Сэмплинг", "Sampling"],
 		forgeGroupImage: ["Изображение", "Image"], forgeGroupAdvanced: ["Дополнительно", "Advanced"],
 		workflowDiagnostics: ["Проверка workflow", "Workflow validation"], generationDiagnostics: ["Результат генерации", "Generation result"],
 		diagnosticsErrors: ["Необходимо исправить:", "Must be fixed:"], diagnosticsWarnings: ["Обратите внимание:", "Please note:"],
 		diagnosticsNeedAttention: ["Обнаружены проблемы", "Problems found"], diagnosticsInformation: ["Информация", "Information"],
+		multiple_load_images_legacy: ["Запущенная версия Python API всё ещё использует прежнюю проверку нескольких LoadImage. Завершите процесс img2img-api и снова запустите скрипт — после перезапуска одна входная нода будет выбрана автоматически.", "The running Python API still uses the previous multiple-LoadImage validation. Stop the img2img-api process and run the script again; one input node will then be selected automatically."],
+		missing_node_class: ["В ComfyUI не установлена нода: %1", "The ComfyUI node is not installed: %1"],
+		sampler_inputs_ambiguous: ["В сэмплере #%1 найдено несколько входов типа %2: %3. В качестве основного используется %4; остальные доступны как дополнительные поля.", "Sampler #%1 contains several inputs matching %2: %3. %4 is used as the standard control; the others remain available as advanced fields."],
+		prompt_fields_ambiguous: ["Перед сэмплером #%2 найдено несколько равнозначных полей %1. Использовано первое найденное поле; чтобы выбрать другое, переименуйте нужную ноду или добавьте метку.", "Several equivalent %1 fields were found upstream of sampler #%2. The first deterministic match is used; rename or tag the intended node to make the workflow unambiguous."],
+		selected_input_missing: ["Ранее выбранная входная нода изображения больше не существует. Откройте настройки workflow и выберите её заново.", "The selected image input no longer exists. Open workflow settings and select it again."],
+		selected_mask_missing: ["Ранее выбранный вход маски больше не существует. Откройте настройки workflow и выберите его заново.", "The selected inpaint mask input no longer exists. Open workflow settings and select it again."],
+		selected_references_missing: ["Некоторые выбранные входы референсов больше не существуют и были пропущены: %1", "Some selected reference inputs no longer exist and were ignored: %1"],
+		empty_role_unsupported: ["%1: роль «Пустое изображение» поддерживается только стандартной нодой LoadImage.", "%1 cannot use the empty-image role because it is not a standard LoadImage node."],
+		image_role_conflict: ["%1 имеет конфликтующие назначения. Выберите для ноды только одну роль в настройках workflow.", "%1 has conflicting image roles. Choose only one role in workflow settings."],
+		empty_roles_missing: ["Некоторые ноды с ролью «Пустое изображение» больше не существуют и были пропущены: %1", "Some LoadImage empty roles no longer exist and were ignored: %1"],
+		selected_output_missing: ["Ранее выбранная выходная нода больше не существует. Откройте настройки workflow и выберите её заново.", "The selected output node no longer exists. Open workflow settings and select it again."],
+		output_ambiguous: ["Найдено несколько возможных выходных нод. Выберите ноду результата в настройках workflow или добавьте к её названию #PS-OUTPUT.", "Several possible output nodes were found. Select the result node in workflow settings or tag it #PS-OUTPUT."],
+		size_binding_required: ["Выбран режим записи размера в поля width/height, но пара полей не указана.", "Size mode is set to selected width/height fields, but no size pair is selected."],
+		selected_size_missing: ["Ранее выбранные поля width/height больше не существуют. Откройте настройки workflow и выберите их заново.", "The selected width/height fields no longer exist. Open workflow settings and select them again."],
+		size_ambiguous: ["Найдено несколько возможных пар width/height. В автоматическом режиме будет использован размер входного изображения. Если workflow требует фиксированных полей размера, выберите пару вручную.", "Several possible width/height pairs were found. Automatic mode will use the input image size. Select a pair explicitly in workflow settings if the workflow requires fixed size fields."],
+		sampler_ambiguous: ["Найдено несколько равнозначных сэмплеров. Основным назначен первый найденный. Чтобы выбрать другой, добавьте к названию нужного сэмплера #PS-MAIN.", "Several equivalent sampler nodes were found. The first deterministic node is treated as primary. Add #PS-MAIN to the intended sampler title to make the choice explicit."],
+		input_not_found: ["В workflow не найдена входная нода изображения. Добавьте #PS-INPUT к названию нужной ноды.", "No image input node was found. Add #PS-INPUT to its title."],
+		output_not_found: ["В workflow не найдена выходная нода. Добавьте #PS-OUTPUT к названию Save Image или Preview Image.", "No output node was found. Add #PS-OUTPUT to Save/Preview Image."],
+		size_not_found: ["Не найдена доступная для изменения пара width/height. Скрипт отправит изображение правильного размера, но итоговый размер зависит от логики workflow.", "No editable width/height pair was found. The script will send a correctly sized JPEG, but the final size depends on workflow logic."],
+		sampler_not_found: ["Основной сэмплер не распознан; часть стандартных параметров может быть недоступна.", "The primary sampler was not recognized; standard parameters may be incomplete."],
 		forgePort: ["Порт Forge Neo:", "Forge Neo port:"], refreshForgeCatalog: ["Обновить текущую схему и её данные", "Refresh current schema and its data"],
 		rebuildForgeSchema: ["Повторно загрузить или полностью сбросить схему Forge", "Reload or fully reset the Forge schema"],
 		rebuildForgeSchemaConfirm: ["Выполнить полный сброс выбранной схемы Forge?\n\nДа — удалить все данные этой схемы и заново загрузить её из JSON.\nНет — только повторно загрузить схему из JSON, сохранив значения параметров, состав интерфейса, выбранные LoRA, ImageStitch inputs и настройки размера.", "Fully reset the selected Forge schema?\n\nYes — remove all data for this schema and load it again from JSON.\nNo — only reload the schema from JSON while preserving parameter values, the interface layout, selected LoRAs, ImageStitch inputs and size settings."],
