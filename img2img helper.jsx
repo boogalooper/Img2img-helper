@@ -37,14 +37,14 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.192",
+	VER = "0.193",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
 	API_HOST = "127.0.0.1",
 	API_PORT_SEND = 6370,
 	API_PORT_LISTEN = 6371,
-	API_PROTOCOL = 2,
+	API_PROTOCOL = 3,
 	// На запуск Python и установку зависимостей даётся две минуты.
 	START_TIMEOUT = 2 * 60 * 1000,
 	SHORT_TIMEOUT = 8000,
@@ -353,12 +353,10 @@ function isUserCancellation(value) {
 function workflowDiagnosticText(item) {
 	item = item && typeof item == "object" ? item : {};
 	var sourceMessage = String(item.message || ""),
-		code = String(item.code || legacyWorkflowDiagnosticCode(sourceMessage)), template = code && str[code] !== undefined
+		code = String(item.code || ""), template = code && str[code] !== undefined
 		? String(str[code])
 		: sourceMessage,
 		params = item.params instanceof Array ? item.params : [];
-	if (!params.length && code == "missing_node_class")
-		params = [sourceMessage.substring(sourceMessage.lastIndexOf(":") + 1).replace(/^\s+|\s+$/g, "")];
 	for (var i = 0; i < params.length; i++)
 		template = template.split("%" + (i + 1)).join(String(params[i]));
 	return template;
@@ -366,9 +364,8 @@ function workflowDiagnosticText(item) {
 function workflowDiagnosticIsInformational(diagnostic) {
 	diagnostic = diagnostic && typeof diagnostic == "object" ? diagnostic : {};
 	var level = String(diagnostic.level || "").toLowerCase(),
-		code = String(diagnostic.code || legacyWorkflowDiagnosticCode(diagnostic.message || ""));
-	// Ошибка никогда не скрывается, даже если старый API повторно использовал
-	// один из информационных кодов.
+		code = String(diagnostic.code || "");
+	// Ошибка никогда не скрывается, даже если использован информационный код.
 	return level != "error" && (level == "info" || code == "size_not_found" || code == "sampler_not_found");
 }
 function schemaHasInformationalDiagnostics(schema) {
@@ -387,24 +384,6 @@ function apiErrorText(item) {
 		template = template.split("%" + (i + 1)).join(String(params[i]));
 	return template;
 }
-function legacyWorkflowDiagnosticCode(message) {
-	message = String(message || "");
-	if (message.indexOf("The workflow contains more than one LoadImage node.") == 0) return "multiple_load_images_legacy";
-	if (message.indexOf("The ComfyUI node is not installed:") == 0) return "missing_node_class";
-	if (message.indexOf("The selected image input no longer exists.") == 0) return "selected_input_missing";
-	if (message.indexOf("The selected inpaint mask input no longer exists.") == 0) return "selected_mask_missing";
-	if (message.indexOf("The selected output node no longer exists.") == 0) return "selected_output_missing";
-	if (message.indexOf("Several possible output nodes were found.") == 0) return "output_ambiguous";
-	if (message.indexOf("Size mode is set to selected width/height fields") == 0) return "size_binding_required";
-	if (message.indexOf("The selected width/height fields no longer exist.") == 0) return "selected_size_missing";
-	if (message.indexOf("Several possible width/height pairs were found.") == 0) return "size_ambiguous";
-	if (message.indexOf("Several equivalent sampler nodes were found.") == 0) return "sampler_ambiguous";
-	if (message.indexOf("No image input node was found.") == 0) return "input_not_found";
-	if (message.indexOf("No output node was found.") == 0) return "output_not_found";
-	if (message.indexOf("No editable width/height pair was found.") == 0) return "size_not_found";
-	if (message.indexOf("The primary sampler was not recognized") == 0) return "sampler_not_found";
-	return "";
-}
 function itemData(source) {
 	var objectItem = source && typeof source == "object",
 		label = objectItem ? (source.label !== undefined ? source.label : source.value) : source,
@@ -416,11 +395,11 @@ function itemData(source) {
 		help: String(help === undefined || help === null ? "" : help)
 	};
 }
-function defaultComfyImageRole(candidate, ignoreUnselected) {
+function defaultComfyImageRole(candidate) {
 	var meta = candidate && candidate.meta ? candidate.meta : {},
 		source = String(meta.source_value === undefined || meta.source_value === null ? "" : meta.source_value)
 			.replace(/^\s+|\s+$/g, "");
-	if (meta.load_image && (ignoreUnselected || !source)) return "empty";
+	if (meta.load_image && !source) return "empty";
 	return "workflow";
 }
 // Только обычный CFG Scale управляет доступностью Negative prompt.
@@ -439,11 +418,6 @@ function findForgeCfgControlId(schema) {
 function isCfgValueOne(value) {
 	var number = parseFloat(value);
 	return !isNaN(number) && number <= 1.000000001;
-}
-function shouldDisableNegativePrompt(schema, values) {
-	if (!schema) return false;
-	var cfgId = findForgeCfgControlId(schema);
-	return !!cfgId && values && values.hasOwnProperty(cfgId) && isCfgValueOne(values[cfgId]);
 }
 function forgeSchemaId(schema) {
 	return schema ? schema.workspace_id || String(schema.workflow_id || "").replace(/^forge:/, "") : "";
@@ -666,7 +640,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (!workflow) return false;
 		cfg.selectedWorkflow = cfg.data.selectedWorkflow = workflow.id;
 		var profile = cfg.getProfile(workflow.id), previous = cloneObj(profile.bindingOverrides);
-		applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat", "selectedPromptPresets", "ignoreUnselectedLoadImages"]);
+		applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat", "selectedPromptPresets"]);
 		if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" };
 		if (profile.bindingOverrides.mask === undefined) profile.bindingOverrides.mask = "";
 		if (!(profile.bindingOverrides.references instanceof Array)) profile.bindingOverrides.references = [];
@@ -1524,7 +1498,7 @@ function mainDialog(selection, initial, responseSeconds) {
 				if (!(inputCandidates[i].meta && inputCandidates[i].meta.grouped)) roleCandidates.push(inputCandidates[i]);
 			for (i = 0; i < roleCandidates.length; i++) {
 				candidate = roleCandidates[i];
-				roleById[candidate.id] = defaultComfyImageRole(candidate, profile.ignoreUnselectedLoadImages);
+				roleById[candidate.id] = defaultComfyImageRole(candidate);
 				if (main && candidatesOverlap(main, candidate)) roleById[candidate.id] = "photoshop";
 				for (j = 0; j < referenceIds.length; j++) {
 					selected = candidateById(inputCandidates, referenceIds[j]);
@@ -1588,15 +1562,10 @@ function mainDialog(selection, initial, responseSeconds) {
 		function currentMaskCandidates() {
 			var main = currentMainCandidate(), inputId = main ? main.id : "",
 				mainByInput = candidates.main_mask_by_input,
-				legacyByInput = candidates.mask_by_input,
 				allMasks = candidates.mask || [], res = [], dynamicMask = null;
 			if (inputId && mainByInput && mainByInput[inputId])
 				dynamicMask = mainByInput[inputId];
 			if (dynamicMask) res.push(dynamicMask);
-			// Compatibility with Python APIs that still return the former full
-			// per-input arrays. New APIs send one dynamic item plus common masks.
-			if (!dynamicMask && inputId && legacyByInput && legacyByInput[inputId] instanceof Array)
-				return legacyByInput[inputId];
 			for (var i = 0; i < allMasks.length; i++)
 				if (!allMasks[i].meta || allMasks[i].meta.mode != "input_alpha") res.push(allMasks[i]);
 			return res;
@@ -1709,7 +1678,6 @@ function mainDialog(selection, initial, responseSeconds) {
 				}
 				profile.bindingOverrides.mask = candidateId(maskDropdown);
 				profile.bindingOverrides.output = candidateId(outputDropdown);
-				profile.ignoreUnselectedLoadImages = false;
 				profile.bindingOverrides.sizeMode = nextSizeMode;
 				profile.bindingOverrides.size = nextSizeId;
 				return true;
@@ -2200,55 +2168,6 @@ function GenerationRuntime() {
 		}
 		return res;
 	}
-	// Создаёт отдельную копию values: LoRA-теги добавляются только в запрос,
-	// а не в поле Prompt/пресеты. Negative prompt удаляется при CFG <= 1.
-	function forgeRequestValues(schema, values, selectedLoras) {
-		var res = cloneObj(values || {}),
-			loras = selectedLoras instanceof Array ? selectedLoras : [],
-			tags = [],
-			tagNames = [],
-			controls = schema && schema.controls instanceof Array ? schema.controls : [],
-			availableLoras = [],
-			promptId = "positive_prompt",
-			negativePromptId = "negative_prompt";
-		for (var controlIndex = 0; controlIndex < controls.length; controlIndex++) {
-			var controlId = String(controls[controlIndex].id || ""),
-				payloadKey = String(controls[controlIndex].payload_key || "");
-			if (controlId == "positive_prompt" || payloadKey == "prompt") {
-				promptId = controlId;
-				availableLoras = controls[controlIndex].forgeLoras instanceof Array
-					? controls[controlIndex].forgeLoras
-					: [];
-			} else if (controlId == "negative_prompt" || payloadKey == "negative_prompt") {
-				negativePromptId = controlId;
-			}
-		}
-		// Каталог LoRA уже получен при загрузке Forge schema, поэтому здесь нет
-		// дополнительного сетевого запроса. Сначала нормализуем сохранённый
-		// список по актуальному каталогу и только затем строим prompt-теги.
-		//
-		// Если каталог пуст или недоступен, значения намеренно не отбрасываем:
-		// Forge сам вернёт понятную ошибку для отсутствующей LoRA вместо того,
-		// чтобы helper молча запустил генерацию без выбранной модели.
-		if (availableLoras.length)
-			loras = normalizeForgeLoraSelection(availableLoras, loras);
-		for (var i = 0; i < loras.length; i++) {
-			var parsed = parseForgeLoraEntry(loras[i]),
-				name = parsed.name;
-			if (!name || arrayContainsCaseInsensitive(tagNames, name)) continue;
-			tagNames.push(name);
-			tags.push(parsed);
-		}
-		if (shouldDisableNegativePrompt(schema, res) && res.hasOwnProperty(negativePromptId))
-			delete res[negativePromptId];
-		if (!tags.length) return res;
-		var prompt = String(res[promptId] === undefined || res[promptId] === null ? "" : res[promptId]),
-			prefix = "";
-		for (var tagIndex = 0; tagIndex < tags.length; tagIndex++)
-			prefix += (prefix ? " " : "") + "<lora:" + tags[tagIndex].name + ":" + formatForgeLoraWeight(tags[tagIndex].weight) + ">";
-		res[promptId] = prefix + (prompt ? " " + prompt : "");
-		return res;
-	}
 	function getProfileTargetSize(bounds, profile, schema) {
 		var scale = toBooleanValue(profile.autoResize)
 			? autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets))
@@ -2292,7 +2211,8 @@ function GenerationRuntime() {
 					input: inputFile.fsName,
 					width: width,
 					height: height,
-					values: forgeRequestValues(schema, values, profile.selectedLoras),
+					values: cloneObj(values),
+					selected_loras: cloneObj(profile.selectedLoras || []),
 					image_inputs: collectForgeImageInputs(schema, profile),
 					timeout: cfg.generationTimeout
 				};
@@ -2308,7 +2228,6 @@ function GenerationRuntime() {
 					values: values,
 					references: collectReferenceFiles(schema, profile),
 					binding_overrides: profile.bindingOverrides,
-					ignore_unselected_load_images: !!profile.ignoreUnselectedLoadImages,
 					output_format: normalizeOutputFormat(profile.outputFormat),
 					timeout: cfg.generationTimeout
 				};
@@ -2358,7 +2277,6 @@ function GenerationRuntime() {
 				selectedPromptPresets: cloneObj(profile.selectedPromptPresets || { positive: "", negative: "" }),
 				bindingOverrides: currentBackend == BACKEND_COMFY ? cloneObj(profile.bindingOverrides) : {},
 				referenceFiles: currentBackend == BACKEND_COMFY ? cloneObj(profile.referenceFiles) : {},
-				ignoreUnselectedLoadImages: currentBackend == BACKEND_COMFY ? !!profile.ignoreUnselectedLoadImages : false,
 				imageStitchInputs: currentBackend == BACKEND_FORGE ? cloneObj(profile.imageStitchInputs) : []
 			};
 			if (currentBackend == BACKEND_COMFY) metadataProfile.outputFormat = normalizeOutputFormat(profile.outputFormat);
@@ -3028,7 +2946,7 @@ function BackendRuntime() {
 			source = [],
 			validation;
 		if (profile.lorasInitialized !== true) {
-			source = hasDeclaredForgeLoras(schema) ? normalizeForgeLoraEntries(schema.loras) : (profile.selectedLoras || []);
+			source = hasDeclaredForgeLoras(schema) ? schema.loras : (profile.selectedLoras || []);
 			validation = resolveForgeLoraSelection(available, source, true);
 			profile.selectedLoras = validation.selected;
 			profile.lorasInitialized = true;
@@ -5240,7 +5158,6 @@ function BridgeApi() {
 		return {
 			workflow_id: workflowId,
 			relative_path: relativePath || "",
-			candidate_format: 2,
 			binding_overrides: cleanBindingOverrides(overrides)
 		};
 	}
@@ -5966,7 +5883,7 @@ function Config() {
 		if (!isObjectMap(profile)) profile = profiles[workflowId] = {
 			relativePath: "", values: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null,
 			bindingOverrides: { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" },
-			referenceFiles: {}, ignoreUnselectedLoadImages: false, sizeMultiple: self.sizeMultiple,
+			referenceFiles: {}, sizeMultiple: self.sizeMultiple,
 			autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
 			outputFormat: "jpg", manualScale: 1, workflowInformationSeen: false,
 			schemaCache: null, schemaCacheStamp: null, schemaCacheVersion: 0, schemaCacheUsed: 0
@@ -5984,7 +5901,6 @@ function Config() {
 		if (bindings.sizeMode !== "source_image" && bindings.sizeMode !== "binding") bindings.sizeMode = "auto";
 		if (bindings.size === undefined || bindings.sizeMode != "binding") bindings.size = "";
 		if (!isObjectMap(profile.referenceFiles)) profile.referenceFiles = {};
-		profile.ignoreUnselectedLoadImages = toBooleanValue(profile.ignoreUnselectedLoadImages);
 		profile.outputFormat = normalizeOutputFormat(profile.outputFormat);
 		profile.workflowInformationSeen = profile.workflowInformationSeen === true;
 		if (profile.sizeMultiple === undefined) profile.sizeMultiple = self.sizeMultiple;
@@ -6594,7 +6510,6 @@ function Locale() {
 		workflowDiagnostics: ["Проверка workflow", "Workflow validation"], generationDiagnostics: ["Результат генерации", "Generation result"],
 		diagnosticsErrors: ["Необходимо исправить:", "Must be fixed:"], diagnosticsWarnings: ["Обратите внимание:", "Please note:"],
 		diagnosticsNeedAttention: ["Обнаружены проблемы", "Problems found"], diagnosticsInformation: ["Информация", "Information"],
-		multiple_load_images_legacy: ["Запущенная версия Python API всё ещё использует прежнюю проверку нескольких LoadImage. Завершите процесс img2img-api и снова запустите скрипт — после перезапуска одной ноде LoadImage автоматически будет назначена роль «Изображение Photoshop».", "The running Python API still uses the previous multiple-LoadImage validation. Stop the img2img-api process and run the script again; one LoadImage node will then automatically receive the Photoshop image role."],
 		missing_node_class: ["В ComfyUI не установлена нода: %1", "The ComfyUI node is not installed: %1"],
 		sampler_inputs_ambiguous: ["В сэмплере #%1 найдено несколько входов типа %2: %3. В качестве основного используется %4; остальные доступны как дополнительные поля.", "Sampler #%1 contains several inputs matching %2: %3. %4 is used as the standard control; the others remain available as advanced fields."],
 		prompt_fields_ambiguous: ["Перед сэмплером #%2 найдено несколько равнозначных полей %1. Использовано первое найденное поле; чтобы выбрать другое, переименуйте нужную ноду или добавьте метку.", "Several equivalent %1 fields were found upstream of sampler #%2. The first deterministic match is used; rename or tag the intended node to make the workflow unambiguous."],

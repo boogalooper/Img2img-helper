@@ -44,8 +44,8 @@ API_HOST = "127.0.0.1"
 DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
-API_PROTOCOL = 2
-VERSION = "0.195"
+API_PROTOCOL = 3
+VERSION = "0.196"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -3083,10 +3083,8 @@ class WorkflowAnalyzer:
                 [", ".join(missing_reference_ids[:10])],
             )
 
-        # Explicit per-LoadImage empty roles replace the former global
-        # ignore_unselected_load_images switch. Keep them in the analysis
-        # overrides so stale ids and role conflicts are caught before prompt
-        # submission. Old clients may omit this key and retain legacy behavior.
+        # Keep explicit per-LoadImage empty roles in the analysis overrides so
+        # stale ids and role conflicts are caught before prompt submission.
         empty_input_ids = overrides.get("empty_inputs") if isinstance(overrides.get("empty_inputs"), list) else []
         input_by_id = {candidate.id: candidate for candidate in input_candidates}
         managed_target_keys: Set[Tuple[str, str]] = set()
@@ -5027,7 +5025,9 @@ def _forge_bool(value: Any) -> bool:
     return bool(value)
 
 
-def _forge_runtime_control_catalog(schema: Dict[str, Any]) -> Dict[str, Any]:
+def _forge_runtime_control_catalog(
+    schema: Dict[str, Any], extra_sources: Optional[Sequence[str]] = None
+) -> Dict[str, Any]:
     controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
     sources = {
         str(control.get("source") or "")
@@ -5035,6 +5035,10 @@ def _forge_runtime_control_catalog(schema: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(control, dict)
         and str(control.get("source") or "") in FORGE_CATALOG_SOURCES
     }
+    sources.update(
+        str(source) for source in (extra_sources or [])
+        if str(source) in FORGE_CATALOG_SOURCES
+    )
     return forge_catalog(sorted(sources), force=False) if sources else {}
 
 
@@ -5223,6 +5227,101 @@ def _forge_control_value(
     return _forge_coerce_control_value(control, raw_value, runtime_catalog)
 
 
+def _normalize_forge_loras(
+    items: Any, available: Optional[Sequence[Any]] = None
+) -> List[Dict[str, Any]]:
+    """Normalize LoRA values for both schema saving and generation.
+
+    A non-empty Forge catalog also canonicalizes names and removes entries that
+    disappeared from Forge. If the catalog is empty or unavailable, names are
+    preserved so Forge can report the actual model-loading error.
+    """
+
+    catalog_names = [str(item).strip() for item in (available or []) if str(item).strip()]
+    catalog_by_key = {name.lower(): name for name in catalog_names}
+    restrict_to_catalog = bool(catalog_by_key)
+    source = items if isinstance(items, list) else []
+    normalized: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for item in source:
+        name = ""
+        weight: Any = 1.0
+        if isinstance(item, str):
+            text = item.strip().strip("<>")
+            if text.lower().startswith("lora:"):
+                text = text[5:]
+            if ":" in text:
+                candidate_name, candidate_weight = text.rsplit(":", 1)
+                name = candidate_name.strip()
+                try:
+                    weight = float(candidate_weight)
+                except (TypeError, ValueError, OverflowError):
+                    weight = 1.0
+            else:
+                name = text.strip()
+        elif isinstance(item, dict):
+            name = str(
+                item.get("name") or item.get("lora") or item.get("value")
+                or item.get("label") or item.get("id") or item.get("file")
+                or item.get("filename") or ""
+            ).strip()
+            weight = item.get("weight", item.get("scale", item.get("strength", 1.0)))
+        if not name:
+            continue
+        if restrict_to_catalog:
+            name = catalog_by_key.get(name.lower(), "")
+            if not name:
+                continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            numeric_weight = float(weight)
+        except (TypeError, ValueError, OverflowError):
+            numeric_weight = 1.0
+        if not math.isfinite(numeric_weight):
+            numeric_weight = 1.0
+        normalized.append({
+            "name": name,
+            "weight": max(0.0, min(1.0, round(numeric_weight, 2))),
+        })
+    return normalized
+
+
+def _forge_cfg_disables_negative_prompt(
+    controls: Sequence[Any], values: Dict[str, Any], runtime_catalog: Dict[str, Any]
+) -> bool:
+    """Apply the Negative prompt rule only to ordinary CFG Scale."""
+
+    for control in controls:
+        if not isinstance(control, dict):
+            continue
+        control_id = str(control.get("id") or "")
+        semantic_id = control_id.lower()
+        input_name = str(control.get("input") or "").strip().lower()
+        payload_key = str(control.get("payload_key") or "").strip().lower()
+        if not (
+            semantic_id == "cfg" or semantic_id.startswith("cfg__")
+            or input_name in {"cfg", "cfg_scale"} or payload_key == "cfg_scale"
+        ):
+            continue
+        try:
+            cfg_value = float(_forge_control_value(control, values, runtime_catalog))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(cfg_value) and cfg_value <= 1.000000001
+    return False
+
+
+def _forge_lora_prompt_prefix(loras: Sequence[Dict[str, Any]]) -> str:
+    tags: List[str] = []
+    for item in loras:
+        weight = f"{float(item['weight']):.2f}".rstrip("0").rstrip(".")
+        tags.append(f"<lora:{item['name']}:{weight}>")
+    return " ".join(tags)
+
+
 def _forge_response_image(result: Any, response_keys: List[str]) -> Optional[str]:
     if not isinstance(result, dict):
         return None
@@ -5258,6 +5357,11 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     input_path = Path(str(message.get("input") or ""))
     output_dir = TEMP_DIR
     values = message.get("values") if isinstance(message.get("values"), dict) else {}
+    selected_loras = (
+        message.get("selected_loras")
+        if isinstance(message.get("selected_loras"), list)
+        else []
+    )
     width = int(message.get("width") or 0)
     height = int(message.get("height") or 0)
     if not input_path.is_file():
@@ -5268,7 +5372,9 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         raise UserVisibleError("Could not determine width/height for Forge Neo.")
 
     client = current_forge_client()
-    runtime_catalog = _forge_runtime_control_catalog(schema)
+    runtime_catalog = _forge_runtime_control_catalog(
+        schema, ["loras"] if selected_loras else None
+    )
     _apply_forge_options(client, values, schema, runtime_catalog)
     raise_if_generation_cancelled(request_id)
 
@@ -5322,7 +5428,9 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     if isinstance(schema_allowed, list):
         allowed.update(str(item) for item in schema_allowed if str(item))
 
-    negative_prompt_omitted = False
+    negative_prompt_omitted = _forge_cfg_disables_negative_prompt(
+        controls, values, runtime_catalog
+    )
     for control in controls:
         if not isinstance(control, dict):
             continue
@@ -5341,9 +5449,8 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
                 if payload_key == "negative_prompt":
                     negative_prompt_omitted = True
                 continue
-        # JSX намеренно удаляет Negative prompt при CFG <= 1. Отсутствие этого
-        # конкретного значения нельзя заменять default из схемы.
-        if payload_key == "negative_prompt" and control_id not in values:
+        # Negative prompt не отправляется при обычном CFG Scale <= 1.
+        if payload_key == "negative_prompt" and negative_prompt_omitted:
             negative_prompt_omitted = True
             continue
         # Значение из JSX есть у видимого поля; для скрытого поля применяется
@@ -5354,6 +5461,18 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     for key, value in fixed_values.items():
         if key in allowed:
             payload[key] = value
+    if negative_prompt_omitted:
+        payload.pop("negative_prompt", None)
+
+    if selected_loras:
+        normalized_loras = _normalize_forge_loras(
+            selected_loras,
+            runtime_catalog.get("loras") if isinstance(runtime_catalog.get("loras"), list) else None,
+        )
+        prefix = _forge_lora_prompt_prefix(normalized_loras)
+        if prefix:
+            prompt = str(payload.get("prompt") or "")
+            payload["prompt"] = prefix + (" " + prompt if prompt else "")
 
     capabilities = schema.get("capabilities") if isinstance(schema.get("capabilities"), dict) else {}
     stitch_requested = (
@@ -5938,62 +6057,6 @@ def analyze_workflow(
     return result
 
 
-def workflow_analysis_for_client(
-    analysis: Dict[str, Any], candidate_format: int
-) -> Dict[str, Any]:
-    """Adapt compact mask candidates for clients using the legacy layout."""
-
-    if candidate_format >= 2:
-        return analysis
-    result = dict(analysis)
-    candidates = dict(
-        analysis.get("candidates")
-        if isinstance(analysis.get("candidates"), dict)
-        else {}
-    )
-    common_masks = list(
-        candidates.get("mask") if isinstance(candidates.get("mask"), list) else []
-    )
-    main_masks_by_input = candidates.pop("main_mask_by_input", {})
-    selected_input_targets = {
-        (str(target.get("node_id") or ""), str(target.get("input") or ""))
-        for target in (
-            analysis.get("bindings", {}).get("input_image", [])
-            if isinstance(analysis.get("bindings"), dict)
-            else []
-        )
-        if isinstance(target, dict)
-    }
-    selected_main_mask: Optional[Dict[str, Any]] = None
-    for candidate in candidates.get("input", []):
-        if not isinstance(candidate, dict):
-            continue
-        candidate_targets = {
-            (str(target.get("node_id") or ""), str(target.get("input") or ""))
-            for target in candidate.get("targets", [])
-            if isinstance(target, dict)
-        }
-        candidate_id = str(candidate.get("id") or "")
-        if candidate_targets == selected_input_targets and isinstance(
-            main_masks_by_input.get(candidate_id), dict
-        ):
-            selected_main_mask = main_masks_by_input[candidate_id]
-            break
-    candidates["mask"] = (
-        [selected_main_mask] if selected_main_mask is not None else []
-    ) + common_masks
-    candidates["mask_by_input"] = {
-        str(input_id): ([mask] if isinstance(mask, dict) else []) + common_masks
-        for input_id, mask in (
-            main_masks_by_input.items()
-            if isinstance(main_masks_by_input, dict)
-            else []
-        )
-    }
-    result["candidates"] = candidates
-    return result
-
-
 def save_workflow_values(
     workflow_id: str,
     *,
@@ -6224,38 +6287,7 @@ def save_forge_schema_values(
     if not is_source:
         raw["label"] = destination.stem
 
-    normalized_loras: List[Dict[str, Any]] = []
-    seen_loras: set[str] = set()
-    for item in raw_selected_loras:
-        name = ""
-        weight = 1.0
-        if isinstance(item, str):
-            text = item.strip().strip("<>")
-            if text.lower().startswith("lora:"):
-                text = text[5:]
-            if ":" in text:
-                candidate_name, candidate_weight = text.rsplit(":", 1)
-                name = candidate_name.strip()
-                try:
-                    weight = float(candidate_weight)
-                except (TypeError, ValueError):
-                    weight = 1.0
-            else:
-                name = text.strip()
-        elif isinstance(item, dict):
-            name = str(item.get("name") or item.get("lora") or item.get("value") or item.get("label") or "").strip()
-            try:
-                weight = float(item.get("weight", 1.0))
-            except (TypeError, ValueError):
-                weight = 1.0
-        if not name:
-            continue
-        key = name.lower()
-        if key in seen_loras:
-            continue
-        seen_loras.add(key)
-        weight = max(0.0, min(1.0, round(weight, 2)))
-        normalized_loras.append({"name": name, "weight": weight})
+    normalized_loras = _normalize_forge_loras(raw_selected_loras)
     if normalized_loras:
         raw["loras"] = normalized_loras
     else:
@@ -6592,47 +6624,6 @@ def _create_blank_helper_image(request_id: str, width: int, height: int) -> Path
     return path
 
 
-def _binding_target_keys(analysis: Dict[str, Any]) -> Set[Tuple[str, str]]:
-    if not isinstance(analysis, dict):
-        return set()
-    bindings = analysis.get("bindings", {}) if isinstance(analysis.get("bindings"), dict) else {}
-    keys: Set[Tuple[str, str]] = set()
-    for target in bindings.get("input_image", []):
-        if isinstance(target, dict):
-            keys.add((str(target.get("node_id") or ""), str(target.get("input") or "")))
-    for reference in bindings.get("reference_images", []):
-        if not isinstance(reference, dict):
-            continue
-        for target in reference.get("targets", []):
-            if isinstance(target, dict):
-                keys.add((str(target.get("node_id") or ""), str(target.get("input") or "")))
-    return keys
-
-
-def _unselected_load_image_candidates(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not isinstance(analysis, dict):
-        return []
-    candidates = analysis.get("candidates", {}) if isinstance(analysis.get("candidates"), dict) else {}
-    input_candidates = candidates.get("input", []) if isinstance(candidates.get("input"), list) else []
-    managed_targets = _binding_target_keys(analysis)
-    result: List[Dict[str, Any]] = []
-    for candidate in input_candidates:
-        if not isinstance(candidate, dict):
-            continue
-        meta = candidate.get("meta") if isinstance(candidate.get("meta"), dict) else {}
-        if not meta.get("load_image") or meta.get("grouped"):
-            continue
-        candidate_targets = {
-            (str(target.get("node_id") or ""), str(target.get("input") or ""))
-            for target in candidate.get("targets", [])
-            if isinstance(target, dict)
-        }
-        if candidate_targets & managed_targets:
-            continue
-        result.append(candidate)
-    return result
-
-
 def _selected_empty_load_image_candidates(
     analysis: Dict[str, Any], candidate_ids: Sequence[str]
 ) -> List[Dict[str, Any]]:
@@ -6692,8 +6683,6 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     overrides = normalize_binding_overrides(
         message.get("binding_overrides") if isinstance(message.get("binding_overrides"), dict) else None
     )
-    ignore_unselected_load_images = message.get("ignore_unselected_load_images") is True
-
     if not input_path.is_file():
         raise UserVisibleError(f"Photoshop temporary file was not found: {input_path}")
     if inpaint_mode not in {"", "input_alpha", "load_image_mask"}:
@@ -6893,25 +6882,13 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         and str(item.get("id") or "")
         and str(item.get("id") or "") not in uploaded_references
     ]
-    if isinstance(overrides, dict) and "empty_inputs" in overrides:
-        selected_empty_ids = list(overrides.get("empty_inputs") or [])
-        for automatic_empty_id in analysis.get("automatic_empty_inputs", []):
-            if automatic_empty_id not in selected_empty_ids:
-                selected_empty_ids.append(automatic_empty_id)
-        neutralized_inputs = _selected_empty_load_image_candidates(
-            analysis, selected_empty_ids
-        )
-    else:
-        # Backward compatibility for old JSX, saved profiles and Actions.
-        neutralized_inputs = _unselected_load_image_candidates(analysis) if ignore_unselected_load_images else []
-        automatic_empty_ids = analysis.get("automatic_empty_inputs", [])
-        if automatic_empty_ids:
-            existing_ids = {str(item.get("id") or "") for item in neutralized_inputs}
-            neutralized_inputs.extend(
-                item
-                for item in _selected_empty_load_image_candidates(analysis, automatic_empty_ids)
-                if str(item.get("id") or "") not in existing_ids
-            )
+    selected_empty_ids = list(overrides.get("empty_inputs") or []) if overrides else []
+    for automatic_empty_id in analysis.get("automatic_empty_inputs", []):
+        if automatic_empty_id not in selected_empty_ids:
+            selected_empty_ids.append(automatic_empty_id)
+    neutralized_inputs = _selected_empty_load_image_candidates(
+        analysis, selected_empty_ids
+    )
 
     neutral_image: Optional[Dict[str, Any]] = None
     if missing_selected_references or neutralized_inputs:
@@ -7639,14 +7616,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                     "Invalid workflow returned as schema valid=false; diagnostics=%s",
                     len(result.get("diagnostics", [])),
                 )
-            try:
-                candidate_format = int(message.get("candidate_format") or 1)
-            except (TypeError, ValueError):
-                candidate_format = 1
-            answer(
-                workflow_analysis_for_client(result, candidate_format),
-                request_id,
-            )
+            answer(result, request_id)
             LOGGER.info(
                 "Command %s completed in %.2f s",
                 command_type,
