@@ -33,11 +33,11 @@ var APP = {
 	},
 	cache: {
 		schemaVersion: 1,
-		comfyAnalysisUuid: "e3834ca5-3f51-4b92-9398-80a451476103",
+		comfyAnalysisUuid: "8d1619b1-a414-4b9b-a5fa-14930ee013a9",
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.191",
+	VER = "0.192",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -363,6 +363,20 @@ function workflowDiagnosticText(item) {
 		template = template.split("%" + (i + 1)).join(String(params[i]));
 	return template;
 }
+function workflowDiagnosticIsInformational(diagnostic) {
+	diagnostic = diagnostic && typeof diagnostic == "object" ? diagnostic : {};
+	var level = String(diagnostic.level || "").toLowerCase(),
+		code = String(diagnostic.code || legacyWorkflowDiagnosticCode(diagnostic.message || ""));
+	// Ошибка никогда не скрывается, даже если старый API повторно использовал
+	// один из информационных кодов.
+	return level != "error" && (level == "info" || code == "size_not_found" || code == "sampler_not_found");
+}
+function schemaHasInformationalDiagnostics(schema) {
+	var diagnostics = schema && schema.diagnostics instanceof Array ? schema.diagnostics : [];
+	for (var i = 0; i < diagnostics.length; i++)
+		if (workflowDiagnosticIsInformational(diagnostics[i])) return true;
+	return false;
+}
 function apiErrorText(item) {
 	item = item && typeof item == "object" ? item : {};
 	var code = String(item.code || "");
@@ -581,15 +595,12 @@ function mainDialog(selection, initial, responseSeconds) {
 			if (!duplicate) state.notices.push(items[i]);
 		}
 	}
-	function workflowDiagnosticIsInformational(diagnostic) {
-		diagnostic = diagnostic && typeof diagnostic == "object" ? diagnostic : {};
-		var level = String(diagnostic.level || "").toLowerCase(),
-			code = String(diagnostic.code || legacyWorkflowDiagnosticCode(diagnostic.message || ""));
-		return level == "info" || code == "size_not_found" || code == "sampler_not_found";
-	}
 	function showPendingNotices(schema) {
 		var warnings = [], errors = [], diagnostics = schema && schema.diagnostics instanceof Array ? schema.diagnostics : [],
-			diagnosticTitle = str.workflowDiagnostics;
+			diagnosticTitle = str.workflowDiagnostics,
+			informationProfile = schema && state.backend == BACKEND_COMFY ? backend.schemaProfile(schema) : null,
+			showInformation = !!(informationProfile && informationProfile.workflowInformationSeen !== true),
+			informationShown = false;
 		for (var i = 0; i < state.notices.length; i++) {
 			var msg = errorMessageText(state.notices[i]), key = noticeKey(state.notices[i]);
 			if (!msg || state.noticeKeysShown[key]) continue;
@@ -600,10 +611,17 @@ function mainDialog(selection, initial, responseSeconds) {
 		}
 		state.notices = [];
 		for (i = 0; i < diagnostics.length; i++) {
-			if (workflowDiagnosticIsInformational(diagnostics[i])) continue;
 			var diagnosticText = workflowDiagnosticText(diagnostics[i]),
-				level = String(diagnostics[i].level || "").toLowerCase();
+				level = String(diagnostics[i].level || "").toLowerCase(),
+				informational = workflowDiagnosticIsInformational(diagnostics[i]);
 			if (!diagnosticText) continue;
+			if (informational) {
+				if (showInformation) {
+					warnings.push(diagnosticText);
+					informationShown = true;
+				}
+				continue;
+			}
 			if (level == "error") errors.push(diagnosticText);
 			else if (level == "warning") warnings.push(diagnosticText);
 		}
@@ -618,13 +636,9 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (signature == state.workflowDiagnosticSignature) return;
 		state.workflowDiagnosticSignature = signature;
 		ui.showDiagnosticSummary({ title: diagnosticTitle, errors: errors, warnings: warnings });
-	}
-	function workflowInputReviewNotices(schema) {
-		if (!schema || !schema.input_review_required || !schema.input_review_message) return [];
-		return [{
-			key: "workflow-input-review:" + String(schema.workflow_id || schema.relative_path || ""),
-			message: String(schema.input_review_message)
-		}];
+		// Обычный повторный анализ и сохранение настроек сохраняют этот флаг;
+		// полный сброс удаляет профиль и снова разрешает показ информации.
+		if (informationShown) informationProfile.workflowInformationSeen = true;
 	}
 	// LOAD из XMP сначала переключает backend/workflow, затем переносит
 	// сохранённые значения в соответствующий профиль и заново строит UI.
@@ -729,7 +743,6 @@ function mainDialog(selection, initial, responseSeconds) {
 		var profile = backend.schemaProfile(state.schema),
 			selectionValidation = backend.validateSchemaSelections(state.schema, profile);
 		appendNotices(selectionValidation.notices);
-		appendNotices(workflowInputReviewNotices(state.schema));
 		state.emptyDropdownIds = selectionValidation.emptyDropdownIds;
 		fitSelectionBounds(selection, resolveProfileSizeMultiple(state.schema, profile)); updateSelectionSummary();
 		var visible = state.backend == BACKEND_FORGE
@@ -3268,11 +3281,17 @@ function BackendRuntime() {
 	function finalizeInitialData(res) {
 		var validation = res.schema
 			? validateSchemaSelections(res.schema, schemaProfile(res.schema))
-			: { notices: [], emptyDropdownIds: [] };
+			: { notices: [], emptyDropdownIds: [] },
+			informationProfile = res.schema && schemaBackend(res.schema) == BACKEND_COMFY
+				? schemaProfile(res.schema)
+				: null,
+			informationPending = !!(informationProfile &&
+				informationProfile.workflowInformationSeen !== true &&
+				schemaHasInformationalDiagnostics(res.schema));
 		res.notices = takeNotices().concat(validation.notices);
 		res.emptyDropdownIds = validation.emptyDropdownIds;
 		res.forceDialog = !!(res.notices.length || res.emptyDropdownIds.length ||
-			(res.schema && !res.schema.valid));
+			(res.schema && !res.schema.valid) || informationPending);
 		return res;
 	}
 	this.loadInitialData = function (progress, allowFastPath) {
@@ -4469,7 +4488,7 @@ function UI() {
 			name = name == null ? "" : String(name).replace(/^\s+|\s+$/g, "");
 			if (!name) return;
 			if (String(name).toLowerCase() == String(str.presetDefault).toLowerCase()) {
-				alert(str.errDefaultPreset);
+				self.showErrorMessage(str.errDefaultPreset);
 				return;
 			}
 			if (presetStore.hasOwnProperty(name) && !confirm(String(str.errPreset).replace("%1", name), false, str.presetNew)) return;
@@ -4815,31 +4834,7 @@ function UI() {
 		self.showDialog(w);
 	}
 	function showErrorMessage(value, title) {
-		var text = errorMessageText(value), dialogTitle = title || APP.name;
-		if (text.length <= 300) {
-			alert(text, dialogTitle, true);
-			return;
-		}
-		try { app.beep(); } catch (_) { }
-		var w = new Window("dialog{orientation:'column',alignChildren:['fill','top'],spacing:10,margins:15}"),
-			heading = w.add("statictext", undefined, str.errorOccurred),
-			explanation = w.add("statictext", undefined, str.errorDialogIntro, { multiline: true }),
-			details = w.add("panel", undefined, str.errorDetails),
-			msg = details.add("edittext", undefined, text, { multiline: true, scrollable: true, readonly: true }),
-			buttons = w.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,5,0,0]}");
-		buttons.add("button", undefined, "OK", { name: "ok" });
-		w.text = dialogTitle + " — " + str.errorDialogTitle;
-		try { heading.graphics.font = ScriptUI.newFont(heading.graphics.font.name, "BOLD", 15); } catch (_) { }
-		explanation.preferredSize.width = 700;
-		details.orientation = "column";
-		details.alignChildren = ["fill", "fill"];
-		details.margins = 12;
-		msg.preferredSize = [700, 360];
-		msg.minimumSize = [540, 260];
-		msg.readonly = true;
-		self.enableHoverFocus(w);
-		w.center();
-		w.show();
+		showDiagnosticSummary({ title: title || APP.name, errors: [errorMessageText(value)] });
 	}
 	function StartupProgress(msg, timeout, delay) {
 		var w = null, text = null, bar = null,
@@ -5973,7 +5968,7 @@ function Config() {
 			bindingOverrides: { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" },
 			referenceFiles: {}, ignoreUnselectedLoadImages: false, sizeMultiple: self.sizeMultiple,
 			autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
-			outputFormat: "jpg", manualScale: 1,
+			outputFormat: "jpg", manualScale: 1, workflowInformationSeen: false,
 			schemaCache: null, schemaCacheStamp: null, schemaCacheVersion: 0, schemaCacheUsed: 0
 		};
 		normalizeBaseProfile(profile);
@@ -5991,6 +5986,7 @@ function Config() {
 		if (!isObjectMap(profile.referenceFiles)) profile.referenceFiles = {};
 		profile.ignoreUnselectedLoadImages = toBooleanValue(profile.ignoreUnselectedLoadImages);
 		profile.outputFormat = normalizeOutputFormat(profile.outputFormat);
+		profile.workflowInformationSeen = profile.workflowInformationSeen === true;
 		if (profile.sizeMultiple === undefined) profile.sizeMultiple = self.sizeMultiple;
 		profile.sizeMultiple = clamp(parseInt(profile.sizeMultiple, 10) || self.sizeMultiple, 1, 256);
 		return profile;
@@ -6413,7 +6409,6 @@ function Locale() {
 		pythonApiVersion: ["Версия Python API:", "Python API version:"],
 		pythonIdleTimeout: ["Остановка после простоя, мин (0 — выкл.):", "Stop after idle, min (0 = off):"],
 		backendMonitorInterval: ["Проверка бэкендов в фоне, с:", "Background backend check, s:"],
-		errorDialogTitle: ["Ошибка", "Error"],
 		errSettingsSaveAfterError: ["Операция завершилась с ошибкой, и настройки сохранить не удалось:", "The operation failed and the settings could not be saved:"],
 		errSettingsSaveAfterGeneration: ["Результат создан, но настройки сохранить не удалось:", "The result was created, but the settings could not be saved:"],
 		errSettingsReadFile: ["Не удалось прочитать файл настроек.", "Could not read the settings file."],
@@ -6426,9 +6421,7 @@ function Locale() {
 		settingsPrimaryReadError: ["Ошибка основного файла:", "Main-file error:"],
 		noAvailableValues: ["нет доступных значений; генерация отключена", "no available values; generation is disabled"],
 		invalidForgeSchema: ["Ошибка схемы Forge", "Invalid Forge schema"], unknownFile: ["неизвестный файл", "unknown file"],
-		errorOccurred: ["Произошла ошибка", "An error occurred"],
-		errorDialogIntro: ["Операция не завершена. Технические подробности:", "The operation was not completed. Technical details:"],
-		errorDetails: ["Подробности ошибки", "Error details"], errApiConnection: ["Нет соединения с Python API.", "Cannot connect to Python API."],
+		errApiConnection: ["Нет соединения с Python API.", "Cannot connect to Python API."],
 		errApiTimeout: ["Превышено время ожидания ответа Python API. Лог: %LOCALAPPDATA%\\" + APP.tempFolder + "\\" + API_FILE + ".log", "Python API response timed out. Log: %LOCALAPPDATA%\\" + APP.tempFolder + "\\" + API_FILE + ".log"],
 		errApiInvalidAnswer: ["Python API вернул повреждённый ответ.", "Python API returned an invalid response."],
 		errApiProtocolA: ["Запущена несовместимая версия протокола Python API (", "An incompatible Python API protocol is running ("],

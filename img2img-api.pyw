@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 2
-VERSION = "0.194"
+VERSION = "0.195"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "e3834ca5-3f51-4b92-9398-80a451476103"
+ANALYZER_UUID = "8d1619b1-a414-4b9b-a5fa-14930ee013a9"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -3020,8 +3020,6 @@ class WorkflowAnalyzer:
             if input_override
             else self.choose_preferred_input_candidate(sampler_input_candidates or main_input_candidates)
         )
-        input_review_required = False
-        input_review_message = ""
         if input_override and not input_choice:
             self.error(
                 "The node previously assigned the Photoshop image role no longer exists. Open Workflow settings and assign the role again.",
@@ -3269,8 +3267,6 @@ class WorkflowAnalyzer:
             "analysis_uuid": ANALYZER_UUID,
             "size_selection_mode": requested_size_mode,
             "has_size_binding": bool(size_choice),
-            "input_review_required": input_review_required,
-            "input_review_message": input_review_message if input_review_required else "",
             "automatic_empty_inputs": automatic_empty_input_ids,
             "bindings": bindings,
             "controls": controls,
@@ -3279,7 +3275,6 @@ class WorkflowAnalyzer:
                 "input": [item.to_dict() for item in input_candidates],
                 "mask": [item.to_dict() for item in common_mask_candidates],
                 "main_mask_by_input": main_mask_candidates_by_input,
-                "reference": [item.to_dict() for item in input_candidates],
                 "output": [item.to_dict() for item in output_candidates],
                 "size": [item.to_dict() for item in size_candidates],
             },
