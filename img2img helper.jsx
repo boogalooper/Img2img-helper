@@ -581,6 +581,12 @@ function mainDialog(selection, initial, responseSeconds) {
 			if (!duplicate) state.notices.push(items[i]);
 		}
 	}
+	function workflowDiagnosticIsInformational(diagnostic) {
+		diagnostic = diagnostic && typeof diagnostic == "object" ? diagnostic : {};
+		var level = String(diagnostic.level || "").toLowerCase(),
+			code = String(diagnostic.code || legacyWorkflowDiagnosticCode(diagnostic.message || ""));
+		return level == "info" || code == "size_not_found" || code == "sampler_not_found";
+	}
 	function showPendingNotices(schema) {
 		var warnings = [], errors = [], diagnostics = schema && schema.diagnostics instanceof Array ? schema.diagnostics : [],
 			diagnosticTitle = str.workflowDiagnostics;
@@ -594,6 +600,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		}
 		state.notices = [];
 		for (i = 0; i < diagnostics.length; i++) {
+			if (workflowDiagnosticIsInformational(diagnostics[i])) continue;
 			var diagnosticText = workflowDiagnosticText(diagnostics[i]),
 				level = String(diagnostics[i].level || "").toLowerCase();
 			if (!diagnosticText) continue;
@@ -3269,7 +3276,8 @@ function BackendRuntime() {
 		return res;
 	}
 	this.loadInitialData = function (progress, allowFastPath) {
-		var res = { backend: cfg.activeBackend, workflows: [], forgePresets: [], forgeCatalog: null, schema: null, fastPath: false };
+		var res = { backend: cfg.activeBackend, workflows: [], forgePresets: [], forgeCatalog: null, schema: null, fastPath: false },
+			requireRecordedSelection = actionPlaybackMode && actionUsesRecordedSettings;
 		if (cfg.activeBackend == BACKEND_FORGE) {
 			var fastForge = allowFastPath ? fastForgeSelection() : null;
 			if (fastForge) {
@@ -3278,7 +3286,10 @@ function BackendRuntime() {
 			} else {
 				if (progress) progress.setStage(str.progressForgePresets, 42);
 				res.forgePresets = refreshForgeSchemas(progress);
-				cfg.selectedForgePreset = cfg.data.selectedForgePreset = chooseForgeSchema(res.forgePresets);
+				if (requireRecordedSelection) {
+					if (!findForgeSchema(res.forgePresets, cfg.selectedForgePreset))
+						throw new Error(apiErrorText({ code: "forge_schema_missing", params: [cfg.selectedForgePreset] }));
+				} else cfg.selectedForgePreset = cfg.data.selectedForgePreset = chooseForgeSchema(res.forgePresets);
 			}
 			res.forgeCatalog = {};
 			if (cfg.selectedForgePreset) {
@@ -3286,7 +3297,7 @@ function BackendRuntime() {
 				try {
 					loadedForge = loadForgeSchema(cfg.selectedForgePreset, res.forgeCatalog, progress, false);
 				} catch (fastForgeError) {
-					if (!res.fastPath) throw fastForgeError;
+					if (!res.fastPath || requireRecordedSelection) throw fastForgeError;
 					// Повреждённая или удалённая выбранная схема не должна
 					// превращать тихий запуск в тупиковую ошибку: полный список
 					// найдёт валидную замену и откроет окно с уведомлением.
@@ -3306,6 +3317,10 @@ function BackendRuntime() {
 			return finalizeInitialData(res);
 		}
 		if (!comfyFolderReady()) {
+			if (requireRecordedSelection) {
+				if (!cfg.workflowsFolder) throw new Error(apiErrorText({ code: "workflow_folder_not_selected" }));
+				throw new Error(apiErrorText({ code: "workflow_folder_missing", params: [cfg.workflowsFolder] }));
+			}
 			cfg.selectedWorkflow = cfg.data.selectedWorkflow = "";
 			return finalizeInitialData(res);
 		}
@@ -3316,7 +3331,10 @@ function BackendRuntime() {
 		} else {
 			if (progress) progress.setStage(str.progressWorkflows, 42);
 			res.workflows = refreshWorkflows(progress);
-			cfg.selectedWorkflow = cfg.data.selectedWorkflow = chooseWorkflow(res.workflows);
+			if (requireRecordedSelection) {
+				if (!findWorkflow(res.workflows, cfg.selectedWorkflow))
+					throw new Error(apiErrorText({ code: "selected_workflow_missing" }));
+			} else cfg.selectedWorkflow = cfg.data.selectedWorkflow = chooseWorkflow(res.workflows);
 		}
 		if (res.workflows.length) {
 			var sel = findWorkflow(res.workflows, cfg.selectedWorkflow);

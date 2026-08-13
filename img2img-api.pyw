@@ -1948,6 +1948,10 @@ class WorkflowAnalyzer:
             item["params"] = [str(value) for value in params]
         self.diagnostics.append(item)
 
+    def info(self, message: str, code: str = "", params: Optional[Sequence[Any]] = None) -> None:
+        LOGGER.info("Workflow analysis: %s", message)
+        self._add_diagnostic("info", message, code, params)
+
     def warning(self, message: str, code: str = "", params: Optional[Sequence[Any]] = None) -> None:
         LOGGER.warning("Workflow analysis: %s", message)
         self._add_diagnostic("warning", message, code, params)
@@ -3208,14 +3212,14 @@ class WorkflowAnalyzer:
             and not size_candidates
             and not self.input_drives_sampler_latent(input_choice, primary_sampler)
         ):
-            self.warning(
+            self.info(
                 "No option was found for Width / height fields. The script will send a correctly sized Photoshop image, "
                 "but the final size depends on the workflow logic.",
                 "size_not_found",
             )
 
         if not primary_sampler:
-            self.warning(
+            self.info(
                 "The primary sampler was not recognized; standard parameters may be incomplete.",
                 "sampler_not_found",
             )
