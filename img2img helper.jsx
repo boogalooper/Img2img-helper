@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.193",
+	VER = "0.194",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -87,6 +87,7 @@ var APP = {
 	action = new ActionRuntime(),
 	backend = new BackendRuntime(),
 	ui = new UI(),
+	messages = new MessageCenter(),
 	generationTimings = new Delay(),
 	str = new Locale(),
 	apl = new AM("application"),
@@ -116,7 +117,7 @@ catch (e) {
 				(e.line ? "\n\n" + str.jsxLine + e.line : "");
 		if (settingsSaveError) errorText += "\n\n" + str.errSettingsSaveAfterError +
 			"\n" + settingsSaveError;
-		ui.showErrorMessage(errorText, APP.name);
+		messages.error(errorText, APP.name);
 		isCancelled = false;
 		$.setenv(APP.dialogEnvKey, "true");
 	}
@@ -493,7 +494,7 @@ function mainDialog(selection, initial, responseSeconds) {
 				if (!loadLayerGenerationSettings(metadata, progress)) throw new Error(str.errLayerMetadata);
 			});
 			updateMetadataButton();
-		} catch (e) { ui.showErrorMessage(e); }
+		} catch (e) { messages.error(e); }
 	};
 	bSettings.onClick = function () {
 		saveCurrentValues();
@@ -518,7 +519,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			try { api.handshake(null, cfg, "silent"); } catch (_) { }
 			backend.applyStatus(oldStatus);
 			backend.normalizeActiveBackend();
-			ui.showErrorMessage(e);
+			messages.error(e);
 		}
 	};
 	bOk.onClick = function () {
@@ -528,7 +529,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			if (!state.schema.valid) throw new Error(str.errWorkflowInvalid);
 			state.result = { cancelled: false, backend: state.backend, schema: state.schema, values: collectValues() };
 			w.close(1);
-		} catch (e) { ui.showErrorMessage(e); }
+		} catch (e) { messages.error(e); }
 	};
 	w.onClose = function () {
 		if (!state.result) {
@@ -609,7 +610,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		}
 		if (signature == state.workflowDiagnosticSignature) return;
 		state.workflowDiagnosticSignature = signature;
-		ui.showDiagnosticSummary({ title: diagnosticTitle, errors: errors, warnings: warnings });
+		messages.show({ title: diagnosticTitle, errors: errors, warnings: warnings });
 		// Обычный повторный анализ и сохранение настроек сохраняют этот флаг;
 		// полный сброс удаляет профиль и снова разрешает показ информации.
 		if (informationShown) informationProfile.workflowInformationSeen = true;
@@ -814,7 +815,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			if (selectedBackend == state.backend) return;
 			saveCurrentValues();
 			try { ui.runWithPaletteProgress(str.progressInitializing, function (progress) { loadBackend(selectedBackend, progress, true); }); }
-			catch (e) { ui.showErrorMessage(e); showControls(); }
+			catch (e) { messages.error(e); showControls(); }
 		};
 	}
 	function addSchemaControl(parent) {
@@ -895,7 +896,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (actionName == "rebuild") {
 			if (!state.schema) return;
 			var profileId = operations.profileId(),
-				fullReset = ui.showDecisionDialog(operations.rebuildConfirm, APP.name);
+				fullReset = messages.confirm(operations.rebuildConfirm, APP.name);
 			if (fullReset === null) return;
 			runSchemaAction(function () {
 				if (fullReset) operations.resetProfile(profileId);
@@ -908,7 +909,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			if (!state.schema) return;
 			var saveTarget;
 			try { saveTarget = chooseSchemaSaveAsTarget(operations); }
-			catch (e) { ui.showErrorMessage(e); return; }
+			catch (e) { messages.error(e); return; }
 			if (!saveTarget) return;
 			runSchemaAction(function () {
 				saveCurrentValues();
@@ -960,7 +961,7 @@ function mainDialog(selection, initial, responseSeconds) {
 
 	function runSchemaAction(callback, after) {
 		try { callback(); }
-		catch (e) { ui.showErrorMessage(e); }
+		catch (e) { messages.error(e); }
 		finally { if (after) after(); }
 	}
 	function schemaControlOperations() {
@@ -1664,7 +1665,7 @@ function mainDialog(selection, initial, responseSeconds) {
 						errors.push(displayCandidateName(candidate) + ": " + str.errEmptyRoleUnsupported);
 				}
 				if (errors.length)
-					ui.showDiagnosticSummary({ title: str.workflowDiagnostics, errors: errors });
+					messages.show({ title: str.workflowDiagnostics, errors: errors });
 				if (errors.length) return false;
 				profile.bindingOverrides.input = main && (!storedMainId && targetsEqual(main, automaticInputTargets))
 					? "" : (main ? main.id : "");
@@ -1827,7 +1828,7 @@ function mainDialog(selection, initial, responseSeconds) {
 					backend.applyStatus(probeStatus);
 				});
 				statusValue.text = backend.statusLabel();
-			} catch (e) { ui.showErrorMessage(e); }
+			} catch (e) { messages.error(e); }
 		};
 		var resize = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
 		resize.text = str.resizePresetManagement;
@@ -1884,12 +1885,12 @@ function mainDialog(selection, initial, responseSeconds) {
 			toolbar.add.onClick = function () {
 				var cur = readPreset(),
 					defaultName = presetList.selection ? tempCfg.resizePresets[presetList.selection.index].name + str.presetCopy : str.resizePresetNew,
-					name = prompt(str.resizePresetPrompt, defaultName, str.resizePresetTitle);
+					name = messages.prompt(str.resizePresetPrompt, defaultName, str.resizePresetTitle);
 				name = name == null ? "" : String(name).replace(/^\s+|\s+$/g, "");
 				if (!name.length) return;
 				var found = presets.findResizeIndex(name, tempCfg.resizePresets);
 				if (found >= 0) {
-					if (!confirm(String(str.errResizePreset).replace("%1", name), false, str.resizePresetTitle)) return;
+					if (messages.confirm(String(str.errResizePreset).replace("%1", name), str.resizePresetTitle) !== true) return;
 					tempCfg.resizePresets[found] = presets.createResize(name, cur.minSide, cur.maxMp);
 				} else {
 					tempCfg.resizePresets.push(presets.createResize(name, cur.minSide, cur.maxMp));
@@ -2315,7 +2316,7 @@ function GenerationRuntime() {
 				// самой генерации. Результат уже размещён и остаётся в
 				// документе; пользователю показывается отдельная ошибка.
 				$.setenv(APP.dialogEnvKey, "true");
-				ui.showErrorMessage(
+				messages.error(
 					APP.name + "\n\n" + str.errSettingsSaveAfterGeneration +
 					"\n" + errorMessageText(saveError) +
 					(saveError && saveError.line ? "\n\n" + str.jsxLine + saveError.line : ""),
@@ -2326,7 +2327,7 @@ function GenerationRuntime() {
 				var localizedGenerationWarnings = [];
 				for (var warningIndex = 0; warningIndex < answer.warnings.length; warningIndex++)
 					localizedGenerationWarnings.push(workflowDiagnosticText(answer.warnings[warningIndex]));
-				ui.showDiagnosticSummary({ title: str.generationDiagnostics, warnings: localizedGenerationWarnings });
+				messages.show({ title: str.generationDiagnostics, warnings: localizedGenerationWarnings });
 			}
 		} finally {
 			if (inputFile && inputFile.exists) try { inputFile.remove(); } catch (_) { }
@@ -3290,6 +3291,98 @@ function BackendRuntime() {
 	};
 }
 // ---
+// ЕДИНЫЙ ДИСПЕТЧЕР ПОЛЬЗОВАТЕЛЬСКИХ СООБЩЕНИЙ
+// Ошибки, предупреждения, информация, подтверждения и ввод текста используют
+// только кастомные ScriptUI-окна. Звук Photoshop подаётся только для ошибок.
+// ---
+function MessageCenter() {
+	function unique(items) {
+		var res = [], seen = {};
+		items = items instanceof Array ? items : [];
+		for (var i = 0; i < items.length; i++) {
+			var text = errorMessageText(items[i]).replace(/^\s+|\s+$/g, ""), key = text.toLowerCase();
+			if (!text || seen[key]) continue;
+			seen[key] = true;
+			res.push(text);
+		}
+		return res;
+	}
+	this.show = function (options) {
+		options = options || {};
+		var errors = unique(options.errors),
+			warnings = unique(options.warnings),
+			information = unique(options.information);
+		if (!errors.length && !warnings.length && !information.length) return false;
+		var sections = [];
+		if (errors.length) sections.push(str.diagnosticsErrors + "\n• " + errors.join("\n• "));
+		if (warnings.length) sections.push(str.diagnosticsWarnings + "\n• " + warnings.join("\n• "));
+		if (information.length) sections.push(str.diagnosticsInformation + ":\n• " + information.join("\n• "));
+		var dialog = ui.createDialog({ title: options.title || APP.name, spacing: 10, margins: 15 }),
+			heading = dialog.add("statictext", undefined, errors.length ? str.diagnosticsNeedAttention : str.diagnosticsInformation),
+			details = dialog.add("edittext", undefined, sections.join("\n\n"), { multiline: true, scrollable: true, readonly: true }),
+			buttons = dialog.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,5,0,0]}");
+		buttons.add("button", undefined, str.dialogOk, { name: "ok" });
+		try { heading.graphics.font = ScriptUI.newFont(heading.graphics.font.name, "BOLD", 15); } catch (_) { }
+		var itemCount = errors.length + warnings.length + information.length;
+		details.preferredSize = [700, Math.min(380, Math.max(180, 90 + itemCount * 28))];
+		details.minimumSize = [540, 180];
+		details.readonly = true;
+		if (errors.length && options.sound !== false) try { app.beep(); } catch (_) { }
+		ui.showDialog(dialog);
+		return true;
+	};
+	this.error = function (value, title) {
+		return this.show({ title: title || APP.name, errors: [errorMessageText(value)] });
+	};
+	this.confirm = function (message, title, yesText, noText) {
+		var result = null,
+			dialog = ui.createDialog({ title: title || APP.name, spacing: 12, margins: 15 }),
+			text = ui.addMultilineNote(dialog, message, 500),
+			buttons = dialog.add("group{orientation:'row',alignment:['right','top'],alignChildren:['right','center'],spacing:8,margins:0}"),
+			noButton = buttons.add("button", undefined, noText || str.dialogNo, { name: "cancel" }),
+			yesButton = buttons.add("button", undefined, yesText || str.dialogYes, { name: "ok" });
+		text.preferredSize.width = text.minimumSize.width = 500;
+		noButton.onClick = function () { result = false; dialog.close(1); };
+		yesButton.onClick = function () { result = true; dialog.close(1); };
+		try { dialog.cancelElement = null; } catch (_) { }
+		try {
+			dialog.addEventListener("keydown", function (event) {
+				if (!event || event.keyName != "Escape") return;
+				result = null;
+				try { event.preventDefault(); } catch (_) { }
+				try { event.stopPropagation(); } catch (_) { }
+				dialog.close(0);
+			}, true);
+		} catch (_) { }
+		dialog.onShow = function () {
+			try { dialog.cancelElement = null; } catch (_) { }
+			try { dialog.defaultElement = noButton; } catch (_) { }
+			try { noButton.active = true; } catch (_) { }
+		};
+		ui.showDialog(dialog);
+		return result;
+	};
+	this.prompt = function (message, defaultValue, title) {
+		var result = null,
+			dialog = ui.createDialog({ title: title || APP.name, spacing: 10, margins: 15 }),
+			text = ui.addMultilineNote(dialog, message, 500),
+			input = dialog.add("edittext", undefined, String(defaultValue === undefined ? "" : defaultValue)),
+			buttons = dialog.add("group{orientation:'row',alignment:['right','top'],alignChildren:['right','center'],spacing:8,margins:[0,5,0,0]}"),
+			cancelButton = buttons.add("button", undefined, str.dialogCancel, { name: "cancel" }),
+			okButton = buttons.add("button", undefined, str.dialogOk, { name: "ok" });
+		text.preferredSize.width = text.minimumSize.width = 500;
+		input.preferredSize.width = input.minimumSize.width = 500;
+		cancelButton.onClick = function () { result = null; dialog.close(0); };
+		okButton.onClick = function () { result = input.text; dialog.close(1); };
+		dialog.onShow = function () {
+			try { dialog.defaultElement = okButton; } catch (_) { }
+			try { input.active = true; } catch (_) { }
+		};
+		ui.showDialog(dialog);
+		return result;
+	};
+}
+// ---
 // БИБЛИОТЕКА КОМПОНЕНТОВ SCRIPTUI
 // Фабрики возвращают контроллеры с getValue(), но сами живые ScriptUI-элементы
 // никогда не переносятся между окнами или пересозданными контейнерами.
@@ -3445,37 +3538,6 @@ function UI() {
 				return res;
 			}
 		};
-	};
-	this.showDecisionDialog = function (msg, title, yesText, noText) {
-		var res = null,
-			dialog = self.createDialog({ title: title || APP.name, spacing: 12, margins: 15 }),
-			text = self.addMultilineNote(dialog, msg, 500),
-			buttons = dialog.add("group{orientation:'row',alignment:['right','top'],alignChildren:['right','center'],spacing:8,margins:0}"),
-			noButton = buttons.add("button", undefined, undefined, { name: "cancel" }),
-			yesButton = buttons.add("button", undefined, undefined, { name: "ok" });
-		text.preferredSize.width = text.minimumSize.width = 500;
-		noButton.text = noText || str.dialogNo;
-		yesButton.text = yesText || str.dialogYes;
-		noButton.onClick = function () { res = false; dialog.close(1); };
-		yesButton.onClick = function () { res = true; dialog.close(1); };
-		try { dialog.cancelElement = null; } catch (_) { }
-		try {
-			dialog.addEventListener("keydown", function (event) {
-				if (!event || event.keyName != "Escape") return;
-				res = null;
-				try { event.preventDefault(); } catch (_) { }
-				try { event.stopPropagation(); } catch (_) { }
-				dialog.close(0);
-			}, true);
-		} catch (_) { }
-		dialog.onShow = function () {
-			try { dialog.cancelElement = null; } catch (_) { }
-			try { dialog.defaultElement = noButton; } catch (_) { }
-			try { noButton.active = true; } catch (_) { }
-		};
-		dialog.onClose = function () { return true; };
-		self.showDialog(dialog);
-		return res;
 	};
 	this.promptHeight = function () {
 		return Math.max(54, 80 - Math.round(Math.max(0, self.mainWindowWidth - 315) * 0.4));
@@ -4402,14 +4464,14 @@ function UI() {
 		};
 		add.onClick = function () {
 			var currentName = presetList.selection ? presetList.selection.text : str.presetDefault,
-				name = prompt(str.presetNamePrompt, currentName + str.presetCopy, str.presetNew);
+				name = messages.prompt(str.presetNamePrompt, currentName + str.presetCopy, str.presetNew);
 			name = name == null ? "" : String(name).replace(/^\s+|\s+$/g, "");
 			if (!name) return;
 			if (String(name).toLowerCase() == String(str.presetDefault).toLowerCase()) {
-				self.showErrorMessage(str.errDefaultPreset);
+				messages.error(str.errDefaultPreset);
 				return;
 			}
-			if (presetStore.hasOwnProperty(name) && !confirm(String(str.errPreset).replace("%1", name), false, str.presetNew)) return;
+			if (presetStore.hasOwnProperty(name) && messages.confirm(String(str.errPreset).replace("%1", name), str.presetNew) !== true) return;
 			presetStore[name] = presets.promptText(edit.text);
 			fillPresets(name);
 			rememberSelectedPreset();
@@ -4424,7 +4486,7 @@ function UI() {
 			if (!presetList.selection || presetList.selection.index == 0) return;
 			var index = presetList.selection.index,
 				name = presetList.selection.text;
-			if (!confirm(str.presetDeleteConfirmA + name + str.presetDeleteConfirmB)) return;
+			if (messages.confirm(str.presetDeleteConfirmA + name + str.presetDeleteConfirmB, APP.name) !== true) return;
 			delete presetStore[name];
 			fillPresets(null, Math.max(0, index - 1));
 			rememberSelectedPreset();
@@ -4441,10 +4503,10 @@ function UI() {
 					edit.text = translated;
 					updateControlState();
 				} else {
-					self.showErrorMessage(str.errTranslate);
+					messages.error(str.errTranslate);
 				}
 			} catch (e) {
-				self.showErrorMessage((e && e.message ? e.message : str.errTranslate));
+				messages.error((e && e.message ? e.message : str.errTranslate));
 			}
 		};
 		return { getValue: function () { return edit.text; }, control: edit, container: group };
@@ -4549,7 +4611,7 @@ function UI() {
 					return;
 				}
 				if (!isSupportedReferenceImage(file.fsName)) {
-					self.showErrorMessage(str.errReferenceImageFormat);
+					messages.error(str.errReferenceImageFormat);
 					rebuild(currentPath());
 					return;
 				}
@@ -4721,39 +4783,6 @@ function UI() {
 			progress.close();
 		}
 	}
-	function showDiagnosticSummary(options) {
-		options = options || {};
-		function unique(items) {
-			var res = [], seen = {};
-			items = items instanceof Array ? items : [];
-			for (var i = 0; i < items.length; i++) {
-				var text = errorMessageText(items[i]).replace(/^\s+|\s+$/g, ""), key = text.toLowerCase();
-				if (!text || seen[key]) continue;
-				seen[key] = true; res.push(text);
-			}
-			return res;
-		}
-		var errors = unique(options.errors), warnings = unique(options.warnings);
-		if (!errors.length && !warnings.length) return;
-		var sections = [];
-		if (errors.length) sections.push(str.diagnosticsErrors + "\n• " + errors.join("\n• "));
-		if (warnings.length) sections.push(str.diagnosticsWarnings + "\n• " + warnings.join("\n• "));
-		var text = sections.join("\n\n"),
-			w = self.createDialog({ title: options.title || APP.name, spacing: 10, margins: 15 }),
-			heading = w.add("statictext", undefined, errors.length ? str.diagnosticsNeedAttention : str.diagnosticsInformation),
-			details = w.add("edittext", undefined, text, { multiline: true, scrollable: true, readonly: true }),
-			buttons = w.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,5,0,0]}");
-		buttons.add("button", undefined, "OK", { name: "ok" });
-		try { heading.graphics.font = ScriptUI.newFont(heading.graphics.font.name, "BOLD", 15); } catch (_) { }
-		details.preferredSize = [700, Math.min(380, Math.max(180, 90 + (errors.length + warnings.length) * 28))];
-		details.minimumSize = [540, 180];
-		details.readonly = true;
-		if (errors.length) try { app.beep(); } catch (_) { }
-		self.showDialog(w);
-	}
-	function showErrorMessage(value, title) {
-		showDiagnosticSummary({ title: title || APP.name, errors: [errorMessageText(value)] });
-	}
 	function StartupProgress(msg, timeout, delay) {
 		var w = null, text = null, bar = null,
 			currentMessage = msg,
@@ -4811,8 +4840,6 @@ function UI() {
 	this.addForgeImageStitchControls = addForgeImageStitchControls;
 	this.addResizeControl = addResizeControl;
 	this.runWithPaletteProgress = runWithPaletteProgress;
-	this.showDiagnosticSummary = showDiagnosticSummary;
-	this.showErrorMessage = showErrorMessage;
 	this.createStartupProgress = function (msg, timeout) { return new StartupProgress(msg, timeout, 0); };
 	this.createDelayedStartupProgress = function (msg, timeout, delay) { return new StartupProgress(msg, timeout, delay); };
 }
@@ -6440,6 +6467,7 @@ function Locale() {
 		noneReference: ["нет", "none"], selectReferenceImage: ["Выберите референсное изображение", "Select reference image"],
 		errReferenceImageFormat: ["Поддерживаются только изображения JPG, JPEG, PNG и WebP.", "Only JPG, JPEG, PNG and WebP images are supported."],
 		saveChanges: ["Сохранить изменения", "Save changes"], dialogYes: ["Да", "Yes"], dialogNo: ["Нет", "No"],
+		dialogOk: ["ОК", "OK"], dialogCancel: ["Отмена", "Cancel"],
 		saveWorkflowJson: ["Сохранить workflow как…", "Save workflow as…"],
 		saveWorkflowAsPrompt: ["Сохранить workflow JSON как…", "Save workflow JSON as…"],
 		saveForgeSchemaJson: ["Сохранить схему Forge как…", "Save Forge schema as…"],

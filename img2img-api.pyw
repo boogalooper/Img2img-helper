@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.196"
+VERSION = "0.197"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -5322,6 +5322,162 @@ def _forge_lora_prompt_prefix(loras: Sequence[Dict[str, Any]]) -> str:
     return " ".join(tags)
 
 
+def _build_forge_payload(
+    schema: Dict[str, Any],
+    values: Dict[str, Any],
+    runtime_catalog: Dict[str, Any],
+    *,
+    input_mode: str,
+    input_key: str,
+    input_data_url: str,
+    width: int,
+    height: int,
+    selected_loras: List[Any],
+    image_stitch_data_urls: Sequence[str],
+) -> Dict[str, Any]:
+    """Build and validate a Forge request without files, network or globals."""
+
+    generation = schema.get("generation") if isinstance(schema.get("generation"), dict) else {}
+    controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
+    controls_by_id = {
+        str(control.get("id") or ""): control
+        for control in controls
+        if isinstance(control, dict) and control.get("id")
+    }
+
+    require_any = generation.get("require_any")
+    if isinstance(require_any, list) and require_any:
+        enabled = False
+        for control_id in require_any:
+            control_key = str(control_id)
+            definition = controls_by_id.get(control_key, {})
+            current_value = (
+                _forge_control_value(definition, values, runtime_catalog)
+                if definition else values.get(control_key, False)
+            )
+            if _forge_bool(current_value):
+                enabled = True
+                break
+        if not enabled:
+            raise UserVisibleError(
+                str(generation.get("require_any_error") or "Select at least one processing mode."),
+                "forge_processing_mode_required",
+            )
+
+    payload: Dict[str, Any]
+    if input_mode == "single_image":
+        payload = {input_key: input_data_url}
+    else:
+        payload = {"width": width, "height": height, "n_iter": 1}
+
+    allowed = {
+        "prompt", "negative_prompt", "sampler_name", "scheduler", "steps",
+        "cfg_scale", "distilled_cfg_scale", "denoising_strength", "seed",
+        "batch_size", "batch_count",
+    }
+    schema_allowed = generation.get("allowed_payload_fields")
+    if isinstance(schema_allowed, list):
+        allowed.update(str(item) for item in schema_allowed if str(item))
+
+    negative_prompt_omitted = _forge_cfg_disables_negative_prompt(
+        controls, values, runtime_catalog
+    )
+    for control in controls:
+        if not isinstance(control, dict):
+            continue
+        control_id = str(control.get("id") or "")
+        payload_key = str(control.get("payload_key") or "")
+        if payload_key not in allowed:
+            continue
+        enabled_by = str(control.get("enabled_by") or "")
+        if enabled_by:
+            source_definition = controls_by_id.get(enabled_by, {})
+            source_value = (
+                _forge_control_value(source_definition, values, runtime_catalog)
+                if source_definition else values.get(enabled_by, False)
+            )
+            if not _forge_bool(source_value):
+                if payload_key == "negative_prompt":
+                    negative_prompt_omitted = True
+                continue
+        if payload_key == "negative_prompt" and negative_prompt_omitted:
+            continue
+        payload[payload_key] = _forge_control_value(control, values, runtime_catalog)
+
+    fixed_values = schema.get("fixed_values") if isinstance(schema.get("fixed_values"), dict) else {}
+    for key, value in fixed_values.items():
+        if key in allowed:
+            payload[key] = copy.deepcopy(value)
+    if negative_prompt_omitted:
+        payload.pop("negative_prompt", None)
+
+    normalized_loras = _normalize_forge_loras(
+        selected_loras,
+        runtime_catalog.get("loras") if isinstance(runtime_catalog.get("loras"), list) else None,
+    )
+    prefix = _forge_lora_prompt_prefix(normalized_loras)
+    if prefix:
+        prompt = str(payload.get("prompt") or "")
+        payload["prompt"] = prefix + (" " + prompt if prompt else "")
+
+    if input_mode != "single_image":
+        payload.setdefault("prompt", "")
+        if not negative_prompt_omitted:
+            payload.setdefault("negative_prompt", "")
+        payload.setdefault("sampler_name", "Euler a")
+        payload.setdefault("scheduler", "Automatic")
+        payload.setdefault("steps", 20)
+        payload.setdefault("cfg_scale", 6)
+        payload.setdefault("seed", -1)
+        if input_mode != "txt2img":
+            payload["init_images"] = [input_data_url]
+
+    stitch_urls = [str(item) for item in image_stitch_data_urls if str(item)]
+    if stitch_urls:
+        capabilities = schema.get("capabilities") if isinstance(schema.get("capabilities"), dict) else {}
+        if input_mode == "single_image" or not _forge_bool(capabilities.get("image_stitch")):
+            raise UserVisibleError(
+                "ImageStitch cannot be used with this Forge schema.",
+                "forge_image_stitch_unsupported",
+            )
+        alwayson_scripts = payload.get("alwayson_scripts")
+        alwayson_scripts = copy.deepcopy(alwayson_scripts) if isinstance(alwayson_scripts, dict) else {}
+        alwayson_scripts["ImageStitch Integrated"] = {
+            "args": [True, stitch_urls[:_forge_image_stitch_limit(capabilities)], 1024]
+        }
+        payload["alwayson_scripts"] = alwayson_scripts
+
+    return payload
+
+
+def _forge_image_stitch_data_urls(
+    image_inputs: Any, maximum: int
+) -> List[str]:
+    """Validate and encode ImageStitch files before pure payload assembly."""
+
+    encoded: List[str] = []
+    seen: Set[str] = set()
+    for raw in image_inputs if isinstance(image_inputs, list) else []:
+        if len(encoded) >= maximum:
+            break
+        raw_path = str(raw or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        if not _is_supported_forge_reference(path):
+            LOGGER.warning("Unsupported ImageStitch reference was ignored: %s", path)
+            continue
+        if not path.is_file():
+            LOGGER.warning("Missing ImageStitch reference was ignored: %s", path)
+            continue
+        normalized = os.path.normcase(str(path.resolve()))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        encoded.append(_forge_reference_data_url(path))
+    return encoded
+
+
 def _forge_response_image(result: Any, response_keys: List[str]) -> Optional[str]:
     if not isinstance(result, dict):
         return None
@@ -5348,8 +5504,8 @@ def forge_post_in_progress() -> bool:
         return any(thread.is_alive() for thread in FORGE_POST_THREADS.values())
 
 
-# Собирает payload только из разрешённых полей схемы. Значения скрытых контролов
-# берутся из default схемы, а значения видимых — из проверенного словаря JSX.
+# Подготавливает внешние данные, вызывает чистую сборку payload и управляет
+# сетевым запросом, progress и сохранением результата.
 def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     message = task.get("message") or {}
     schema_id = str(message.get("schema_id") or "")
@@ -5386,162 +5542,34 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     if not isinstance(response_keys, list) or not response_keys:
         response_keys = ["images", "image"]
     response_keys = [str(item) for item in response_keys if str(item)]
-
-    controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
-    controls_by_id = {
-        str(control.get("id") or ""): control
-        for control in controls
-        if isinstance(control, dict) and control.get("id")
-    }
-
-    require_any = generation.get("require_any")
-    if isinstance(require_any, list) and require_any:
-        enabled = False
-        for control_id in require_any:
-            control_key = str(control_id)
-            definition = controls_by_id.get(control_key, {})
-            current_value = (
-                _forge_control_value(definition, values, runtime_catalog)
-                if definition else values.get(control_key, False)
-            )
-            if _forge_bool(current_value):
-                enabled = True
-                break
-        if not enabled:
-            raise UserVisibleError(
-                str(generation.get("require_any_error") or "Select at least one processing mode."),
-                "forge_processing_mode_required",
-            )
-
-    payload: Dict[str, Any]
-    if input_mode == "single_image":
-        payload = {input_key: _file_data_url(input_path)}
-    else:
-        payload = {"width": width, "height": height, "n_iter": 1}
-
-    allowed = {
-        "prompt", "negative_prompt", "sampler_name", "scheduler", "steps",
-        "cfg_scale", "distilled_cfg_scale", "denoising_strength", "seed",
-        "batch_size", "batch_count",
-    }
-    schema_allowed = generation.get("allowed_payload_fields")
-    if isinstance(schema_allowed, list):
-        allowed.update(str(item) for item in schema_allowed if str(item))
-
-    negative_prompt_omitted = _forge_cfg_disables_negative_prompt(
-        controls, values, runtime_catalog
-    )
-    for control in controls:
-        if not isinstance(control, dict):
-            continue
-        control_id = str(control.get("id") or "")
-        payload_key = str(control.get("payload_key") or "")
-        if payload_key not in allowed:
-            continue
-        enabled_by = str(control.get("enabled_by") or "")
-        if enabled_by:
-            source_definition = controls_by_id.get(enabled_by, {})
-            source_value = (
-                _forge_control_value(source_definition, values, runtime_catalog)
-                if source_definition else values.get(enabled_by, False)
-            )
-            if not _forge_bool(source_value):
-                if payload_key == "negative_prompt":
-                    negative_prompt_omitted = True
-                continue
-        # Negative prompt не отправляется при обычном CFG Scale <= 1.
-        if payload_key == "negative_prompt" and negative_prompt_omitted:
-            negative_prompt_omitted = True
-            continue
-        # Значение из JSX есть у видимого поля; для скрытого поля применяется
-        # проверенное значение по умолчанию непосредственно из JSON-схемы.
-        payload[payload_key] = _forge_control_value(control, values, runtime_catalog)
-
-    fixed_values = schema.get("fixed_values") if isinstance(schema.get("fixed_values"), dict) else {}
-    for key, value in fixed_values.items():
-        if key in allowed:
-            payload[key] = value
-    if negative_prompt_omitted:
-        payload.pop("negative_prompt", None)
-
-    if selected_loras:
-        normalized_loras = _normalize_forge_loras(
-            selected_loras,
-            runtime_catalog.get("loras") if isinstance(runtime_catalog.get("loras"), list) else None,
-        )
-        prefix = _forge_lora_prompt_prefix(normalized_loras)
-        if prefix:
-            prompt = str(payload.get("prompt") or "")
-            payload["prompt"] = prefix + (" " + prompt if prompt else "")
-
     capabilities = schema.get("capabilities") if isinstance(schema.get("capabilities"), dict) else {}
     stitch_requested = (
         _forge_bool(values.get("image_stitch", schema.get("image_stitch_default", False)))
         and _forge_bool(capabilities.get("image_stitch"))
     )
+    encoded_stitch_inputs = (
+        _forge_image_stitch_data_urls(
+            message.get("image_inputs"), _forge_image_stitch_limit(capabilities)
+        )
+        if stitch_requested else []
+    )
+    if stitch_requested and not encoded_stitch_inputs:
+        LOGGER.info("ImageStitch was requested without usable reference files; continuing without it.")
 
-    if input_mode != "single_image":
-        payload.setdefault("prompt", "")
-        if not negative_prompt_omitted:
-            payload.setdefault("negative_prompt", "")
-        payload.setdefault("sampler_name", "Euler a")
-        payload.setdefault("scheduler", "Automatic")
-        payload.setdefault("steps", 20)
-        payload.setdefault("cfg_scale", 6)
-        payload.setdefault("seed", -1)
-        # В img2img выделение Photoshop остаётся основным init_image.
-        # В txt2img оно задаёт только размер и область размещения результата.
-        if input_mode != "txt2img":
-            payload["init_images"] = [_file_data_url(input_path)]
-
-    if stitch_requested:
-        maximum = _forge_image_stitch_limit(capabilities)
-        image_inputs = message.get("image_inputs") if isinstance(message.get("image_inputs"), list) else []
-        encoded: List[str] = []
-        seen: Set[str] = set()
-        for raw in image_inputs:
-            if len(encoded) >= maximum:
-                break
-            raw_path = str(raw or "").strip()
-            if not raw_path:
-                continue
-            path = Path(raw_path)
-            if not _is_supported_forge_reference(path):
-                LOGGER.warning("Unsupported ImageStitch reference was ignored: %s", path)
-                continue
-            if not path.is_file():
-                LOGGER.warning("Missing ImageStitch reference was ignored: %s", path)
-                continue
-            normalized = os.path.normcase(str(path.resolve()))
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            encoded.append(_forge_reference_data_url(path))
-
-        # Пустые или полностью устаревшие списки не должны блокировать обычную
-        # генерацию: в таком случае ImageStitch просто не активируется.
-        if encoded:
-            if input_mode == "single_image":
-                raise UserVisibleError(
-                    "ImageStitch cannot be used with this Forge schema.",
-                    "forge_image_stitch_unsupported",
-                )
-            # Не заменяем alwayson_scripts целиком: схема может уже включать
-            # другие Forge extensions, которые должны работать вместе с ImageStitch.
-            alwayson_scripts = payload.get("alwayson_scripts")
-            if not isinstance(alwayson_scripts, dict):
-                alwayson_scripts = {}
-            else:
-                alwayson_scripts = copy.deepcopy(alwayson_scripts)
-            # Forge Neo currently exposes three ImageStitch arguments:
-            # enable, reference gallery and maximum side length. Passing all
-            # three explicitly avoids dependence on Gradio/API default values.
-            alwayson_scripts["ImageStitch Integrated"] = {
-                "args": [True, encoded, 1024]
-            }
-            payload["alwayson_scripts"] = alwayson_scripts
-        else:
-            LOGGER.info("ImageStitch was requested without usable reference files; continuing without it.")
+    input_data_url = _file_data_url(input_path) if input_mode != "txt2img" else ""
+    payload = _build_forge_payload(
+        schema,
+        values,
+        runtime_catalog,
+        input_mode=input_mode,
+        input_key=input_key,
+        input_data_url=input_data_url,
+        width=width,
+        height=height,
+        selected_loras=selected_loras,
+        image_stitch_data_urls=encoded_stitch_inputs,
+    )
+    raise_if_generation_cancelled(request_id)
 
     # POST идёт в потоке, пока worker ждёт sampling_step через /progress.
     post_done = threading.Event()
