@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.194",
+	VER = "0.195",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -109,7 +109,6 @@ catch (e) {
 	if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
 	if (isUserCancellation(e)) {
 		isCancelled = true;
-		$.setenv(APP.dialogEnvKey, "true");
 	} else {
 		// После placeResult не повторяем сохранение при ошибке финализации.
 		var settingsSaveError = generationResultPlaced ? "" : action.saveAfterError(),
@@ -168,8 +167,8 @@ function init() {
 	settingsReady = true;
 	cfg.cleanReferenceHistory();
 	var environmentMode = DEBUG_FIRST_LAUNCH_WITH_INTERFACE ? null : $.getenv(APP.dialogEnvKey),
-		// После ошибки или отмены dialog-флаг открывает следующий запуск также
-		// внутри Action; успешная генерация снова переводит его в silent mode.
+		// После ошибки dialog-флаг открывает следующий запуск также внутри Action.
+		// Пользовательская отмена не изменяет сохранённый режим окна.
 		showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
 			? forceDialog || environmentMode == "true" || app.playbackDisplayDialogs == DialogModes.ALL
 			: forceDialog || environmentMode == "true" || environmentMode == null);
@@ -179,7 +178,6 @@ function init() {
 		sourceBounds: null,
 		previousGeneration: null,
 		junk: null,
-		flattenedSource: null,
 		inpaint: false
 	};
 	app.activeDocument.suspendHistory(localize(str.historyCheckSelection), "checkSelection(selection)");
@@ -274,17 +272,17 @@ function init() {
 				return;
 			}
 			action.saveAcceptedSettings();
-			$.setenv(APP.dialogEnvKey, "false");
-			generation.run(selection, res.schema, res.values);
+			var generationStatus = generation.run(selection, res.schema, res.values);
+			if (!generationStatus.keepDialog) $.setenv(APP.dialogEnvKey, "false");
 			return;
 		}
 		if (!initial.schema) return;
 		var silentProfile = backend.schemaProfile(initial.schema),
 			silentValues = backend.profileValues(initial.schema, silentProfile);
 		if (!actionPlaybackMode) cfg.saveToAction();
-		$.setenv(APP.dialogEnvKey, "false");
 		try {
-			generation.run(selection, initial.schema, silentValues);
+			var silentGenerationStatus = generation.run(selection, initial.schema, silentValues);
+			if (!silentGenerationStatus.keepDialog) $.setenv(APP.dialogEnvKey, "false");
 		} catch (silentGenerationError) {
 			if (isUserCancellation(silentGenerationError))
 				throw silentGenerationError;
@@ -317,8 +315,8 @@ function init() {
 				return;
 			}
 			action.saveAcceptedSettings();
-			$.setenv(APP.dialogEnvKey, "false");
-			generation.run(selection, retryResult.schema, retryResult.values);
+			var retryGenerationStatus = generation.run(selection, retryResult.schema, retryResult.values);
+			if (!retryGenerationStatus.keepDialog) $.setenv(APP.dialogEnvKey, "false");
 		}
 	} finally {
 		if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
@@ -383,6 +381,14 @@ function apiErrorText(item) {
 		params = item.params instanceof Array ? item.params : [];
 	for (var i = 0; i < params.length; i++)
 		template = template.split("%" + (i + 1)).join(String(params[i]));
+	if (code == "workflow_not_ready" && item.details instanceof Array) {
+		var details = [];
+		for (i = 0; i < item.details.length; i++) {
+			var detail = workflowDiagnosticText(item.details[i]);
+			if (detail) details.push(detail);
+		}
+		if (details.length) template += "\n\n• " + details.join("\n• ");
+	}
 	return template;
 }
 function itemData(source) {
@@ -534,7 +540,7 @@ function mainDialog(selection, initial, responseSeconds) {
 	w.onClose = function () {
 		if (!state.result) {
 			saveCurrentValues(); $.setenv(APP.dialogEnvKey, "true");
-			state.result = { cancelled: true, saveSettings: true, forceDialogNextLaunch: true };
+			state.result = { cancelled: true, saveSettings: true };
 		}
 		return true;
 	};
@@ -835,8 +841,13 @@ function mainDialog(selection, initial, responseSeconds) {
 			if (String(item.selectorValue) == String(description.selectedValue)) sel = i;
 		}
 		if (dropdown.items.length) dropdown.selection = sel;
-		var enabled = description.items.length > 0;
-		dropdown.enabled = buttons[0].enabled = buttons[1].enabled = buttons[2].enabled = buttons[3].enabled = enabled;
+		var hasItems = description.items.length > 0;
+		dropdown.enabled = hasItems;
+		// Обновление должно оставаться доступным в существующей папке даже при
+		// пустом списке: пользователь мог добавить JSON, пока окно было открыто.
+		buttons[0].enabled = true;
+		buttons[1].enabled = buttons[3].enabled = hasItems;
+		buttons[2].enabled = hasItems && description.canSave;
 		dropdown.onChange = function () { if (this.selection) schemaControlAction("select", this.selection.selectorValue); };
 		buttons[0].onClick = function () { schemaControlAction("refresh"); };
 		buttons[1].onClick = function () { schemaControlAction("rebuild"); };
@@ -849,6 +860,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			title: forge ? str.uiPreset : str.workflow,
 			items: forge ? state.forgePresets : state.workflows,
 			selectedValue: forge ? cfg.selectedForgePreset : cfg.selectedWorkflow,
+			canSave: schemaHasSavableVisibleValues(),
 			itemLabel: forge
 				? function (preset) {
 					var label = String(preset.label || preset.id), duplicate = false;
@@ -872,6 +884,18 @@ function mainDialog(selection, initial, responseSeconds) {
 				{ text: "⚙", helpTip: str.workflowSettings }
 			]
 		};
+	}
+	function schemaHasSavableVisibleValues() {
+		if (!state.schema) return false;
+		var profile = backend.schemaProfile(state.schema),
+			forge = backend.schemaBackend(state.schema) == BACKEND_FORGE,
+			visible = forge ? resolveForgeVisibleControls(state.schema, profile) : profile.visibleControls;
+		if (visible === null || visible === undefined) visible = state.schema.recommended_controls || [];
+		var controls = state.schema.controls instanceof Array ? state.schema.controls : [];
+		for (var i = 0; i < controls.length; i++)
+			if (controls[i] && controls[i].id && arrayContains(visible, controls[i].id)) return true;
+		return forge && state.schema.capabilities && state.schema.capabilities.image_stitch &&
+			arrayContains(visible, "image_stitch");
 	}
 	// ---
 	// ДЕЙСТВИЯ TOOLBAR WORKFLOW / FORGE PRESET
@@ -1067,7 +1091,13 @@ function mainDialog(selection, initial, responseSeconds) {
 			},
 			refresh: function () {
 				ui.runWithPaletteProgress(str.progressForgeCatalog, function (progress) {
-					loadForgeSchemaState(cfg.selectedForgePreset, progress, true);
+					// Пересканируем папку, а не только данные текущей схемы. Это позволяет
+					// подхватить первый JSON из уже открытого окна с пустым списком.
+					state.forgePresets = backend.refreshForgeSchemas(progress);
+					cfg.selectedForgePreset = cfg.data.selectedForgePreset =
+						backend.chooseForgeSchema(state.forgePresets);
+					if (cfg.selectedForgePreset) loadForgeSchemaState(cfg.selectedForgePreset, progress, true);
+					else state.schema = null;
 				});
 				showControls();
 			},
@@ -2179,7 +2209,8 @@ function GenerationRuntime() {
 		var requestId = createRequestId(),
 			inputFile = null,
 			maskFile = null,
-			resultFile = null;
+			resultFile = null,
+			keepDialog = false;
 		try {
 			var currentBackend = backend.schemaBackend(schema),
 				profile = backend.schemaProfile(schema),
@@ -2257,7 +2288,6 @@ function GenerationRuntime() {
 			}
 			var progressResult = generationProgress.getResult();
 			if (progressCompleted === false || isUserCancellation(progressResult)) {
-				$.setenv(APP.dialogEnvKey, "true");
 				throw userCancellationError();
 			}
 			if (!progressResult) throw new Error(str.errNoResult);
@@ -2316,6 +2346,7 @@ function GenerationRuntime() {
 				// самой генерации. Результат уже размещён и остаётся в
 				// документе; пользователю показывается отдельная ошибка.
 				$.setenv(APP.dialogEnvKey, "true");
+				keepDialog = true;
 				messages.error(
 					APP.name + "\n\n" + str.errSettingsSaveAfterGeneration +
 					"\n" + errorMessageText(saveError) +
@@ -2329,6 +2360,7 @@ function GenerationRuntime() {
 					localizedGenerationWarnings.push(workflowDiagnosticText(answer.warnings[warningIndex]));
 				messages.show({ title: str.generationDiagnostics, warnings: localizedGenerationWarnings });
 			}
+			return { keepDialog: keepDialog };
 		} finally {
 			if (inputFile && inputFile.exists) try { inputFile.remove(); } catch (_) { }
 			if (maskFile && maskFile.exists) try { maskFile.remove(); } catch (_) { }
@@ -2433,18 +2465,7 @@ function GenerationRuntime() {
 			}
 		}
 		selection.junk = lr.getProperty("layerID");
-		selection.flattenedSource = null;
 		doc.makeSelection(selection.bounds);
-		if (cfg.flatten) {
-			doc.hideSelectedLayers();
-			doc.makeLayer(APP.generatedLayerName);
-			doc.mergeVisible();
-			// Merge Visible создаёт подготовленный composite, который и должен
-			// экспортироваться. Его ID сохраняется до возврата к скрытому
-			// служебному слою с маской.
-			selection.flattenedSource = lr.getProperty("layerID");
-			doc.selectLayersByIDs([selection.junk]);
-		}
 	}
 	function exportSelectionFiles(selection, width, height, requestId, inpaintMode, preferredFolder) {
 		var hst = activeDocument.activeHistoryState,
@@ -2467,13 +2488,15 @@ function GenerationRuntime() {
 				doc.copyPixels();
 			}
 			if (cfg.flatten) {
-				if (!selection.flattenedSource)
-					throw new Error(str.errFlattenedSourceMissing);
-				// Не вызываем hideLayersAboveSource(): merged composite обычно
-				// находится выше selection.junk и был бы скрыт этой функцией.
-				// Явный выбор также возвращает Photoshop с mask channel
-				// служебного слоя на пиксельный канал composite.
-				doc.selectLayersByIDs([selection.flattenedSource]);
+				// Composite нужен только для отправки. Он создаётся после сохранения
+				// hst и полностью удаляется возвратом к этой записи истории в finally.
+				// Служебный слой с маской скрывается, чтобы не попасть во входное
+				// изображение; новый пустой слой гарантирует работу Merge Visible
+				// даже тогда, когда в документе был только один видимый слой.
+				doc.selectLayersByIDs([selection.junk]);
+				doc.hideSelectedLayers();
+				doc.makeLayer(APP.generatedLayerName);
+				doc.mergeVisible();
 			} else {
 				hiddenLayerIds = hideLayersAboveSource(selection.junk);
 			}
@@ -4891,7 +4914,6 @@ function GenerationProgress() {
 	};
 	function cancelProgress() {
 		res = { type: "cancelled", message: "" };
-		$.setenv(APP.dialogEnvKey, "true");
 		api.interrupt(requestId);
 		return false;
 	}
@@ -5259,7 +5281,6 @@ function BridgeApi() {
 						? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
 						: title;
 					if (!app.doProgressTask(slice, "workChunk('" + escapeProgressText(text) + "');")) {
-						$.setenv(APP.dialogEnvKey, "true");
 						// GenerationProgress.cancelProgress() отправит единственный interrupt.
 						listener.close();
 						return false;
@@ -6374,7 +6395,6 @@ function Locale() {
 		errSelectionTooSmall: ["Выделение или документ слишком малы. Минимальный размер каждой стороны:", "The selection or document is too small. Minimum size for each side:"],
 		errNoResult: ["Бэкенд не вернул результат.", "The backend returned no result."],
 		errPlacedBounds: ["Не удалось определить размер вставленного слоя.", "Could not determine placed layer bounds."],
-		errFlattenedSourceMissing: ["Не удалось определить объединённый слой для экспорта.", "Could not determine the merged layer for export."],
 		errPythonMissingA: ["Не найден ", "Could not find "],
 		errPythonMissingB: [".pyw или .py рядом с JSX либо в подпапке lib.", ".pyw or .py next to JSX or in the lib subfolder."],
 		errPythonExecute: ["Windows не смог запустить файл Python. Проверьте установку Python и ассоциацию файлов .pyw/.py:", "Windows could not launch the Python file. Check the Python installation and .pyw/.py file association:"],
@@ -6398,6 +6418,7 @@ function Locale() {
 		workflow_empty: ["Выбранный workflow пуст.", "The selected workflow is empty."],
 		invalid_api_nodes: ["В API-workflow найдены некорректные ноды без class_type или inputs: %1", "The API workflow contains invalid nodes without class_type or inputs: %1"],
 		workflow_not_ready: ["Workflow не готов к запуску. Откройте настройки workflow и исправьте перечисленные проблемы.", "The workflow is not ready to run. Open Workflow settings and correct the listed problems."],
+		translator_unavailable: ["Перевод prompt недоступен: не удалось загрузить deep-translator. Подробности записаны в журнал Python API.", "Prompt translation is unavailable because deep-translator could not be loaded. See the Python API log for details."],
 		inpaint_mask_missing: ["Для параметра «Маска inpaint» не найден подходящий вариант. В настройках workflow выберите MASK основной ноды LoadImage или ноду LoadImageMask.", "No suitable option was found for Inpaint mask. In Workflow settings, select the main LoadImage MASK or a LoadImageMask node."],
 		inpaint_mask_changed: ["Настройка параметра «Маска inpaint» изменилась. Снова откройте главное окно скрипта.", "The Inpaint mask configuration changed. Reopen the main script window."],
 		inpaint_main_mask_unused: ["MASK основной ноды LoadImage не используется в workflow. Подключите выход MASK к inpaint-ветке в ComfyUI или выберите другой вариант параметра «Маска inpaint».", "The main LoadImage MASK is not used by the workflow. Connect its MASK output to the inpaint branch in ComfyUI or select another Inpaint mask option."],
@@ -6564,7 +6585,7 @@ function Locale() {
 		generation_size_binding_skipped: ["Автоматическая запись размера в «Поля width / height» пропущена: выбранная пара не принимает размер изображения Photoshop. Использован «Размер входного изображения».", "Automatic writing to Width / height fields was skipped because the selected pair cannot accept the Photoshop image size. Input image size was used instead."],
 		generation_parameter_missing: ["Параметр %1 не применён: он отсутствует в текущей схеме. Повторно проанализируйте workflow.", "Parameter %1 was not applied because it is missing from the current schema. Reanalyze the workflow."],
 		generation_parameter_no_targets: ["Параметр %1 не применён: в схеме для него нет целевых полей. Повторно проанализируйте workflow.", "Parameter %1 was not applied because the schema contains no target fields for it. Reanalyze the workflow."],
-		forgePort: ["Порт Forge Neo:", "Forge Neo port:"], refreshForgeCatalog: ["Обновить текущую схему и её данные", "Refresh current schema and its data"],
+		forgePort: ["Порт Forge Neo:", "Forge Neo port:"], refreshForgeCatalog: ["Обновить список схем и данные текущей схемы", "Refresh schema list and current schema data"],
 		rebuildForgeSchema: ["Повторно загрузить или полностью сбросить схему Forge", "Reload or fully reset the Forge schema"],
 		rebuildForgeSchemaConfirm: ["Выполнить полный сброс выбранной схемы Forge?\n\nДа — удалить все данные этой схемы и заново загрузить её из JSON.\nНет — только повторно загрузить схему из JSON, сохранив значения параметров, состав интерфейса, выбранные LoRA, ImageStitch inputs и настройки размера.", "Fully reset the selected Forge schema?\n\nYes — remove all data for this schema and load it again from JSON.\nNo — only reload the schema from JSON while preserving parameter values, the interface layout, selected LoRAs, ImageStitch inputs and size settings."],
 		progressForgeCatalog: ["Загрузка данных Forge Neo…", "Loading Forge Neo data…"], progressForgePresets: ["Загрузка схем Forge…", "Loading Forge schemas…"],

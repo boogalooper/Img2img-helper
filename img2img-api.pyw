@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.197"
+VERSION = "0.198"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -378,7 +378,7 @@ WEBSOCKET_MODULE: Any = None
 
 
 def prepare_required_modules() -> None:
-    """Checks and installs all third-party modules required by the helper.
+    """Prepare required and optional third-party modules used by the helper.
 
     The local API socket is already open while this function runs. JSX polls
     the lightweight ping command and receives installing only after a real
@@ -390,13 +390,16 @@ def prepare_required_modules() -> None:
 
     errors: List[str] = []
 
+    # Перевод prompt является дополнительной функцией. Как и WebSocket,
+    # переводчик устанавливается по возможности, но не блокирует весь API.
     try:
         DEEP_TRANSLATOR_MODULE = ensure_python_module(
             "deep_translator",
             "deep-translator",
         )
     except Exception as exc:
-        errors.append(f"deep-translator: {exc}")
+        DEEP_TRANSLATOR_MODULE = None
+        LOGGER.warning("deep-translator is unavailable; prompt translation is disabled: %s", exc)
 
     try:
         PIL_IMAGE_MODULE = ensure_python_module("PIL.Image", "Pillow")
@@ -429,7 +432,8 @@ def prepare_required_modules() -> None:
         )
 
     LOGGER.info(
-        "Required Python modules are ready: deep-translator, Pillow%s",
+        "Required Python modules are ready: Pillow%s%s",
+        ", deep-translator" if DEEP_TRANSLATOR_MODULE is not None else "",
         ", websocket-client" if WEBSOCKET_MODULE is not None else "",
     )
 
@@ -1011,10 +1015,12 @@ class UserVisibleError(RuntimeError):
         message: str,
         code: str = "",
         params: Optional[Sequence[Any]] = None,
+        details: Optional[Sequence[Any]] = None,
     ) -> None:
         super().__init__(str(message or ""))
         self.code = str(code or "")
         self.params = [str(value) for value in params] if params else []
+        self.details = list(details) if details else []
 
 
 class CancelledError(UserVisibleError):
@@ -5531,8 +5537,6 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     runtime_catalog = _forge_runtime_control_catalog(
         schema, ["loras"] if selected_loras else None
     )
-    _apply_forge_options(client, values, schema, runtime_catalog)
-    raise_if_generation_cancelled(request_id)
 
     generation = schema.get("generation") if isinstance(schema.get("generation"), dict) else {}
     endpoint = str(generation.get("endpoint") or "sdapi/v1/img2img").lstrip("/")
@@ -5569,6 +5573,12 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         selected_loras=selected_loras,
         image_stitch_data_urls=encoded_stitch_inputs,
     )
+    raise_if_generation_cancelled(request_id)
+
+    # Только полностью проверенный payload получает право менять постоянные
+    # /options Forge. Ошибка Action/схемы больше не переключит модель перед
+    # предсказуемым отказом сборки запроса.
+    _apply_forge_options(client, values, schema, runtime_catalog)
     raise_if_generation_cancelled(request_id)
 
     # POST идёт в потоке, пока worker ждёт sampling_step через /progress.
@@ -5923,6 +5933,8 @@ def error_answer(message: Any, request_id: Optional[str] = None) -> None:
             payload["code"] = message.code
         if message.params:
             payload["params"] = message.params
+        if message.details:
+            payload["details"] = message.details
     send_data_to_jsx(payload)
 
 
@@ -6762,6 +6774,11 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         raise UserVisibleError(
             "The workflow is not ready to run:\n• " + "\n• ".join(messages),
             "workflow_not_ready",
+            details=[
+                item
+                for item in analysis.get("diagnostics", [])
+                if item.get("level") == "error"
+            ],
         )
 
     mask_binding = analysis.get("bindings", {}).get("inpaint_mask")
@@ -7707,8 +7724,9 @@ def handle_command(command: Dict[str, Any]) -> None:
             translation_module = DEEP_TRANSLATOR_MODULE
             if translation_module is None:
                 raise UserVisibleError(
-                    "deep-translator was not initialized during Python startup. "
-                    f"Restart {APP_NAME}. Log: {LOG_FILE}"
+                    "Prompt translation is unavailable because deep-translator could not be loaded. "
+                    f"Details: {LOG_FILE}",
+                    "translator_unavailable",
                 )
             try:
                 translated = translation_module.GoogleTranslator(
