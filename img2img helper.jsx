@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.195",
+	VER = "0.196",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -112,7 +112,7 @@ catch (e) {
 	} else {
 		// После placeResult не повторяем сохранение при ошибке финализации.
 		var settingsSaveError = generationResultPlaced ? "" : action.saveAfterError(),
-			errorText = APP.name + "\n\n" + e.message +
+			errorText = errorMessageText(e) +
 				(e.line ? "\n\n" + str.jsxLine + e.line : "");
 		if (settingsSaveError) errorText += "\n\n" + str.errSettingsSaveAfterError +
 			"\n" + settingsSaveError;
@@ -2348,7 +2348,7 @@ function GenerationRuntime() {
 				$.setenv(APP.dialogEnvKey, "true");
 				keepDialog = true;
 				messages.error(
-					APP.name + "\n\n" + str.errSettingsSaveAfterGeneration +
+					str.errSettingsSaveAfterGeneration +
 					"\n" + errorMessageText(saveError) +
 					(saveError && saveError.line ? "\n\n" + str.jsxLine + saveError.line : ""),
 					APP.name
@@ -3319,11 +3319,22 @@ function BackendRuntime() {
 // только кастомные ScriptUI-окна. Звук Photoshop подаётся только для ошибок.
 // ---
 function MessageCenter() {
-	function unique(items) {
+	function stripAppHeader(text) {
+		var normalized = String(text || "").replace(/\r\n?/g, "\n"),
+			lineEnd = normalized.indexOf("\n"),
+			firstLine = lineEnd < 0 ? normalized : normalized.substring(0, lineEnd);
+		if (firstLine.replace(/^\s+|\s+$/g, "").toLowerCase() != APP.name.toLowerCase()) return normalized;
+		if (lineEnd < 0) return "";
+		return normalized.substring(lineEnd + 1).replace(/^(?:[ \t]*\n)+/, "");
+	}
+	function unique(items, stripRedundantAppHeader) {
 		var res = [], seen = {};
 		items = items instanceof Array ? items : [];
 		for (var i = 0; i < items.length; i++) {
-			var text = errorMessageText(items[i]).replace(/^\s+|\s+$/g, ""), key = text.toLowerCase();
+			var text = errorMessageText(items[i]);
+			if (stripRedundantAppHeader) text = stripAppHeader(text);
+			text = text.replace(/^\s+|\s+$/g, "");
+			var key = text.toLowerCase();
 			if (!text || seen[key]) continue;
 			seen[key] = true;
 			res.push(text);
@@ -3332,7 +3343,7 @@ function MessageCenter() {
 	}
 	this.show = function (options) {
 		options = options || {};
-		var errors = unique(options.errors),
+		var errors = unique(options.errors, true),
 			warnings = unique(options.warnings),
 			information = unique(options.information);
 		if (!errors.length && !warnings.length && !information.length) return false;
