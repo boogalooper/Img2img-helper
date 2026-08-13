@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 2
-VERSION = "0.193"
+VERSION = "0.194"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "a174cecf-c02f-42e5-b6dc-cabca3772a66"
+ANALYZER_UUID = "e3834ca5-3f51-4b92-9398-80a451476103"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -1004,7 +1004,17 @@ def schedule_comfy_folder_cleanup(
 
 
 class UserVisibleError(RuntimeError):
-    """Ожидаемая ошибка workflow/ComfyUI без технического traceback в UI."""
+    """Expected failure returned to JSX without a technical traceback."""
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "",
+        params: Optional[Sequence[Any]] = None,
+    ) -> None:
+        super().__init__(str(message or ""))
+        self.code = str(code or "")
+        self.params = [str(value) for value in params] if params else []
 
 
 class CancelledError(UserVisibleError):
@@ -1501,11 +1511,22 @@ class WorkflowRepository:
 
     def ensure_folder(self) -> None:
         if not self.folder:
-            raise UserVisibleError("Workflow folder is not set.")
+            raise UserVisibleError(
+                "Workflow folder is not set.",
+                "workflow_folder_not_selected",
+            )
         if not self.folder.exists():
-            raise UserVisibleError(f"Workflow folder does not exist: {self.folder}")
+            raise UserVisibleError(
+                f"Workflow folder does not exist: {self.folder}",
+                "workflow_folder_missing",
+                [self.folder],
+            )
         if not self.folder.is_dir():
-            raise UserVisibleError(f"Workflow path is not a folder: {self.folder}")
+            raise UserVisibleError(
+                f"Workflow path is not a folder: {self.folder}",
+                "workflow_path_not_folder",
+                [self.folder],
+            )
 
     def _workflow_from_path(self, path: Path, *, compute_hash: bool = False) -> WorkflowFile:
         relative = path.relative_to(self.folder).as_posix()
@@ -1559,7 +1580,10 @@ class WorkflowRepository:
         for item in self.list_workflows():
             if item.workflow_id == workflow_id:
                 return item
-        raise UserVisibleError("The selected workflow is no longer present in the folder.")
+        raise UserVisibleError(
+            "The selected workflow is no longer present in the folder.",
+            "selected_workflow_missing",
+        )
 
     @staticmethod
     def ensure_hash(workflow_file: WorkflowFile) -> str:
@@ -1574,16 +1598,27 @@ class WorkflowRepository:
                 data = json.load(stream)
         except json.JSONDecodeError as exc:
             raise UserVisibleError(
-                f"JSON error in {workflow_file.relative_path}, line {exc.lineno}: {exc.msg}"
+                f"JSON error in {workflow_file.relative_path}, line {exc.lineno}: {exc.msg}",
+                "workflow_json_invalid",
+                [workflow_file.relative_path, exc.lineno, exc.colno, exc.msg],
             ) from exc
         except OSError as exc:
             raise UserVisibleError(f"Could not read {workflow_file.absolute_path}: {exc}") from exc
         if not isinstance(data, dict):
-            raise UserVisibleError("The API workflow root must be a JSON object.")
+            raise UserVisibleError(
+                "The API workflow root must be a JSON object.",
+                "workflow_root_invalid",
+                [workflow_file.relative_path],
+            )
         return data
 
 
-def write_json_atomic(path: Path, data: Dict[str, Any], description: str) -> None:
+def write_json_atomic(
+    path: Path,
+    data: Dict[str, Any],
+    description: str,
+    error_code: str = "",
+) -> None:
     """Write JSON beside the source and atomically replace the original file."""
 
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -1601,7 +1636,9 @@ def write_json_atomic(path: Path, data: Dict[str, Any], description: str) -> Non
             f"Could not write {description}:\n{path}\n\n"
             "The file or its folder may be protected from writing. Move the JSON "
             "to a writable folder or run Photoshop and the Python helper with "
-            f"sufficient permissions.\n\n{exc}"
+            f"sufficient permissions.\n\n{exc}",
+            error_code,
+            [path, exc] if error_code else None,
         ) from exc
 
 
@@ -1838,10 +1875,11 @@ class WorkflowAnalyzer:
         if "nodes" in self.workflow and "links" in self.workflow:
             raise UserVisibleError(
                 "The file uses the regular ComfyUI UI format. Open it in ComfyUI "
-                "and choose Workflow/File → Export (API)."
+                "and choose Workflow/File → Export (API).",
+                "api_workflow_required",
             )
         if not self.workflow:
-            raise UserVisibleError("The workflow is empty.")
+            raise UserVisibleError("The workflow is empty.", "workflow_empty")
 
         invalid: List[str] = []
         missing_classes: Set[str] = set()
@@ -1855,7 +1893,9 @@ class WorkflowAnalyzer:
 
         if invalid:
             raise UserVisibleError(
-                "Invalid API nodes without class_type/inputs: " + ", ".join(invalid[:20])
+                "Invalid API nodes without class_type/inputs: " + ", ".join(invalid[:20]),
+                "invalid_api_nodes",
+                [", ".join(invalid[:20])],
             )
         if missing_classes:
             for class_type in sorted(missing_classes):
@@ -1907,10 +1947,6 @@ class WorkflowAnalyzer:
         if params:
             item["params"] = [str(value) for value in params]
         self.diagnostics.append(item)
-
-    def info(self, message: str, code: str = "", params: Optional[Sequence[Any]] = None) -> None:
-        LOGGER.info("Workflow analysis: %s", message)
-        self._add_diagnostic("info", message, code, params)
 
     def warning(self, message: str, code: str = "", params: Optional[Sequence[Any]] = None) -> None:
         LOGGER.warning("Workflow analysis: %s", message)
@@ -2023,9 +2059,10 @@ class WorkflowAnalyzer:
 
         return sorted(result, key=lambda item: (-item.score, item.label.lower()))
 
-    def mask_candidates(self, input_choice: Optional[Candidate]) -> List[Candidate]:
-        result: List[Candidate] = []
-        tagged: List[Candidate] = []
+    def input_alpha_mask_candidate(
+        self, input_choice: Optional[Candidate]
+    ) -> Optional[Candidate]:
+        """Build the virtual MASK option belonging to one main image input."""
 
         input_nodes: List[str] = []
         if input_choice:
@@ -2035,24 +2072,34 @@ class WorkflowAnalyzer:
                 class_norm = normalize_name(node.get("class_type", "")) if isinstance(node, dict) else ""
                 if "loadimage" in class_norm and "mask" not in class_norm and node_id not in input_nodes:
                     input_nodes.append(node_id)
-        if input_nodes:
-            connected = any(
-                any(source_slot == 1 for _target_id, source_slot, _input_name in self.graph.outgoing.get(node_id, []))
-                for node_id in input_nodes
-            )
-            result.append(
-                Candidate(
-                    id="input_alpha",
-                    label="Main LoadImage MASK",
-                    targets=[],
-                    score=4000 if connected else 200,
-                    meta={
-                        "mode": "input_alpha",
-                        "node_ids": input_nodes,
-                        "connected": connected,
-                    },
+        if not input_nodes:
+            return None
+        connected = any(
+            any(
+                source_slot == 1
+                for _target_id, source_slot, _input_name in self.graph.outgoing.get(
+                    node_id, []
                 )
             )
+            for node_id in input_nodes
+        )
+        return Candidate(
+            id="input_alpha",
+            label="Main LoadImage MASK",
+            targets=[],
+            score=4000 if connected else 200,
+            meta={
+                "mode": "input_alpha",
+                "node_ids": input_nodes,
+                "connected": connected,
+            },
+        )
+
+    def load_image_mask_candidates(self) -> List[Candidate]:
+        """Return workflow-wide LoadImageMask options independent of main input."""
+
+        result: List[Candidate] = []
+        tagged: List[Candidate] = []
 
         for node_id, node in self.workflow.items():
             if not isinstance(node, dict):
@@ -2120,6 +2167,23 @@ class WorkflowAnalyzer:
                 )
             )
 
+        return sorted(result, key=lambda item: (-item.score, item.label.lower()))
+
+    def mask_candidates(
+        self,
+        input_choice: Optional[Candidate],
+        common_candidates: Optional[Sequence[Candidate]] = None,
+    ) -> List[Candidate]:
+        """Combine the selected main-input MASK with common mask nodes."""
+
+        result = list(
+            common_candidates
+            if common_candidates is not None
+            else self.load_image_mask_candidates()
+        )
+        input_alpha = self.input_alpha_mask_candidate(input_choice)
+        if input_alpha is not None:
+            result.append(input_alpha)
         return sorted(result, key=lambda item: (-item.score, item.label.lower()))
 
     @staticmethod
@@ -2960,16 +3024,16 @@ class WorkflowAnalyzer:
                 "selected_input_missing",
             )
 
-        mask_candidates = self.mask_candidates(input_choice)
-        # The settings dialog can switch the main input without closing and
-        # reanalyzing the workflow. Return the mask candidates for every
-        # possible main input so JSX can rebuild Main LoadImage MASK
-        # immediately. The ordinary mask list remains for compatibility and
-        # represents the input selected for this analysis.
-        mask_candidates_by_input = {
-            candidate.id: [item.to_dict() for item in self.mask_candidates(candidate)]
-            for candidate in input_candidates
-        }
+        # LoadImageMask nodes are common to every possible main input. Only the
+        # virtual Main LoadImage MASK changes, so keep it in a separate map
+        # instead of repeating every common candidate N times in the response.
+        common_mask_candidates = self.load_image_mask_candidates()
+        mask_candidates = self.mask_candidates(input_choice, common_mask_candidates)
+        main_mask_candidates_by_input: Dict[str, Dict[str, Any]] = {}
+        for candidate in input_candidates:
+            candidate_mask = self.input_alpha_mask_candidate(candidate)
+            if candidate_mask is not None:
+                main_mask_candidates_by_input[candidate.id] = candidate_mask.to_dict()
         mask_override = str(overrides.get("mask") or "")
         mask_choice = self.choose_mask_candidate(mask_candidates, mask_override)
         if mask_override and not mask_choice:
@@ -2979,15 +3043,35 @@ class WorkflowAnalyzer:
             )
 
         reference_ids = overrides.get("references") if isinstance(overrides.get("references"), list) else []
+        references_configured = overrides.get("references_configured") is True
         reference_choices: List[Candidate] = []
         found_reference_ids: Set[str] = set()
+        input_target_keys = {
+            (target.node_id, target.input_name)
+            for target in input_choice.targets
+        } if input_choice else set()
         for candidate in input_candidates:
-            if input_choice and candidate.id == input_choice.id:
+            explicitly_selected = candidate.id in reference_ids
+            automatically_selected = (
+                not references_configured
+                and not reference_ids
+                and bool(candidate.meta.get("reference"))
+            )
+            if not explicitly_selected and not automatically_selected:
                 continue
-            if candidate.id in reference_ids or (not reference_ids and candidate.meta.get("reference")):
-                reference_choices.append(candidate)
-                if candidate.id in reference_ids:
-                    found_reference_ids.add(candidate.id)
+            if explicitly_selected:
+                found_reference_ids.add(candidate.id)
+            candidate_target_keys = {
+                (target.node_id, target.input_name) for target in candidate.targets
+            }
+            if candidate_target_keys & input_target_keys:
+                self.error(
+                    f"{candidate.label} has conflicting image roles. Choose only one role in workflow settings.",
+                    "image_role_conflict",
+                    [candidate.label],
+                )
+                continue
+            reference_choices.append(candidate)
         missing_reference_ids = [item for item in reference_ids if item not in found_reference_ids]
         if missing_reference_ids:
             self.warning(
@@ -3118,7 +3202,6 @@ class WorkflowAnalyzer:
         # В source_image и в неоднозначном auto-режиме width/height не меняются.
         # Photoshop всё равно экспортирует JPEG нужного размера; дальнейшее
         # поведение определяется самим workflow.
-        effective_size_mode = "binding" if size_choice else "source_image"
         if (
             not size_choice
             and requested_size_mode == "auto"
@@ -3180,7 +3263,6 @@ class WorkflowAnalyzer:
         return {
             "valid": not errors,
             "analysis_uuid": ANALYZER_UUID,
-            "size_mode": effective_size_mode,
             "size_selection_mode": requested_size_mode,
             "has_size_binding": bool(size_choice),
             "input_review_required": input_review_required,
@@ -3189,11 +3271,10 @@ class WorkflowAnalyzer:
             "bindings": bindings,
             "controls": controls,
             "recommended_controls": [item["id"] for item in controls if item.get("recommended")],
-            "available_controls": [item["id"] for item in controls],
             "candidates": {
                 "input": [item.to_dict() for item in input_candidates],
-                "mask": [item.to_dict() for item in mask_candidates],
-                "mask_by_input": mask_candidates_by_input,
+                "mask": [item.to_dict() for item in common_mask_candidates],
+                "main_mask_by_input": main_mask_candidates_by_input,
                 "reference": [item.to_dict() for item in input_candidates],
                 "output": [item.to_dict() for item in output_candidates],
                 "size": [item.to_dict() for item in size_candidates],
@@ -3298,11 +3379,23 @@ class SchemaCache:
             "analysis": analysis,
             "validation_schema": validation_schema,
         }
-        temp_path = path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(path)
-        if overrides:
-            self._trim_override_variants(workflow_file.workflow_id)
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+            if overrides:
+                self._trim_override_variants(workflow_file.workflow_id)
+        except OSError as exc:
+            # Analysis is authoritative; its optional disk cache must never
+            # make a valid workflow unusable on a read-only/full temp drive.
+            LOGGER.warning("Could not save workflow cache %s: %s", path.name, exc)
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _trim_override_variants(self, workflow_id: str) -> None:
         try:
@@ -3504,10 +3597,18 @@ class WorkflowPatcher:
         input_name = str(target.get("input"))
         node = self.workflow.get(node_id)
         if not isinstance(node, dict):
-            raise UserVisibleError(f"A node disappeared from the workflow: {node_id}.")
+            raise UserVisibleError(
+                f"A node disappeared from the workflow: {node_id}.",
+                "workflow_target_node_missing",
+                [node_id],
+            )
         inputs = node.get("inputs")
         if not isinstance(inputs, dict) or input_name not in inputs:
-            raise UserVisibleError(f"Node {node_id} lost input {input_name}.")
+            raise UserVisibleError(
+                f"Node {node_id} lost input {input_name}.",
+                "workflow_target_input_missing",
+                [node_id, input_name],
+            )
         return node, input_name, inputs
 
     def set_target(self, target: Dict[str, str], value: Any) -> None:
@@ -3521,7 +3622,7 @@ class WorkflowPatcher:
 
         Использовать только для значений, полученных непосредственно от
         ComfyUI, например результата POST /upload/image. Пользовательские
-        Пользовательские sampler/scheduler/model-поля проходят set_target().
+        sampler/scheduler/model-поля проходят set_target().
         """
 
         _node, input_name, inputs = self._resolve_target(target)
@@ -3541,7 +3642,9 @@ class WorkflowPatcher:
                     value = string_map[str(value)]
                 else:
                     raise UserVisibleError(
-                        f"Invalid value {value!r} for {class_type}.{input_name}."
+                        f"Invalid value {value!r} for {class_type}.{input_name}.",
+                        "workflow_field_invalid_value",
+                        [value, f"{class_type}.{input_name}"],
                     )
             return value
 
@@ -3569,7 +3672,9 @@ class WorkflowPatcher:
                     number_int = parse_user_int(value)
                 except (TypeError, ValueError, OverflowError) as exc:
                     raise UserVisibleError(
-                        f"Field {class_type}.{input_name} expects an integer, received {value!r}."
+                        f"Field {class_type}.{input_name} expects an integer, received {value!r}.",
+                        "workflow_field_integer_expected",
+                        [f"{class_type}.{input_name}", value],
                     ) from exc
                 try:
                     minimum_int = int(minimum) if minimum is not None else None
@@ -3602,11 +3707,15 @@ class WorkflowPatcher:
                 number = parse_user_float(value)
             except (TypeError, ValueError, OverflowError) as exc:
                 raise UserVisibleError(
-                    f"Field {class_type}.{input_name} expects a number, received {value!r}."
+                    f"Field {class_type}.{input_name} expects a number, received {value!r}.",
+                    "workflow_field_number_expected",
+                    [f"{class_type}.{input_name}", value],
                 ) from exc
             if not math.isfinite(number):
                 raise UserVisibleError(
-                    f"Field {class_type}.{input_name} expects a finite number, received {value!r}."
+                    f"Field {class_type}.{input_name} expects a finite number, received {value!r}.",
+                    "workflow_field_finite_expected",
+                    [f"{class_type}.{input_name}", value],
                 )
             try:
                 minimum_float = float(minimum) if minimum is not None else None
@@ -3735,7 +3844,8 @@ class WorkflowPatcher:
             raise UserVisibleError(
                 "ComfyUI does not provide the standard LoadImageMask node required "
                 "to apply the Photoshop inpaint mask. Update ComfyUI or add a "
-                "separate LoadImageMask node to the workflow."
+                "separate LoadImageMask node to the workflow.",
+                "load_image_mask_unavailable",
             )
 
         source_node_ids = {
@@ -3745,7 +3855,8 @@ class WorkflowPatcher:
         }
         if not source_node_ids:
             raise UserVisibleError(
-                "The Main LoadImage MASK binding lost its source node. Reanalyze the workflow."
+                "The Main LoadImage MASK binding lost its source node. Reanalyze the workflow.",
+                "main_mask_source_missing",
             )
 
         runtime_node_id = self._next_runtime_node_id()
@@ -3766,7 +3877,8 @@ class WorkflowPatcher:
         if not rewired:
             raise UserVisibleError(
                 "The selected Inpaint mask is no longer used by the workflow. "
-                "Reanalyze the workflow or fix the MASK connections in ComfyUI."
+                "Reanalyze the workflow or fix the MASK connections in ComfyUI.",
+                "selected_mask_no_longer_used",
             )
 
         self.workflow[runtime_node_id] = {
@@ -3868,7 +3980,9 @@ class WorkflowPatcher:
                 raise UserVisibleError(
                     "The selected workflow size fields cannot accept the requested Photoshop size:\n• "
                     + details
-                    + "\n\nOpen workflow settings and choose Input image size, Automatic, or another width/height pair."
+                    + "\n\nOpen workflow settings and choose Input image size, Automatic, or another width/height pair.",
+                    "selected_size_rejected",
+                    [details],
                 )
         if apply_dimensions and bindings.get("width"):
             self.set_target(bindings["width"], int(width))
@@ -4059,12 +4173,19 @@ def resolve_forge_schema_dir(schema_folder: Any = "") -> Path:
     if raw:
         folder = Path(raw).expanduser()
         if not folder.is_dir():
-            raise UserVisibleError(f"Forge schema folder does not exist: {folder}")
+            raise UserVisibleError(
+                f"Forge schema folder does not exist: {folder}",
+                "forge_schema_folder_missing",
+                [folder],
+            )
         return folder.resolve()
     for folder in DEFAULT_FORGE_SCHEMA_DIRS:
         if _folder_contains_forge_schema(folder):
             return folder.resolve()
-    raise UserVisibleError("Forge schema folder was not found. Select it in the script settings.")
+    raise UserVisibleError(
+        "Forge schema folder was not found. Select it in the script settings.",
+        "forge_schema_folder_not_selected",
+    )
 
 
 def _normalize_forge_model_hint_text(value: Any) -> str:
@@ -4245,22 +4366,52 @@ def _read_forge_schema_file(
         except OSError as exc:
             raise UserVisibleError(f"Could not read Forge schema: {path}") from exc
         except json.JSONDecodeError as exc:
-            raise UserVisibleError(f"Invalid Forge schema JSON {path.name}: {exc}") from exc
+            raise UserVisibleError(
+                f"Invalid Forge schema JSON {path.name}: {exc}",
+                "forge_schema_json_invalid",
+                [path.name, exc.lineno, exc.colno, exc.msg],
+            ) from exc
     else:
         data = copy.deepcopy(source)
     if not isinstance(data, dict):
-        raise UserVisibleError(f"Forge schema {path.name} must be a JSON object.")
+        raise UserVisibleError(
+            f"Forge schema {path.name} must be a JSON object.",
+            "forge_schema_root_invalid",
+            [path.name],
+        )
     if data.get("kind") != FORGE_SCHEMA_KIND or str(data.get("backend")) != "forge":
-        raise UserVisibleError(f"File {path.name} is not an {APP_NAME} Forge schema.")
-    if int(data.get("schema_version") or 0) != FORGE_SCHEMA_VERSION:
-        raise UserVisibleError(f"Unsupported schema_version in {path.name}.")
+        raise UserVisibleError(
+            f"File {path.name} is not an {APP_NAME} Forge schema.",
+            "forge_schema_kind_invalid",
+            [path.name],
+        )
+    raw_schema_version = data.get("schema_version")
+    try:
+        schema_version = int(raw_schema_version or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    if schema_version != FORGE_SCHEMA_VERSION:
+        display_version = raw_schema_version if raw_schema_version not in (None, "") else 0
+        raise UserVisibleError(
+            f"Unsupported schema_version in {path.name}: {display_version}",
+            "forge_schema_version_invalid",
+            [path.name, display_version, FORGE_SCHEMA_VERSION],
+        )
     parent_id = str(data.get("extends") or "").strip()
     if parent_id:
         if parent_id in stack:
-            raise UserVisibleError(f"Circular Forge schema inheritance: {parent_id}")
+            raise UserVisibleError(
+                f"Circular Forge schema inheritance: {parent_id}",
+                "forge_schema_inheritance_cycle",
+                [parent_id],
+            )
         parent_path = schema_dir / f"{safe_filename(parent_id, parent_id)}.json"
         if not parent_path.is_file():
-            raise UserVisibleError(f"Base Forge schema was not found: {parent_id}")
+            raise UserVisibleError(
+                f"Base Forge schema was not found: {parent_id}",
+                "forge_schema_base_missing",
+                [parent_id],
+            )
         stack.add(parent_id)
         parent = _read_forge_schema_file(parent_path, schema_dir, stack)
         data = _schema_deep_merge(parent, data)
@@ -4271,7 +4422,7 @@ def _read_forge_schema_file(
 
 def list_forge_schemas(
     schema_folder: Any = "",
-) -> Tuple[List[Dict[str, Any]], Path, List[Dict[str, str]]]:
+) -> Tuple[List[Dict[str, Any]], Path, List[Dict[str, Any]]]:
     """Lists usable Forge schemas and reports files that could not be loaded.
 
     Files that are valid JSON but are not img2img helper Forge schemas are
@@ -4281,11 +4432,21 @@ def list_forge_schemas(
 
     schema_dir = resolve_forge_schema_dir(schema_folder)
     items: List[Dict[str, Any]] = []
-    invalid_schemas: List[Dict[str, str]] = []
+    invalid_schemas: List[Dict[str, Any]] = []
 
-    def report_invalid(path: Path, message: str) -> None:
+    def report_invalid(
+        path: Path,
+        message: str,
+        code: str = "",
+        params: Optional[Sequence[Any]] = None,
+    ) -> None:
         rendered = str(message or "Unknown schema error").strip()
-        invalid_schemas.append({"file": path.name, "message": rendered})
+        item: Dict[str, Any] = {"file": path.name, "message": rendered}
+        if code:
+            item["code"] = str(code)
+        if params:
+            item["params"] = [str(value) for value in params]
+        invalid_schemas.append(item)
         LOGGER.warning("Skipped invalid Forge schema %s: %s", path, rendered)
 
     for path in sorted(schema_dir.glob("*.json"), key=lambda item: item.name.lower()):
@@ -4302,6 +4463,8 @@ def list_forge_schemas(
             report_invalid(
                 path,
                 f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}",
+                "forge_schema_json_invalid",
+                [path.name, exc.lineno, exc.colno, exc.msg],
             )
             continue
 
@@ -4321,8 +4484,17 @@ def list_forge_schemas(
             # internal id. A copied schema may intentionally keep the same id.
             schema_id = path.stem
             order = int(raw.get("order") or 1000)
-        except (UserVisibleError, TypeError, ValueError) as exc:
-            report_invalid(path, str(exc))
+        except UserVisibleError as exc:
+            report_invalid(path, str(exc), exc.code, exc.params)
+            continue
+        except (TypeError, ValueError) as exc:
+            order_value = raw.get("order")
+            report_invalid(
+                path,
+                str(exc),
+                "forge_schema_order_invalid",
+                [path.name, order_value],
+            )
             continue
 
         items.append({
@@ -4342,20 +4514,46 @@ def get_forge_schema(schema_id: str, schema_folder: Any = "") -> Dict[str, Any]:
     schema_id = str(schema_id or "").strip()
     schema_dir = resolve_forge_schema_dir(schema_folder)
     if not schema_id or Path(schema_id).name != schema_id or schema_id in {".", ".."}:
-        raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
+        raise UserVisibleError(
+            f"Forge UI preset was not found: {schema_id}",
+            "forge_schema_missing",
+            [schema_id],
+        )
     path = (schema_dir / f"{schema_id}.json").resolve()
     if path.parent != schema_dir or not path.is_file():
-        raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
+        raise UserVisibleError(
+            f"Forge UI preset was not found: {schema_id}",
+            "forge_schema_missing",
+            [schema_id],
+        )
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise UserVisibleError(f"Could not read Forge schema: {path}") from exc
     except json.JSONDecodeError as exc:
-        raise UserVisibleError(f"Invalid Forge schema JSON {path.name}: {exc}") from exc
-    if not isinstance(raw, dict) or raw.get("kind") != FORGE_SCHEMA_KIND or raw.get("backend") != "forge":
-        raise UserVisibleError(f"File {path.name} is not an {APP_NAME} Forge schema.")
+        raise UserVisibleError(
+            f"Invalid Forge schema JSON {path.name}: {exc}",
+            "forge_schema_json_invalid",
+            [path.name, exc.lineno, exc.colno, exc.msg],
+        ) from exc
+    if not isinstance(raw, dict):
+        raise UserVisibleError(
+            f"Forge schema {path.name} must be a JSON object.",
+            "forge_schema_root_invalid",
+            [path.name],
+        )
+    if raw.get("kind") != FORGE_SCHEMA_KIND or raw.get("backend") != "forge":
+        raise UserVisibleError(
+            f"File {path.name} is not an {APP_NAME} Forge schema.",
+            "forge_schema_kind_invalid",
+            [path.name],
+        )
     if raw.get("abstract"):
-        raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
+        raise UserVisibleError(
+            f"Forge UI preset was not found: {schema_id}",
+            "forge_schema_missing",
+            [schema_id],
+        )
     schema = _read_forge_schema_file(path, schema_dir, source=raw)
     schema["workspace_id"] = schema_id
     schema["workflow_id"] = "forge:" + schema_id
@@ -4698,14 +4896,18 @@ def _forge_reference_data_url(path: Path) -> str:
             content = buffer.getvalue()
     except Exception as exc:
         raise UserVisibleError(
-            f"ImageStitch could not decode the selected image: {path}"
+            f"ImageStitch could not decode the selected image: {path}",
+            "image_stitch_decode_failed",
+            [path],
         ) from exc
 
     # Local round-trip validation catches an incomplete/empty encoder result
     # before the request reaches Forge Neo.
     if not content.startswith(b"\x89PNG\r\n\x1a\n"):
         raise UserVisibleError(
-            f"ImageStitch could not prepare a valid PNG image: {path}"
+            f"ImageStitch could not prepare a valid PNG image: {path}",
+            "image_stitch_prepare_failed",
+            [path],
         )
     result = "data:image/png;base64," + base64.b64encode(content).decode("ascii")
     if _imagestitch_cache_key(path) == cache_key:
@@ -4864,7 +5066,11 @@ def _forge_match_choice(value: Any, choices: Sequence[Any], field_name: str) -> 
     string_matches = [choice for choice in choices if str(choice) == str(value)]
     if len(string_matches) == 1:
         return string_matches[0]
-    raise UserVisibleError(f"Invalid value {value!r} for Forge field {field_name}.")
+    raise UserVisibleError(
+        f"Invalid value {value!r} for Forge field {field_name}.",
+        "forge_field_invalid_value",
+        [value, field_name],
+    )
 
 
 def _forge_int_bound(value: Any) -> Optional[int]:
@@ -4903,7 +5109,11 @@ def _forge_coerce_control_value(
     if control_type == "dropdown":
         choices = _forge_control_choices(control, runtime_catalog)
         if not choices:
-            raise UserVisibleError(f"Forge field {control_id} has no available values.")
+            raise UserVisibleError(
+                f"Forge field {control_id} has no available values.",
+                "forge_field_no_values",
+                [control_id],
+            )
         return _forge_match_choice(value, choices, control_id)
 
     if control_type == "multiselect":
@@ -4912,10 +5122,18 @@ def _forge_coerce_control_value(
         elif isinstance(value, (list, tuple)):
             values = list(value)
         else:
-            raise UserVisibleError(f"Forge field {control_id} expects a list of values.")
+            raise UserVisibleError(
+                f"Forge field {control_id} expects a list of values.",
+                "forge_field_list_expected",
+                [control_id],
+            )
         choices = _forge_control_choices(control, runtime_catalog)
         if values and not choices:
-            raise UserVisibleError(f"Forge field {control_id} has no available values.")
+            raise UserVisibleError(
+                f"Forge field {control_id} has no available values.",
+                "forge_field_no_values",
+                [control_id],
+            )
         result: List[Any] = []
         seen: Set[Tuple[str, str]] = set()
         for item in values:
@@ -4934,7 +5152,9 @@ def _forge_coerce_control_value(
             number = parse_user_int(value)
         except (TypeError, ValueError, OverflowError) as exc:
             raise UserVisibleError(
-                f"Forge field {control_id} expects an integer, received {value!r}."
+                f"Forge field {control_id} expects an integer, received {value!r}.",
+                "forge_field_integer_expected",
+                [control_id, value],
             ) from exc
 
         minimum = _forge_int_bound(control.get("min"))
@@ -4961,11 +5181,15 @@ def _forge_coerce_control_value(
             number = parse_user_float(value)
         except (TypeError, ValueError, OverflowError) as exc:
             raise UserVisibleError(
-                f"Forge field {control_id} expects a number, received {value!r}."
+                f"Forge field {control_id} expects a number, received {value!r}.",
+                "forge_field_number_expected",
+                [control_id, value],
             ) from exc
         if not math.isfinite(number):
             raise UserVisibleError(
-                f"Forge field {control_id} expects a finite number, received {value!r}."
+                f"Forge field {control_id} expects a finite number, received {value!r}.",
+                "forge_field_finite_expected",
+                [control_id, value],
             )
         minimum = _forge_float_bound(control.get("min"))
         maximum = _forge_float_bound(control.get("max"))
@@ -4978,7 +5202,11 @@ def _forge_coerce_control_value(
                 number = math.floor(quotient + 0.5) * step + origin
         number = clamp_number(number, minimum, maximum)
         if not math.isfinite(number):
-            raise UserVisibleError(f"Forge field {control_id} produced a non-finite number.")
+            raise UserVisibleError(
+                f"Forge field {control_id} produced a non-finite number.",
+                "forge_field_non_finite",
+                [control_id],
+            )
         return float(number)
 
     if value is None:
@@ -5011,6 +5239,15 @@ def _forge_response_image(result: Any, response_keys: List[str]) -> Optional[str
 def run_forge_generation(task: Dict[str, Any]) -> None:
     with generation_context(task, "forge") as request_id:
         _run_forge_generation(task, request_id)
+
+
+FORGE_POST_THREADS_LOCK = threading.Lock()
+FORGE_POST_THREADS: Dict[str, threading.Thread] = {}
+
+
+def forge_post_in_progress() -> bool:
+    with FORGE_POST_THREADS_LOCK:
+        return any(thread.is_alive() for thread in FORGE_POST_THREADS.values())
 
 
 # Собирает payload только из разрешённых полей схемы. Значения скрытых контролов
@@ -5066,7 +5303,10 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
                 enabled = True
                 break
         if not enabled:
-            raise UserVisibleError(str(generation.get("require_any_error") or "Select at least one processing mode."))
+            raise UserVisibleError(
+                str(generation.get("require_any_error") or "Select at least one processing mode."),
+                "forge_processing_mode_required",
+            )
 
     payload: Dict[str, Any]
     if input_mode == "single_image":
@@ -5164,7 +5404,10 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         # генерацию: в таком случае ImageStitch просто не активируется.
         if encoded:
             if input_mode == "single_image":
-                raise UserVisibleError("ImageStitch cannot be used with this Forge schema.")
+                raise UserVisibleError(
+                    "ImageStitch cannot be used with this Forge schema.",
+                    "forge_image_stitch_unsupported",
+                )
             # Не заменяем alwayson_scripts целиком: схема может уже включать
             # другие Forge extensions, которые должны работать вместе с ImageStitch.
             alwayson_scripts = payload.get("alwayson_scripts")
@@ -5197,12 +5440,22 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
             post_result["error"] = exc
         finally:
             post_done.set()
+            with FORGE_POST_THREADS_LOCK:
+                FORGE_POST_THREADS.pop(request_id, None)
 
-    threading.Thread(
+    post_thread = threading.Thread(
         target=forge_post_worker,
         name=f"ForgeGeneration-{request_id[:8]}",
         daemon=True,
-    ).start()
+    )
+    with FORGE_POST_THREADS_LOCK:
+        FORGE_POST_THREADS[request_id] = post_thread
+    try:
+        post_thread.start()
+    except Exception:
+        with FORGE_POST_THREADS_LOCK:
+            FORGE_POST_THREADS.pop(request_id, None)
+        raise
 
     progress_mode = str(generation.get("progress_mode") or "sampling").strip().lower()
     progress_stage_started = False
@@ -5283,6 +5536,7 @@ class RuntimeConfig:
 @dataclass
 class GenerationState:
     request_id: Optional[str] = None
+    queued_request_id: Optional[str] = None
     backend: str = "comfy"
     prompt_id: Optional[str] = None
     input_folder: Optional[Path] = None
@@ -5328,6 +5582,7 @@ def generation_context(task: Dict[str, Any], backend: str):
     request_id = str(task.get("request_id") or uuid.uuid4())
     task["request_id"] = request_id
     GENERATION.request_id = request_id
+    GENERATION.queued_request_id = None
     GENERATION.prompt_id = None
     GENERATION.backend = backend
     GENERATION.input_folder = None
@@ -5356,6 +5611,7 @@ def generation_context(task: Dict[str, Any], backend: str):
             with CANCELLED_REQUESTS_LOCK:
                 CANCELLED_REQUESTS.discard(request_id)
             GENERATION.request_id = None
+            GENERATION.queued_request_id = None
             GENERATION.prompt_id = None
             GENERATION.backend = "comfy"
             GENERATION.input_folder = None
@@ -5509,15 +5765,19 @@ def answer(message: Any, request_id: Optional[str] = None) -> None:
     )
 
 
-def error_answer(message: str, request_id: Optional[str] = None) -> None:
-    send_data_to_jsx(
-        {
-            "protocol": API_PROTOCOL,
-            "request_id": request_id,
-            "type": "error",
-            "message": message,
-        }
-    )
+def error_answer(message: Any, request_id: Optional[str] = None) -> None:
+    payload: Dict[str, Any] = {
+        "protocol": API_PROTOCOL,
+        "request_id": request_id,
+        "type": "error",
+        "message": str(message or ""),
+    }
+    if isinstance(message, UserVisibleError):
+        if message.code:
+            payload["code"] = message.code
+        if message.params:
+            payload["params"] = message.params
+    send_data_to_jsx(payload)
 
 
 def cancelled_answer(request_id: Optional[str] = None) -> None:
@@ -5587,8 +5847,21 @@ def normalize_binding_overrides(value: Optional[Dict[str, Any]]) -> Optional[Dic
         if size_id not in (None, ""):
             result["size"] = size_id
     references = value.get("references")
-    if isinstance(references, list):
-        result["references"] = [str(item) for item in references if item not in (None, "")]
+    references_configured = (
+        value.get("referencesConfigured") is True
+        or value.get("references_configured") is True
+    )
+    normalized_references = (
+        [str(item) for item in references if item not in (None, "")]
+        if isinstance(references, list)
+        else []
+    )
+    if normalized_references or references_configured:
+        result["references"] = normalized_references
+    if references_configured:
+        # Distinguish the first automatic #PS-REF setup from an explicit user
+        # choice to assign no LoadImage nodes to the Reference role.
+        result["references_configured"] = True
     empty_inputs = value.get("emptyInputs")
     if not isinstance(empty_inputs, list):
         empty_inputs = value.get("empty_inputs")
@@ -5666,6 +5939,62 @@ def analyze_workflow(
     return result
 
 
+def workflow_analysis_for_client(
+    analysis: Dict[str, Any], candidate_format: int
+) -> Dict[str, Any]:
+    """Adapt compact mask candidates for clients using the legacy layout."""
+
+    if candidate_format >= 2:
+        return analysis
+    result = dict(analysis)
+    candidates = dict(
+        analysis.get("candidates")
+        if isinstance(analysis.get("candidates"), dict)
+        else {}
+    )
+    common_masks = list(
+        candidates.get("mask") if isinstance(candidates.get("mask"), list) else []
+    )
+    main_masks_by_input = candidates.pop("main_mask_by_input", {})
+    selected_input_targets = {
+        (str(target.get("node_id") or ""), str(target.get("input") or ""))
+        for target in (
+            analysis.get("bindings", {}).get("input_image", [])
+            if isinstance(analysis.get("bindings"), dict)
+            else []
+        )
+        if isinstance(target, dict)
+    }
+    selected_main_mask: Optional[Dict[str, Any]] = None
+    for candidate in candidates.get("input", []):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_targets = {
+            (str(target.get("node_id") or ""), str(target.get("input") or ""))
+            for target in candidate.get("targets", [])
+            if isinstance(target, dict)
+        }
+        candidate_id = str(candidate.get("id") or "")
+        if candidate_targets == selected_input_targets and isinstance(
+            main_masks_by_input.get(candidate_id), dict
+        ):
+            selected_main_mask = main_masks_by_input[candidate_id]
+            break
+    candidates["mask"] = (
+        [selected_main_mask] if selected_main_mask is not None else []
+    ) + common_masks
+    candidates["mask_by_input"] = {
+        str(input_id): ([mask] if isinstance(mask, dict) else []) + common_masks
+        for input_id, mask in (
+            main_masks_by_input.items()
+            if isinstance(main_masks_by_input, dict)
+            else []
+        )
+    }
+    result["candidates"] = candidates
+    return result
+
+
 def save_workflow_values(
     workflow_id: str,
     *,
@@ -5678,7 +6007,10 @@ def save_workflow_values(
 
     values = values if isinstance(values, dict) else {}
     if not values:
-        raise UserVisibleError("There are no visible workflow values to save.")
+        raise UserVisibleError(
+            "There are no visible workflow values to save.",
+            "workflow_save_no_values",
+        )
 
     repository = WorkflowRepository(RUNTIME.workflows_folder)
     workflow_file = repository.get(workflow_id, relative_path=relative_path)
@@ -5708,14 +6040,9 @@ def save_workflow_values(
             workflow_file, normalized_overrides, analysis, object_info
         )
     if not analysis.get("valid"):
-        messages = [
-            str(item.get("message") or "")
-            for item in analysis.get("diagnostics", [])
-            if str(item.get("level") or "").lower() == "error"
-        ]
         raise UserVisibleError(
-            "The workflow cannot be saved because its current bindings are invalid:"
-            + ("\n• " + "\n• ".join(messages) if messages else "")
+            "The workflow cannot be saved because its current bindings are invalid.",
+            "workflow_save_invalid_bindings",
         )
 
     controls = analysis.get("controls") if isinstance(analysis.get("controls"), list) else []
@@ -5731,24 +6058,37 @@ def save_workflow_values(
         if not control:
             raise UserVisibleError(
                 f"Could not save workflow field {control_id!r}: it is missing from the current analysis. "
-                "Reanalyze the workflow and try again."
+                "Reanalyze the workflow and try again.",
+                "workflow_save_field_missing",
+                [control_id],
             )
         targets = control.get("targets") if isinstance(control.get("targets"), list) else []
         if not targets:
             raise UserVisibleError(
                 f"Could not save workflow field {control_id!r}: it has no target inputs. "
-                "Reanalyze the workflow and check its bindings."
+                "Reanalyze the workflow and check its bindings.",
+                "workflow_save_field_no_targets",
+                [control_id],
             )
         for target in targets:
             patcher.set_target(target, value)
 
     raw_destination = str(destination_path or "").strip()
     if not raw_destination:
-        raise UserVisibleError("No destination file was selected for Save As. The source workflow was not changed.")
+        raise UserVisibleError(
+            "No destination file was selected for Save As. The source workflow was not changed.",
+            "save_destination_missing",
+        )
     destination = Path(raw_destination).expanduser()
     if destination.suffix.lower() != ".json":
-        raise UserVisibleError(f"The workflow must be saved as a .json file:\n{destination}")
-    write_json_atomic(destination, patcher.workflow, "workflow JSON")
+        raise UserVisibleError(
+            f"The workflow must be saved as a .json file:\n{destination}",
+            "workflow_save_json_required",
+            [destination],
+        )
+    write_json_atomic(
+        destination, patcher.workflow, "workflow JSON", "workflow_save_write_failed"
+    )
     try:
         saved_relative = destination.resolve().relative_to(repository.folder.resolve()).as_posix()
         invalidate_workflow_cache(stable_workflow_id(saved_relative))
@@ -5771,21 +6111,36 @@ def save_forge_schema_values(
 
     values = values if isinstance(values, dict) else {}
     if not values:
-        raise UserVisibleError("There are no visible Forge schema values to save.")
+        raise UserVisibleError(
+            "There are no visible Forge schema values to save.",
+            "forge_save_no_values",
+        )
 
     items, schema_dir, _ = list_forge_schemas(schema_folder)
     item = next((entry for entry in items if str(entry.get("id") or "") == str(schema_id or "")), None)
     if not item:
-        raise UserVisibleError(f"Forge UI preset was not found: {schema_id}")
+        raise UserVisibleError(
+            f"Forge UI preset was not found: {schema_id}",
+            "forge_schema_missing",
+            [schema_id],
+        )
     path = schema_dir / str(item.get("file") or "")
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise UserVisibleError(f"Could not read Forge schema: {path}") from exc
     except json.JSONDecodeError as exc:
-        raise UserVisibleError(f"Invalid Forge schema JSON {path.name}: {exc}") from exc
+        raise UserVisibleError(
+            f"Invalid Forge schema JSON {path.name}: {exc}",
+            "forge_schema_json_invalid",
+            [path.name, exc.lineno, exc.colno, exc.msg],
+        ) from exc
     if not isinstance(raw, dict):
-        raise UserVisibleError(f"Forge schema {path.name} must be a JSON object.")
+        raise UserVisibleError(
+            f"Forge schema {path.name} must be a JSON object.",
+            "forge_schema_root_invalid",
+            [path.name],
+        )
 
     raw_selected_loras = selected_loras if isinstance(selected_loras, list) else []
 
@@ -5827,13 +6182,18 @@ def save_forge_schema_values(
                 else {}
             )
             if not _forge_bool(capabilities.get("image_stitch")):
-                raise UserVisibleError("The selected Forge schema does not support ImageStitch.")
+                raise UserVisibleError(
+                    "The selected Forge schema does not support ImageStitch.",
+                    "forge_image_stitch_unsupported",
+                )
             raw["image_stitch_default"] = _forge_bool(value)
             continue
         control = controls_by_id.get(control_id)
         if not control:
             raise UserVisibleError(
-                f"Could not save Forge field {control_id!r}: it is absent from the selected schema."
+                f"Could not save Forge field {control_id!r}: it is absent from the selected schema.",
+                "forge_save_field_missing",
+                [control_id],
             )
         effective_control = effective_by_id.get(control_id, control)
         control["value"] = _forge_coerce_control_value(
@@ -5842,10 +6202,17 @@ def save_forge_schema_values(
 
     raw_destination = str(destination_path or "").strip()
     if not raw_destination:
-        raise UserVisibleError("No destination file was selected for Save As. The source Forge schema was not changed.")
+        raise UserVisibleError(
+            "No destination file was selected for Save As. The source Forge schema was not changed.",
+            "save_destination_missing",
+        )
     destination = Path(raw_destination).expanduser()
     if destination.suffix.lower() != ".json":
-        raise UserVisibleError(f"The Forge schema must be saved as a .json file:\n{destination}")
+        raise UserVisibleError(
+            f"The Forge schema must be saved as a .json file:\n{destination}",
+            "forge_save_json_required",
+            [destination],
+        )
 
     # Save As создаёт самостоятельную копию схемы. Для новой копии label
     # должен соответствовать имени, которое пользователь ввёл в стандартном
@@ -5895,7 +6262,9 @@ def save_forge_schema_values(
     else:
         raw.pop("loras", None)
 
-    write_json_atomic(destination, raw, "Forge schema JSON")
+    write_json_atomic(
+        destination, raw, "Forge schema JSON", "forge_save_write_failed"
+    )
     return {"path": str(destination)}
 
 
@@ -5940,7 +6309,9 @@ def select_output_image(
     node_output = outputs.get(node_id)
     if not isinstance(node_output, dict):
         raise UserVisibleError(
-            f"The workflow completed, but the selected Output image node #{node_id} is missing from history."
+            f"The workflow completed, but the selected Output image node #{node_id} is missing from history.",
+            "output_image_missing_from_history",
+            [node_id],
         )
 
     images = node_output.get("images")
@@ -5953,8 +6324,10 @@ def select_output_image(
                 break
     if not isinstance(images, list) or not images:
         raise UserVisibleError(
-            f"Output node #{node_id} did not return an image. "
-            "Select Save Image or Preview Image tagged #PS-OUTPUT."
+            f"The selected Output image node #{node_id} did not return an image. "
+            "Select Save Image or Preview Image tagged #PS-OUTPUT.",
+            "output_image_not_returned",
+            [node_id],
         )
     image = images[0]
     if not isinstance(image, dict) or not image.get("filename"):
@@ -5963,10 +6336,18 @@ def select_output_image(
 
 
 def mark_request_cancelled(request_id: Optional[str]) -> str:
-    normalized = str(request_id or "")
-    if normalized:
-        with CANCELLED_REQUESTS_LOCK:
-            CANCELLED_REQUESTS.add(normalized)
+    requested = str(request_id or "")
+    current = str(GENERATION.request_id or GENERATION.queued_request_id or "")
+    # Ignore a delayed interrupt after its task has completed, and never retain
+    # an ID belonging to a different task. This keeps the cancellation set
+    # bounded even when JSX closes its listener before the interrupt arrives.
+    if requested and (not current or requested != current):
+        return ""
+    normalized = requested or current
+    if not normalized:
+        return ""
+    with CANCELLED_REQUESTS_LOCK:
+        CANCELLED_REQUESTS.add(normalized)
     return normalized
 
 
@@ -5986,10 +6367,7 @@ def raise_if_generation_cancelled(request_id: str) -> None:
 
 def cancel_current_generation(request_id: Optional[str] = None) -> None:
     normalized = mark_request_cancelled(request_id)
-
-    # Не прерываем другую генерацию, если пришла запоздалая команда от уже
-    # завершённого request_id. При отсутствии ID отменяем текущую задачу.
-    if GENERATION.request_id and normalized and normalized != GENERATION.request_id:
+    if not normalized:
         return
 
     GENERATION.cancel_event.set()
@@ -6365,26 +6743,35 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
             for item in analysis.get("diagnostics", [])
             if item.get("level") == "error"
         ]
-        raise UserVisibleError("The workflow is not ready to run:\n• " + "\n• ".join(messages))
+        raise UserVisibleError(
+            "The workflow is not ready to run:\n• " + "\n• ".join(messages),
+            "workflow_not_ready",
+        )
 
     mask_binding = analysis.get("bindings", {}).get("inpaint_mask")
     if inpaint_mode:
         if not isinstance(mask_binding, dict) or not mask_binding.get("mode"):
             raise UserVisibleError(
                 "No suitable option was found for Inpaint mask. In Workflow settings, "
-                "select the main LoadImage MASK or a LoadImageMask node."
+                "select the main LoadImage MASK or a LoadImageMask node.",
+                "inpaint_mask_missing",
             )
         if str(mask_binding.get("mode")) != inpaint_mode:
-            raise UserVisibleError("The workflow mask configuration changed. Reopen the main script window.")
+            raise UserVisibleError(
+                "The workflow mask configuration changed. Reopen the main script window.",
+                "inpaint_mask_changed",
+            )
         if not mask_binding.get("connected"):
             if inpaint_mode == "input_alpha":
                 raise UserVisibleError(
                     "The main LoadImage MASK is not used by the workflow. Connect its MASK output "
-                    "to the inpaint branch in ComfyUI or select another Inpaint mask option."
+                    "to the inpaint branch in ComfyUI or select another Inpaint mask option.",
+                    "inpaint_main_mask_unused",
                 )
             raise UserVisibleError(
                 "The selected LoadImageMask MASK is not used by the workflow. Connect its MASK output "
-                "to the inpaint branch in ComfyUI or select another Inpaint mask option."
+                "to the inpaint branch in ComfyUI or select another Inpaint mask option.",
+                "inpaint_node_mask_unused",
             )
 
     # Если JSX/другой клиент не передал dimensions и workflow наследует размер
@@ -6692,7 +7079,7 @@ def generation_worker() -> None:
             cancelled_answer(task.get("request_id"))
         except UserVisibleError as exc:
             LOGGER.warning("Generation error: %s", exc)
-            error_answer(str(exc), task.get("request_id"))
+            error_answer(exc, task.get("request_id"))
         except Exception as exc:
             log_exception("Unhandled generation error")
             error_answer(f"Internal Python error: {exc}", task.get("request_id"))
@@ -7253,7 +7640,14 @@ def handle_command(command: Dict[str, Any]) -> None:
                     "Invalid workflow returned as schema valid=false; diagnostics=%s",
                     len(result.get("diagnostics", [])),
                 )
-            answer(result, request_id)
+            try:
+                candidate_format = int(message.get("candidate_format") or 1)
+            except (TypeError, ValueError):
+                candidate_format = 1
+            answer(
+                workflow_analysis_for_client(result, candidate_format),
+                request_id,
+            )
             LOGGER.info(
                 "Command %s completed in %.2f s",
                 command_type,
@@ -7325,7 +7719,11 @@ def handle_command(command: Dict[str, Any]) -> None:
                 ).translate(source_text)
             except Exception as exc:
                 LOGGER.exception("Prompt translation error")
-                raise UserVisibleError(f"Could not translate prompt: {exc}") from exc
+                raise UserVisibleError(
+                    f"Could not translate prompt: {exc}",
+                    "translate_failed",
+                    [exc],
+                ) from exc
             answer(str(translated or ""), request_id)
             return
 
@@ -7334,12 +7732,21 @@ def handle_command(command: Dict[str, Any]) -> None:
             # в отдельных потоках, и два почти одновременных запроса не должны
             # пройти проверку GENERATION_QUEUE.empty() одновременно.
             with GENERATION_SUBMIT_LOCK:
-                if GENERATION.active or GENERATION.queued or not GENERATION_QUEUE.empty():
-                    raise UserVisibleError("The previous generation has not finished yet.")
+                if (
+                    GENERATION.active
+                    or GENERATION.queued
+                    or not GENERATION_QUEUE.empty()
+                    or forge_post_in_progress()
+                ):
+                    raise UserVisibleError(
+                        "The previous generation has not finished yet.",
+                        "generation_already_running",
+                    )
                 # Резервируем единственный слот до queue.put(). Worker сначала
                 # выставляет active=True и только затем снимает queued, поэтому
                 # между приёмом команды и началом run_generation больше нет окна.
                 GENERATION.queued = True
+                GENERATION.queued_request_id = str(request_id or "")
                 GENERATION_QUEUE.put(command)
                 BACKEND_MONITOR_WAKE.set()
             # Первый ответ придёт из worker после успешного POST /prompt.
@@ -7362,7 +7769,7 @@ def handle_command(command: Dict[str, Any]) -> None:
         raise UserVisibleError(f"Unknown API command: {command_type}")
 
     except UserVisibleError as exc:
-        error_answer(str(exc), request_id)
+        error_answer(exc, request_id)
     except Exception as exc:
         log_exception(f"Command error: {command_type}")
         error_answer(f"Internal Python error: {exc}", request_id)
@@ -7404,7 +7811,7 @@ def handle_client(client_socket: socket.socket) -> None:
         if command:
             handle_command(command)
     except UserVisibleError as exc:
-        error_answer(str(exc))
+        error_answer(exc)
     except Exception:
         log_exception("TCP client handling error")
         error_answer("Photoshop local connection to Python failed.")
@@ -7430,7 +7837,12 @@ def backend_monitor_watcher() -> None:
             BACKEND_MONITOR_WAKE.wait(remaining)
             BACKEND_MONITOR_WAKE.clear()
             continue
-        if GENERATION.active or GENERATION.queued or not GENERATION_QUEUE.empty():
+        if (
+            GENERATION.active
+            or GENERATION.queued
+            or not GENERATION_QUEUE.empty()
+            or forge_post_in_progress()
+        ):
             BACKEND_MONITOR_WAKE.wait(min(1.0, float(interval)))
             BACKEND_MONITOR_WAKE.clear()
             continue
@@ -7438,7 +7850,12 @@ def backend_monitor_watcher() -> None:
         if BACKEND_MONITOR_WAKE.wait(0.1):
             BACKEND_MONITOR_WAKE.clear()
             continue
-        if GENERATION.active or GENERATION.queued or not GENERATION_QUEUE.empty():
+        if (
+            GENERATION.active
+            or GENERATION.queued
+            or not GENERATION_QUEUE.empty()
+            or forge_post_in_progress()
+        ):
             continue
         try:
             _refresh_backend_status(
@@ -7476,6 +7893,7 @@ def idle_watcher() -> None:
             and not GENERATION.active
             and not GENERATION.queued
             and GENERATION_QUEUE.empty()
+            and not forge_post_in_progress()
         ):
             LOGGER.info("Shutting down after %.0f seconds of inactivity", idle)
             WORKER_STOP.set()
@@ -7490,7 +7908,6 @@ def idle_watcher() -> None:
 
 
 def load_runtime_file() -> None:
-    global RUNTIME
     try:
         if not RUNTIME_FILE.exists():
             return

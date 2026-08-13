@@ -33,11 +33,11 @@ var APP = {
 	},
 	cache: {
 		schemaVersion: 1,
-		comfyAnalysisUuid: "a174cecf-c02f-42e5-b6dc-cabca3772a66",
+		comfyAnalysisUuid: "e3834ca5-3f51-4b92-9398-80a451476103",
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.189",
+	VER = "0.191",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -59,6 +59,8 @@ var APP = {
 	GENERATION_TOTAL_SEGMENTS = 100,
 	// doProgressTask() получает долю оставшегося участка.
 	PROGRESS_STAGE_TARGET = 0.95,
+	API_POLL_INTERVAL = 25,
+	API_POLL_SLEEP = 5,
 	// Вертикальный ритм главного окна. Эти значения можно менять независимо:
 	// обычные динамические блоки, верхняя строка Selection/Settings, Backend и Workflow/Schema.
 	MAIN_UI_BLOCK_SPACING = 5,
@@ -104,8 +106,7 @@ var APP = {
 try { init(); }
 catch (e) {
 	if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
-	if (String(e.message) == APP.cancelToken) {
-		api.interrupt(generationProgress.getRequestId());
+	if (isUserCancellation(e)) {
 		isCancelled = true;
 		$.setenv(APP.dialogEnvKey, "true");
 	} else {
@@ -221,15 +222,18 @@ function init() {
 				if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
 			}
 		} else if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
-		// Forge UI может использовать сохранённый список схем, если выбранная
-		// схема всё ещё присутствует в нём. Сама схема и требуемые каталоги
-		// всё равно запрашиваются заново, поэтому генерационные данные не кэшируются.
+		// Видимый UI использует сохранённый каталог, если выбранный элемент ещё
+		// присутствует в нём. Изменение выбранного JSON проверяется по stamp, а
+		// полный поиск новых файлов выполняется при первом запуске и по кнопке ↻.
 		var interfaceRequestedAtStartup = showInterface,
 			hasCachedForgeSelection = showInterface && cfg.activeBackend == BACKEND_FORGE &&
 				cfg.forgeCatalog instanceof Array &&
 				!!backend.findForgeSchema(cfg.forgeCatalog, cfg.selectedForgePreset),
+			hasCachedComfySelection = showInterface && cfg.activeBackend == BACKEND_COMFY &&
+				cfg.workflowCatalog instanceof Array &&
+				!!backend.findWorkflow(cfg.workflowCatalog, cfg.selectedWorkflow),
 			allowFastInitialLoad = !backendChangedAtStartup && !settingsWarnings.length &&
-				(!showInterface || hasCachedForgeSelection),
+				(!showInterface || hasCachedForgeSelection || hasCachedComfySelection),
 			initial = backend.loadInitialData(startupProgress, allowFastInitialLoad);
 		initial.notices = settingsWarnings.concat(initial.notices instanceof Array ? initial.notices : []);
 		if (backendChangedAtStartup || initial.forceDialog || initial.notices.length ||
@@ -281,7 +285,7 @@ function init() {
 		try {
 			generation.run(selection, initial.schema, silentValues);
 		} catch (silentGenerationError) {
-			if (String(silentGenerationError.message || silentGenerationError) == APP.cancelToken)
+			if (isUserCancellation(silentGenerationError))
 				throw silentGenerationError;
 			// GenerationRuntime may temporarily change layers and channels. Restore
 			// the document before presenting controls for a corrected retry.
@@ -327,6 +331,25 @@ function errorMessageText(value) {
 	if (value.message !== undefined) return String(value.message);
 	return String(value);
 }
+// Photoshop сообщает нажатие Cancel несколькими способами: возвращает false
+// из doProgress(), передаёт ответ backend с type=cancelled или выбрасывает
+// системную ошибку 8007. Во всех случаях это один штатный исход без UI ошибки.
+function userCancellationError() {
+	var error = new Error(APP.cancelToken);
+	error.img2imgUserCancelled = true;
+	return error;
+}
+function isUserCancellation(value) {
+	if (value === false) return true;
+	if (!value) return false;
+	if (value.img2imgUserCancelled === true) return true;
+	if (String(value.type || "").toLowerCase() == "cancelled") return true;
+	var number = Number(value.number);
+	if (number == 8007 || number == -128) return true;
+	var message = errorMessageText(value).replace(/^\s+|\s+$/g, "");
+	if (message == APP.cancelToken) return true;
+	return /^(?:error:\s*)?(?:user (?:cancelled|canceled)(?: the operation)?|operation (?:cancelled|canceled))[.!]?$/i.test(message);
+}
 function workflowDiagnosticText(item) {
 	item = item && typeof item == "object" ? item : {};
 	var sourceMessage = String(item.message || ""),
@@ -336,6 +359,16 @@ function workflowDiagnosticText(item) {
 		params = item.params instanceof Array ? item.params : [];
 	if (!params.length && code == "missing_node_class")
 		params = [sourceMessage.substring(sourceMessage.lastIndexOf(":") + 1).replace(/^\s+|\s+$/g, "")];
+	for (var i = 0; i < params.length; i++)
+		template = template.split("%" + (i + 1)).join(String(params[i]));
+	return template;
+}
+function apiErrorText(item) {
+	item = item && typeof item == "object" ? item : {};
+	var code = String(item.code || "");
+	if (!code || str[code] === undefined) return String(item.message || "");
+	var template = String(str[code]),
+		params = item.params instanceof Array ? item.params : [];
 	for (var i = 0; i < params.length; i++)
 		template = template.split("%" + (i + 1)).join(String(params[i]));
 	return template;
@@ -457,7 +490,7 @@ function mainDialog(selection, initial, responseSeconds) {
 	bSettings.text = "⚙"; bSettings.helpTip = str.scriptSettings; bSettings.alignment = ["right", "center"];
 	bOk.text = str.generate;
 	updateMetadataButton(); showControls();
-	var showInitialDiagnostics = state.schema && !state.schema.valid;
+	var showInitialDiagnostics = !!state.schema;
 	w.onShow = function () {
 		activateVisibleDenoiseControl();
 		var diagnosticSchema = showInitialDiagnostics ? state.schema : null;
@@ -567,7 +600,10 @@ function mainDialog(selection, initial, responseSeconds) {
 			if (level == "error") errors.push(diagnosticText);
 			else if (level == "warning") warnings.push(diagnosticText);
 		}
-		var signature = errors.join("\n") + "\n--warnings--\n" + warnings.join("\n");
+		var schemaIdentity = schema
+			? String(schema.workflow_id || schema.workspace_id || schema.relative_path || "")
+			: "",
+			signature = schemaIdentity + "\n--errors--\n" + errors.join("\n") + "\n--warnings--\n" + warnings.join("\n");
 		if (!errors.length && !warnings.length) {
 			state.workflowDiagnosticSignature = "";
 			return;
@@ -610,9 +646,10 @@ function mainDialog(selection, initial, responseSeconds) {
 		cfg.selectedWorkflow = cfg.data.selectedWorkflow = workflow.id;
 		var profile = cfg.getProfile(workflow.id), previous = cloneObj(profile.bindingOverrides);
 		applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat", "selectedPromptPresets", "ignoreUnselectedLoadImages"]);
-		if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], emptyInputs: [], output: "", sizeMode: "auto", size: "" };
+		if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" };
 		if (profile.bindingOverrides.mask === undefined) profile.bindingOverrides.mask = "";
 		if (!(profile.bindingOverrides.references instanceof Array)) profile.bindingOverrides.references = [];
+		profile.bindingOverrides.referencesConfigured = profile.bindingOverrides.referencesConfigured === true;
 		if (!(profile.bindingOverrides.emptyInputs instanceof Array)) profile.bindingOverrides.emptyInputs = [];
 		if (profile.bindingOverrides.sizeMode !== "source_image" && profile.bindingOverrides.sizeMode !== "binding")
 			profile.bindingOverrides.sizeMode = "auto";
@@ -679,7 +716,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (mainState) {
 			state.emptyDropdownIds = [];
 			renderMainState(mainState);
-			if (w.visible) showPendingNotices(state.schema && !state.schema.valid ? state.schema : null);
+			if (w.visible) showPendingNotices(state.schema);
 			return;
 		}
 		var profile = backend.schemaProfile(state.schema),
@@ -717,7 +754,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (state.backend == BACKEND_FORGE)
 			applyForgeSchemaRules(state.schema, state.controls, baseGenerationEnabled);
 		finalizeMainLayout();
-		if (w.visible) showPendingNotices(state.schema && !state.schema.valid ? state.schema : null);
+		if (w.visible) showPendingNotices(state.schema);
 	}
 	function resolveMainState() {
 		if (state.backend == BACKEND_COMFY && !backend.comfyFolderReady())
@@ -1461,6 +1498,7 @@ function mainDialog(selection, initial, responseSeconds) {
 					? candidateById(inputCandidates, storedMainId)
 					: (automaticInputTargets.length ? { targets: automaticInputTargets } : null),
 				referenceIds = profile.bindingOverrides.references || [],
+				referencesConfigured = profile.bindingOverrides.referencesConfigured === true,
 				emptyIds = profile.bindingOverrides.emptyInputs || [], i, j, candidate, selected;
 			for (i = 0; i < inputCandidates.length; i++)
 				if (!(inputCandidates[i].meta && inputCandidates[i].meta.grouped)) roleCandidates.push(inputCandidates[i]);
@@ -1472,7 +1510,7 @@ function mainDialog(selection, initial, responseSeconds) {
 					selected = candidateById(inputCandidates, referenceIds[j]);
 					if (selected && candidatesOverlap(selected, candidate)) roleById[candidate.id] = "reference";
 				}
-				if (!referenceIds.length && roleById[candidate.id] != "photoshop")
+				if (!referencesConfigured && !referenceIds.length && roleById[candidate.id] != "photoshop")
 					for (j = 0; j < automaticReferenceBindings.length; j++)
 						if (candidatesOverlap(candidate, { targets: automaticReferenceBindings[j].targets || [] })) {
 							roleById[candidate.id] = "reference";
@@ -1529,10 +1567,16 @@ function mainDialog(selection, initial, responseSeconds) {
 		}
 		function currentMaskCandidates() {
 			var main = currentMainCandidate(), inputId = main ? main.id : "",
-				byInput = candidates.mask_by_input;
-			if (inputId && byInput && byInput[inputId] instanceof Array)
-				return byInput[inputId];
-			var allMasks = candidates.mask || [], res = [];
+				mainByInput = candidates.main_mask_by_input,
+				legacyByInput = candidates.mask_by_input,
+				allMasks = candidates.mask || [], res = [], dynamicMask = null;
+			if (inputId && mainByInput && mainByInput[inputId])
+				dynamicMask = mainByInput[inputId];
+			if (dynamicMask) res.push(dynamicMask);
+			// Compatibility with Python APIs that still return the former full
+			// per-input arrays. New APIs send one dynamic item plus common masks.
+			if (!dynamicMask && inputId && legacyByInput && legacyByInput[inputId] instanceof Array)
+				return legacyByInput[inputId];
 			for (var i = 0; i < allMasks.length; i++)
 				if (!allMasks[i].meta || allMasks[i].meta.mode != "input_alpha") res.push(allMasks[i]);
 			return res;
@@ -1636,6 +1680,7 @@ function mainDialog(selection, initial, responseSeconds) {
 				profile.bindingOverrides.input = main && (!storedMainId && targetsEqual(main, automaticInputTargets))
 					? "" : (main ? main.id : "");
 				profile.bindingOverrides.references = [];
+				profile.bindingOverrides.referencesConfigured = true;
 				profile.bindingOverrides.emptyInputs = [];
 				for (i = 0; i < roleCandidates.length; i++) {
 					candidate = roleCandidates[i];
@@ -2263,14 +2308,20 @@ function GenerationRuntime() {
 				timingMax: generationTimings.getDelay(timingKey),
 				requestId: requestId
 			});
-			app.doProgress(progressTitles.window, "runGenerationProgress()");
+			var progressCompleted;
+			try {
+				progressCompleted = app.doProgress(progressTitles.window, "runGenerationProgress()");
+			} catch (progressError) {
+				if (!isUserCancellation(progressError)) throw progressError;
+				progressCompleted = false;
+			}
 			var progressResult = generationProgress.getResult();
-			if (progressResult === false || (progressResult && progressResult.type == "cancelled")) {
+			if (progressCompleted === false || isUserCancellation(progressResult)) {
 				$.setenv(APP.dialogEnvKey, "true");
-				throw new Error(APP.cancelToken);
+				throw userCancellationError();
 			}
 			if (!progressResult) throw new Error(str.errNoResult);
-			if (progressResult.type == "error") throw new Error(progressResult.message);
+			if (progressResult.type == "error") throw new Error(apiErrorText(progressResult));
 			var answer = progressResult.message,
 				resultPath = typeof answer == "object" ? answer.path : answer;
 			resultFile = new File(resultPath);
@@ -2909,10 +2960,15 @@ function BackendRuntime() {
 		if (response.folder) cfg.forgeSchemasFolder = cfg.data.forgeSchemasFolder = String(response.folder);
 		for (var i = 0; i < invalid.length; i++) {
 			var fileName = String(invalid[i].file || str.unknownFile),
-				msg = String(invalid[i].message || str.invalidForgeSchema);
+				msg = invalid[i] && invalid[i].code
+					? apiErrorText(invalid[i])
+					: String(invalid[i].message || str.invalidForgeSchema),
+				displayMessage = invalid[i] && invalid[i].code
+					? msg
+					: str.invalidForgeSchema + " " + fileName + ": " + msg;
 			pushNotice(
 				"forge-schema-invalid:" + fileName + ":" + msg,
-				str.invalidForgeSchema + " " + fileName + ": " + msg
+				displayMessage
 			);
 		}
 		cfg.forgeCatalog = cfg.data.forgeCatalog = items;
@@ -2959,7 +3015,7 @@ function BackendRuntime() {
 			if (validation.missing.length)
 				pushNotice(
 					"forge-schema-default-loras-missing:" + forgeSchemaId(schema) + ":" + validation.missing.join("|"),
-					"Some default LoRAs from the selected Forge schema were not found and were skipped: " + forgeLoraNoticeList(validation.missing)
+					str.forgeDefaultLorasMissing + forgeLoraNoticeList(validation.missing)
 				);
 			return;
 		}
@@ -2968,7 +3024,7 @@ function BackendRuntime() {
 		if (validation.missing.length)
 			pushNotice(
 				"forge-profile-loras-missing:" + forgeSchemaId(schema) + ":" + validation.missing.join("|"),
-				"Some saved LoRAs for the selected Forge schema were not found and were skipped: " + forgeLoraNoticeList(validation.missing)
+				str.forgeSavedLorasMissing + forgeLoraNoticeList(validation.missing)
 			);
 	}
 	function hydrateForgeSchema(schema, catalog) {
@@ -3033,7 +3089,8 @@ function BackendRuntime() {
 		return { catalog: nextCatalog, schema: hydrated };
 	}
 	var workflowAnalysisArgs = null,
-		workflowAnalysisResult = null;
+		workflowAnalysisResult = null,
+		workflowAnalysisCancelled = false;
 	function schemaBackend(schema) {
 		return schema && schema.backend == BACKEND_FORGE ? BACKEND_FORGE : BACKEND_COMFY;
 	}
@@ -3067,7 +3124,7 @@ function BackendRuntime() {
 				key = "dropdown:" + schemaId + ":" + id;
 			if (!items.length) {
 				res.emptyDropdownIds.push(id);
-				res.notices.push({ key: key + ":empty", message: label + ": " + str.noAvailableValues });
+				res.notices.push({ key: key + ":empty", level: "error", message: label + ": " + str.noAvailableValues });
 				continue;
 			}
 			var hasStored = profile.values.hasOwnProperty(id),
@@ -3135,15 +3192,28 @@ function BackendRuntime() {
 		}
 		workflowAnalysisArgs = { workflow: workflow, profile: profile, force: !!force };
 		workflowAnalysisResult = null;
-		app.doProgress(str.progressAnalyze, "runWorkflowAnalysisProgress()");
-		var res = workflowAnalysisResult;
+		workflowAnalysisCancelled = false;
+		var progressCompleted;
+		try {
+			progressCompleted = app.doProgress(str.progressAnalyze, "runWorkflowAnalysisProgress()");
+		} catch (progressError) {
+			if (!isUserCancellation(progressError)) throw progressError;
+			progressCompleted = false;
+		}
+		var res = workflowAnalysisResult,
+			wasCancelled = workflowAnalysisCancelled;
 		workflowAnalysisArgs = null;
 		workflowAnalysisResult = null;
+		workflowAnalysisCancelled = false;
+		if (progressCompleted === false || wasCancelled) throw userCancellationError();
 		if (!res) throw new Error(str.errEmptyApiAnswer);
 		return res;
 	}
 	function runWorkflowAnalysisProgress() {
-		if (!app.doProgressSegmentTask(100, 0, 100, "workflowAnalysisStage()")) throw new Error(APP.cancelToken);
+		if (!app.doProgressSegmentTask(100, 0, 100, "workflowAnalysisStage()")) {
+			workflowAnalysisCancelled = true;
+			return false;
+		}
 		return true;
 	}
 	function workflowAnalysisStage() {
@@ -4696,9 +4766,6 @@ function UI() {
 			progress.close();
 		}
 	}
-	function showWarningMessage(value, title) {
-		showDiagnosticSummary({ title: title || APP.name, warnings: [errorMessageText(value)] });
-	}
 	function showDiagnosticSummary(options) {
 		options = options || {};
 		function unique(items) {
@@ -4813,7 +4880,6 @@ function UI() {
 	this.addForgeImageStitchControls = addForgeImageStitchControls;
 	this.addResizeControl = addResizeControl;
 	this.runWithPaletteProgress = runWithPaletteProgress;
-	this.showWarningMessage = showWarningMessage;
 	this.showDiagnosticSummary = showDiagnosticSummary;
 	this.showErrorMessage = showErrorMessage;
 	this.createStartupProgress = function (msg, timeout) { return new StartupProgress(msg, timeout, 0); };
@@ -4845,29 +4911,32 @@ function GenerationProgress() {
 		requestId = options.requestId || (payload ? payload.request_id : null);
 	};
 	this.run = function () {
-		if (!app.doProgressSegmentTask(
-			GENERATION_PREPARE_SEGMENT, 0, GENERATION_TOTAL_SEGMENTS,
-			"generationStageOne()"
-		)) {
-			$.setenv(APP.dialogEnvKey, "true");
-			api.interrupt(requestId);
-			throw new Error(APP.cancelToken);
-		}
-		if (!firstAnswer || firstAnswer.type == "error" || firstAnswer.message != "init") {
-			res = firstAnswer;
+		try {
+			if (!app.doProgressSegmentTask(
+				GENERATION_PREPARE_SEGMENT, 0, GENERATION_TOTAL_SEGMENTS,
+				"generationStageOne()"
+			)) return cancelProgress();
+			if (!firstAnswer || firstAnswer.type == "error" || firstAnswer.message != "init") {
+				res = firstAnswer;
+				return true;
+			}
+			if (!app.doProgressSegmentTask(
+				GENERATION_RUN_SEGMENT, GENERATION_PREPARE_SEGMENT,
+				GENERATION_TOTAL_SEGMENTS,
+				"generationStageTwo()"
+			)) return cancelProgress();
 			return true;
+		} catch (progressError) {
+			if (!isUserCancellation(progressError)) throw progressError;
+			return cancelProgress();
 		}
-		if (!app.doProgressSegmentTask(
-			GENERATION_RUN_SEGMENT, GENERATION_PREPARE_SEGMENT,
-			GENERATION_TOTAL_SEGMENTS,
-			"generationStageTwo()"
-		)) {
-			$.setenv(APP.dialogEnvKey, "true");
-			api.interrupt(requestId);
-			throw new Error(APP.cancelToken);
-		}
-		return true;
 	};
+	function cancelProgress() {
+		res = { type: "cancelled", message: "" };
+		$.setenv(APP.dialogEnvKey, "true");
+		api.interrupt(requestId);
+		return false;
+	}
 	this.stageOne = function () {
 		// Comfy остаётся на первом сегменте до реального начала sampler, а
 		// загрузка крупной модели может занимать больше прежних двух минут.
@@ -4897,7 +4966,6 @@ function GenerationProgress() {
 		return answer !== false;
 	};
 	this.getResult = function () { return res; };
-	this.getRequestId = function () { return requestId; };
 	this.clear = function () {
 		payload = null;
 		res = null;
@@ -5159,6 +5227,7 @@ function BridgeApi() {
 		return {
 			workflow_id: workflowId,
 			relative_path: relativePath || "",
+			candidate_format: 2,
 			binding_overrides: cleanBindingOverrides(overrides)
 		};
 	}
@@ -5216,28 +5285,30 @@ function BridgeApi() {
 				listener.close();
 				throw new Error(str.errApiTimeout);
 			}
-			if (progress) progress.pulse();
-			if (title && t2 - t3 >= 1) {
-				// taskLength — доля оставшейся части текущего segment. Для
-				// подготовки гипербола t/(t+max) медленно и без скачков стремится
-				// к границе 20%. Генерация сохраняет адаптивную экспоненту, которая
-				// за ожидаемое время проходит PROGRESS_STAGE_TARGET сегмента.
-				var progressDelta = t2 - t3;
-				if (progressDelta > 0 && progressCurve == "hyperbolic")
-					slice = progressDelta / (max + t2 - t1);
-				else slice = progressDelta > 0
-					? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / max)
-					: 0;
-				t3 = t2;
-				var text = trackDelay
-					? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
-					: title;
-				if (!app.doProgressTask(slice, "workChunk('" + escapeProgressText(text) + "');")) {
-					$.setenv(APP.dialogEnvKey, "true");
-					try { self.interrupt(expectedRequestId); } catch (_) { }
-					listener.close();
-					return false;
+			if (t2 - t3 >= API_POLL_INTERVAL) {
+				if (progress) progress.pulse();
+				if (title) {
+					// taskLength — доля оставшейся части текущего segment. Для
+					// подготовки гипербола t/(t+max) медленно и без скачков стремится
+					// к границе 20%. Генерация сохраняет адаптивную экспоненту, которая
+					// за ожидаемое время проходит PROGRESS_STAGE_TARGET сегмента.
+					var progressDelta = t2 - t3;
+					if (progressDelta > 0 && progressCurve == "hyperbolic")
+						slice = progressDelta / (max + t2 - t1);
+					else slice = progressDelta > 0
+						? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / max)
+						: 0;
+					var text = trackDelay
+						? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
+						: title;
+					if (!app.doProgressTask(slice, "workChunk('" + escapeProgressText(text) + "');")) {
+						$.setenv(APP.dialogEnvKey, "true");
+						// GenerationProgress.cancelProgress() отправит единственный interrupt.
+						listener.close();
+						return false;
+					}
 				}
+				t3 = t2;
 			}
 			var connection = listener.poll();
 			if (connection != null) {
@@ -5264,7 +5335,7 @@ function BridgeApi() {
 				}
 				return answer;
 			}
-			$.sleep(1);
+			$.sleep(API_POLL_SLEEP);
 		}
 	}
 	function workChunk(text) {
@@ -5417,8 +5488,8 @@ function BridgeApi() {
 		catch (_) { return false; }
 		finally { try { socket.close(); } catch (_) { } }
 	}
-	// Не отправляет пустые/default overrides. sizeMode передаётся отдельно,
-	// потому что source_image и ручной binding меняют поведение анализатора.
+	// Пустые/default overrides обычно не отправляются. Явно настроенные пустые
+	// Reference/Empty-image списки являются осознанным состоянием и сохраняются.
 	function cleanBindingOverrides(value) {
 		if (!value) return {};
 		var res = {},
@@ -5427,7 +5498,10 @@ function BridgeApi() {
 				: "auto";
 		if (value.input) res.input = value.input;
 		if (value.mask) res.mask = value.mask;
-		if (value.references instanceof Array && value.references.length) res.references = value.references.slice(0);
+		if (value.references instanceof Array && (value.references.length || value.referencesConfigured === true))
+			res.references = value.references.slice(0);
+		if (value.referencesConfigured === true) res.referencesConfigured = true;
+		if (value.emptyInputs instanceof Array) res.emptyInputs = value.emptyInputs.slice(0);
 		if (value.output) res.output = value.output;
 		if (sizeMode != "auto") res.sizeMode = sizeMode;
 		if (sizeMode == "binding" && value.size) res.size = value.size;
@@ -5438,7 +5512,7 @@ function BridgeApi() {
 	}
 	function unwrapAnswer(response) {
 		if (!response) throw new Error(str.errEmptyApiAnswer);
-		if (response.type == "error") throw new Error(response.message);
+		if (response.type == "error") throw new Error(apiErrorText(response));
 		return response.message;
 	}
 }
@@ -5878,7 +5952,7 @@ function Config() {
 		var profiles = profileStore("workflowProfiles"), profile = profiles[workflowId];
 		if (!isObjectMap(profile)) profile = profiles[workflowId] = {
 			relativePath: "", values: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null,
-			bindingOverrides: { input: "", mask: "", references: [], emptyInputs: [], output: "", sizeMode: "auto", size: "" },
+			bindingOverrides: { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" },
 			referenceFiles: {}, ignoreUnselectedLoadImages: false, sizeMultiple: self.sizeMultiple,
 			autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
 			outputFormat: "jpg", manualScale: 1,
@@ -5886,11 +5960,12 @@ function Config() {
 		};
 		normalizeBaseProfile(profile);
 		if (!isObjectMap(profile.bindingOverrides))
-			profile.bindingOverrides = { input: "", mask: "", references: [], emptyInputs: [], output: "", sizeMode: "auto", size: "" };
+			profile.bindingOverrides = { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" };
 		var bindings = profile.bindingOverrides;
 		if (bindings.input === undefined) bindings.input = "";
 		if (bindings.mask === undefined) bindings.mask = "";
 		if (!(bindings.references instanceof Array)) bindings.references = [];
+		bindings.referencesConfigured = bindings.referencesConfigured === true;
 		if (!(bindings.emptyInputs instanceof Array)) bindings.emptyInputs = [];
 		if (bindings.output === undefined) bindings.output = "";
 		if (bindings.sizeMode !== "source_image" && bindings.sizeMode !== "binding") bindings.sizeMode = "auto";
@@ -6360,6 +6435,66 @@ function Locale() {
 		errInpaintInputDisconnected: ["MASK основной ноды LoadImage не используется в workflow. Подключите выход MASK к inpaint-ветке в ComfyUI или выберите другой вариант для параметра «Маска inpaint».", "The main LoadImage MASK is not used by the workflow. Connect its MASK output to the inpaint branch in ComfyUI or select another Inpaint mask option."],
 		errInpaintNodeDisconnected: ["MASK выбранной ноды LoadImageMask не используется в workflow. Подключите её выход MASK к inpaint-ветке в ComfyUI или выберите другой вариант для параметра «Маска inpaint».", "The selected LoadImageMask MASK is not used by the workflow. Connect its MASK output to the inpaint branch in ComfyUI or select another Inpaint mask option."],
 		errSelectedWorkflowMissing: ["Выбранный workflow больше не найден.", "The selected workflow can no longer be found."],
+		selected_workflow_missing: ["Выбранный workflow больше не найден в указанной папке. Обновите список workflow или выберите другой файл.", "The selected workflow is no longer present in the configured folder. Refresh the workflow list or select another file."],
+		workflow_json_invalid: ["Ошибка JSON в workflow %1, строка %2, столбец %3: %4", "JSON error in workflow %1, line %2, column %3: %4"],
+		workflow_root_invalid: ["Корень API-workflow %1 должен быть JSON-объектом.", "The API-workflow root in %1 must be a JSON object."],
+		workflow_target_node_missing: ["Нода #%1, используемая текущими настройками workflow, больше не существует. Повторно проанализируйте workflow.", "Node #%1 used by the current workflow settings no longer exists. Reanalyze the workflow."],
+		workflow_target_input_missing: ["В ноде #%1 больше нет входа %2, используемого текущими настройками workflow. Повторно проанализируйте workflow.", "Node #%1 no longer has input %2 used by the current workflow settings. Reanalyze the workflow."],
+		api_workflow_required: ["Выбран обычный JSON интерфейса ComfyUI. Откройте workflow в ComfyUI и выполните Workflow/File → Export (API).", "The selected JSON uses the regular ComfyUI UI format. Open it in ComfyUI and choose Workflow/File → Export (API)."],
+		workflow_empty: ["Выбранный workflow пуст.", "The selected workflow is empty."],
+		invalid_api_nodes: ["В API-workflow найдены некорректные ноды без class_type или inputs: %1", "The API workflow contains invalid nodes without class_type or inputs: %1"],
+		workflow_not_ready: ["Workflow не готов к запуску. Откройте настройки workflow и исправьте перечисленные проблемы.", "The workflow is not ready to run. Open Workflow settings and correct the listed problems."],
+		inpaint_mask_missing: ["Для параметра «Маска inpaint» не найден подходящий вариант. В настройках workflow выберите MASK основной ноды LoadImage или ноду LoadImageMask.", "No suitable option was found for Inpaint mask. In Workflow settings, select the main LoadImage MASK or a LoadImageMask node."],
+		inpaint_mask_changed: ["Настройка параметра «Маска inpaint» изменилась. Снова откройте главное окно скрипта.", "The Inpaint mask configuration changed. Reopen the main script window."],
+		inpaint_main_mask_unused: ["MASK основной ноды LoadImage не используется в workflow. Подключите выход MASK к inpaint-ветке в ComfyUI или выберите другой вариант параметра «Маска inpaint».", "The main LoadImage MASK is not used by the workflow. Connect its MASK output to the inpaint branch in ComfyUI or select another Inpaint mask option."],
+		inpaint_node_mask_unused: ["MASK выбранной ноды LoadImageMask не используется в workflow. Подключите её выход MASK к inpaint-ветке в ComfyUI или выберите другой вариант параметра «Маска inpaint».", "The selected LoadImageMask MASK is not used by the workflow. Connect its MASK output to the inpaint branch in ComfyUI or select another Inpaint mask option."],
+		load_image_mask_unavailable: ["В ComfyUI недоступна стандартная нода LoadImageMask, необходимая для маски Photoshop. Обновите ComfyUI или добавьте в workflow отдельную ноду LoadImageMask.", "The standard LoadImageMask node required for the Photoshop mask is unavailable in ComfyUI. Update ComfyUI or add a separate LoadImageMask node to the workflow."],
+		main_mask_source_missing: ["Основная нода для пункта Main LoadImage MASK больше не существует. Повторно проанализируйте workflow.", "The source node for Main LoadImage MASK no longer exists. Reanalyze the workflow."],
+		selected_mask_no_longer_used: ["Выбранная «Маска inpaint» больше не используется в workflow. Повторно проанализируйте workflow или исправьте соединения MASK в ComfyUI.", "The selected Inpaint mask is no longer used by the workflow. Reanalyze the workflow or fix the MASK connections in ComfyUI."],
+		selected_size_rejected: ["Выбранные «Поля width / height» не принимают размер изображения Photoshop:\n• %1\n\nВ настройках workflow выберите «Размер входного изображения», «Автоматически» или другую пару полей.", "The selected Width / height fields cannot accept the Photoshop image size:\n• %1\n\nIn Workflow settings, choose Input image size, Automatic, or another field pair."],
+		output_image_missing_from_history: ["Workflow завершён, но выбранное «Выходное изображение» (нода #%1) отсутствует в history ComfyUI.", "The workflow completed, but the selected Output image (node #%1) is missing from ComfyUI history."],
+		output_image_not_returned: ["Выбранное «Выходное изображение» (нода #%1) не вернуло изображение. Выберите Save Image или Preview Image с меткой #PS-OUTPUT.", "The selected Output image (node #%1) did not return an image. Select Save Image or Preview Image tagged #PS-OUTPUT."],
+		forge_schema_folder_missing: ["Папка схем Forge не существует: %1", "The Forge schema folder does not exist: %1"],
+		forge_schema_folder_not_selected: ["Папка схем Forge не найдена. Выберите её в настройках скрипта.", "The Forge schema folder was not found. Select it in the script settings."],
+		forge_schema_missing: ["Выбранная схема Forge больше не найдена: %1", "The selected Forge schema can no longer be found: %1"],
+		forge_schema_json_invalid: ["Некорректный JSON в схеме Forge %1, строка %2, столбец %3: %4", "Invalid JSON in Forge schema %1, line %2, column %3: %4"],
+		forge_schema_root_invalid: ["Схема Forge %1 должна быть JSON-объектом.", "Forge schema %1 must be a JSON object."],
+		forge_schema_kind_invalid: ["Файл %1 не является схемой Forge img2img helper.", "File %1 is not an img2img helper Forge schema."],
+		forge_schema_version_invalid: ["Схема Forge %1 использует неподдерживаемую schema_version %2 (поддерживается %3).", "Forge schema %1 uses unsupported schema_version %2 (supported: %3)."],
+		forge_schema_inheritance_cycle: ["Обнаружен цикл наследования схем Forge: %1", "Circular Forge schema inheritance was detected: %1"],
+		forge_schema_base_missing: ["Не найдена базовая схема Forge: %1", "Base Forge schema was not found: %1"],
+		forge_schema_order_invalid: ["Некорректное значение order в схеме Forge %1: %2", "Invalid order value in Forge schema %1: %2"],
+		workflow_save_no_values: ["В workflow нет видимых параметров для сохранения.", "There are no visible workflow values to save."],
+		forge_save_no_values: ["В схеме Forge нет видимых параметров для сохранения.", "There are no visible Forge schema values to save."],
+		save_destination_missing: ["Файл назначения не выбран. Исходный JSON не изменён.", "No destination file was selected. The source JSON was not changed."],
+		forge_image_stitch_unsupported: ["Выбранная схема Forge не поддерживает ImageStitch.", "The selected Forge schema does not support ImageStitch."],
+		forge_processing_mode_required: ["Выберите хотя бы один режим обработки Forge.", "Select at least one Forge processing mode."],
+		generation_already_running: ["Предыдущая генерация ещё не завершена.", "The previous generation has not finished yet."],
+		workflow_folder_not_selected: ["Папка API-workflow не выбрана. Укажите её в настройках скрипта.", "The API-workflow folder is not selected. Choose it in the script settings."],
+		workflow_folder_missing: ["Папка API-workflow не существует: %1", "The API-workflow folder does not exist: %1"],
+		workflow_path_not_folder: ["Путь API-workflow не является папкой: %1", "The API-workflow path is not a folder: %1"],
+		image_stitch_decode_failed: ["ImageStitch не удалось прочитать выбранное изображение: %1", "ImageStitch could not read the selected image: %1"],
+		image_stitch_prepare_failed: ["ImageStitch не удалось подготовить выбранное изображение: %1", "ImageStitch could not prepare the selected image: %1"],
+		workflow_save_invalid_bindings: ["Workflow нельзя сохранить: текущие назначения нод некорректны. Исправьте их в настройках workflow.", "The workflow cannot be saved because the current node assignments are invalid. Correct them in Workflow settings."],
+		workflow_save_field_missing: ["Параметр workflow %1 отсутствует в текущем анализе. Повторно проанализируйте workflow.", "Workflow parameter %1 is missing from the current analysis. Reanalyze the workflow."],
+		workflow_save_field_no_targets: ["Для параметра workflow %1 не найдены целевые поля. Повторно проанализируйте workflow и проверьте назначения.", "No target fields were found for workflow parameter %1. Reanalyze the workflow and check its assignments."],
+		workflow_save_json_required: ["Workflow необходимо сохранить как JSON-файл:\n%1", "The workflow must be saved as a JSON file:\n%1"],
+		workflow_save_write_failed: ["Не удалось записать workflow JSON:\n%1\n\n%2\n\nПроверьте права доступа к файлу и папке.", "Could not write workflow JSON:\n%1\n\n%2\n\nCheck file and folder permissions."],
+		forge_save_field_missing: ["Параметр Forge %1 отсутствует в выбранной схеме.", "Forge parameter %1 is absent from the selected schema."],
+		forge_save_json_required: ["Схему Forge необходимо сохранить как JSON-файл:\n%1", "The Forge schema must be saved as a JSON file:\n%1"],
+		forge_save_write_failed: ["Не удалось записать JSON-схему Forge:\n%1\n\n%2\n\nПроверьте права доступа к файлу и папке.", "Could not write Forge schema JSON:\n%1\n\n%2\n\nCheck file and folder permissions."],
+		translate_failed: ["Не удалось перевести промпт:\n%1", "Could not translate the prompt:\n%1"],
+		forge_field_invalid_value: ["Значение «%1» недоступно для поля Forge %2. Обновите данные схемы или выберите другое значение.", "Value “%1” is unavailable for Forge field %2. Refresh the schema data or select another value."],
+		forge_field_no_values: ["Для поля Forge %1 нет доступных значений. Обновите данные схемы.", "Forge field %1 has no available values. Refresh the schema data."],
+		forge_field_list_expected: ["Поле Forge %1 должно содержать список значений.", "Forge field %1 expects a list of values."],
+		forge_field_integer_expected: ["Поле Forge %1 должно содержать целое число; получено: %2.", "Forge field %1 expects an integer; received: %2."],
+		forge_field_number_expected: ["Поле Forge %1 должно содержать число; получено: %2.", "Forge field %1 expects a number; received: %2."],
+		forge_field_finite_expected: ["Поле Forge %1 должно содержать конечное число; получено: %2.", "Forge field %1 expects a finite number; received: %2."],
+		forge_field_non_finite: ["Поле Forge %1 сформировало недопустимое числовое значение.", "Forge field %1 produced an invalid numeric value."],
+		workflow_field_invalid_value: ["Значение «%1» недоступно для поля workflow %2. Повторно проанализируйте workflow или выберите другое значение.", "Value “%1” is unavailable for workflow field %2. Reanalyze the workflow or select another value."],
+		workflow_field_integer_expected: ["Поле workflow %1 должно содержать целое число; получено: %2.", "Workflow field %1 expects an integer; received: %2."],
+		workflow_field_number_expected: ["Поле workflow %1 должно содержать число; получено: %2.", "Workflow field %1 expects a number; received: %2."],
+		workflow_field_finite_expected: ["Поле workflow %1 должно содержать конечное число; получено: %2.", "Workflow field %1 expects a finite number; received: %2."],
 		errWorkflowInvalid: ["Workflow не прошёл проверку. Откройте ⚙ или добавьте метки к названиям нод.", "Workflow validation failed. Open ⚙ or add tags to node titles."],
 		generate: ["Генерировать", "Generate"], generationTimeout: ["Таймаут генерации, с:", "Generation timeout, s:"],
 		historyCheckSelection: ["Проверить выделение", "Check selection"], historyPlaceResult: ["Вставить результат генерации", "Place generated result"],
@@ -6396,6 +6531,8 @@ function Locale() {
 		loraSearch: ["Фильтр списка LoRA", "Filter the LoRA list"], selectModules: ["Выбрать VAE / Text Encoder", "Select VAE / Text Encoder"],
 		modulesSearch: ["Фильтр списка VAE / Text Encoder", "Filter the VAE / Text Encoder list"], modulesNone: ["ничего не выбрано", "nothing selected"],
 		lorasNone: ["ничего не выбрано", "nothing selected"], nodeInput: ["Нода #", "Node #"], none: ["Снять все", "Select none"],
+		forgeDefaultLorasMissing: ["Некоторые LoRA, заданные по умолчанию в выбранной схеме Forge, не найдены и были пропущены: ", "Some default LoRAs from the selected Forge schema were not found and were skipped: "],
+		forgeSavedLorasMissing: ["Некоторые сохранённые LoRA выбранной схемы Forge не найдены и были пропущены: ", "Some saved LoRAs for the selected Forge schema were not found and were skipped: "],
 		opacity: ["Непрозрачность кисти", "Brush opacity"], imageSettings: ["Параметры изображения", "Image settings"], outputImage: ["Выходное изображение", "Output image"],
 		comfyPort: ["Порт ComfyUI:", "ComfyUI port:"], presetNew: ["Новый пресет", "New preset"],
 		errDefaultPreset: ["Используйте другое имя для пресета.", "Use a different preset name."],
@@ -6682,6 +6819,7 @@ function normalizedBindingOverrides(value) {
 		input: String(value.input || ""),
 		mask: String(value.mask || ""),
 		references: references,
+		referencesConfigured: value.referencesConfigured === true,
 		emptyInputs: emptyInputs,
 		output: String(value.output || ""),
 		sizeMode: value.sizeMode == "source_image" || value.sizeMode == "binding" ? String(value.sizeMode) : "auto",
