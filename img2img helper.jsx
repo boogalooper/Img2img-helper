@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.196",
+	VER = "0.2",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",

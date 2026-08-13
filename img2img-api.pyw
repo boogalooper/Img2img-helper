@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.198"
+VERSION = "0.2"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
