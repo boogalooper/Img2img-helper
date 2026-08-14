@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.201"
+VERSION = "0.202"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "3fbf3eb1-7a96-4ef4-90d6-25b087438d2f"
+ANALYZER_UUID = "fbb6e4b0-5c1a-4d42-9a87-63e2f449ce18"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -3192,6 +3192,12 @@ class WorkflowAnalyzer:
             self.error(
                 "The previously selected Output image no longer exists. Open Workflow settings and select it again.",
                 "selected_output_missing",
+            )
+        elif not output_override and len(output_candidates) > 1 and output_choice:
+            self.info(
+                f"Several output nodes were found. {output_choice.label} was automatically selected as Output image.",
+                "output_auto_selected",
+                [output_choice.label],
             )
 
         requested_size_mode = str(overrides.get("size_mode") or "auto").lower()

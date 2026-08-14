@@ -33,11 +33,11 @@ var APP = {
 	},
 	cache: {
 		schemaVersion: 1,
-		comfyAnalysisUuid: "8d1619b1-a414-4b9b-a5fa-14930ee013a9",
+		comfyAnalysisUuid: "fbb6e4b0-5c1a-4d42-9a87-63e2f449ce18",
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.2",
+	VER = "0.202",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -6580,6 +6580,7 @@ function Locale() {
 		image_role_conflict: ["%1 имеет конфликтующие назначения. Выберите для ноды только одну роль в настройках workflow.", "%1 has conflicting image roles. Choose only one role in workflow settings."],
 		empty_roles_missing: ["Некоторые ноды с ролью «Пустое изображение» больше не существуют и были пропущены: %1", "Some LoadImage empty roles no longer exist and were ignored: %1"],
 		selected_output_missing: ["Ранее выбранное «Выходное изображение» больше не существует. Откройте настройки workflow и выберите его заново.", "The previously selected Output image no longer exists. Open Workflow settings and select it again."],
+		output_auto_selected: ["Найдено несколько выходных нод. В качестве «Выходного изображения» автоматически выбрана нода %1.", "Several output nodes were found. Node %1 was automatically selected as Output image."],
 		output_ambiguous: ["Найдено несколько вариантов для параметра «Выходное изображение». Выберите нужный вариант в настройках workflow или добавьте #PS-OUTPUT к названию соответствующей ноды.", "Several options were found for Output image. Select the required option in Workflow settings or add #PS-OUTPUT to the corresponding node title."],
 		size_binding_required: ["Для параметра «Управление размером» выбраны «Поля width / height», но сама пара полей не указана.", "Width / height fields is selected under Size control, but no field pair is specified."],
 		selected_size_missing: ["Ранее выбранная пара «Поля width / height» больше не существует. Откройте настройки workflow и выберите её заново.", "The previously selected Width / height fields pair no longer exists. Open Workflow settings and select it again."],
