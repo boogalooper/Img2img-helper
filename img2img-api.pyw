@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.2"
+VERSION = "0.201"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -94,7 +94,7 @@ CACHE_VERSION = 1
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
-ANALYZER_UUID = "8d1619b1-a414-4b9b-a5fa-14930ee013a9"
+ANALYZER_UUID = "3fbf3eb1-7a96-4ef4-90d6-25b087438d2f"
 
 # Кэш ImageStitch ограничен числом элементов и размером.
 IMAGESTITCH_CACHE_MAX_ITEMS = 12
@@ -2218,6 +2218,21 @@ class WorkflowAnalyzer:
             class_type = str(node.get("class_type", ""))
             title = self.node_title(str(node_id))
             class_norm = normalize_name(class_type)
+            inputs = node.get("inputs", {})
+            has_image_input = isinstance(inputs, dict) and any(
+                str(
+                    (self.schema.input_definition(class_type, input_name) or {}).get(
+                        "type", ""
+                    )
+                ).upper()
+                == "IMAGE"
+                for input_name in inputs
+            )
+            terminal_image_save = (
+                "saveimage" in class_norm
+                and has_image_input
+                and not self.graph.outgoing.get(str(node_id))
+            )
             score = 0
             if title_has_tag(title, "output"):
                 score += 1000
@@ -2229,6 +2244,8 @@ class WorkflowAnalyzer:
                 score += 180
             elif "save" in class_norm and "image" in class_norm:
                 score += 120
+            if terminal_image_save:
+                score += 500
 
             if score:
                 result.append(
@@ -2237,7 +2254,11 @@ class WorkflowAnalyzer:
                         label=self.node_label(str(node_id)),
                         targets=[],
                         score=score,
-                        meta={"node_id": str(node_id), "tagged": title_has_tag(title, "output")},
+                        meta={
+                            "node_id": str(node_id),
+                            "tagged": title_has_tag(title, "output"),
+                            "terminal_image_save": terminal_image_save,
+                        },
                     )
                 )
         return sorted(result, key=lambda item: (-item.score, item.label.lower()))
@@ -3000,6 +3021,24 @@ class WorkflowAnalyzer:
 
         return sorted(candidates, key=priority)[0]
 
+    @classmethod
+    def choose_preferred_output_candidate(cls, candidates: List[Candidate]) -> Optional[Candidate]:
+        """Prefer an explicit output, then a terminal SaveImage with IMAGE input."""
+
+        if not candidates:
+            return None
+        tagged = [candidate for candidate in candidates if candidate.meta.get("tagged")]
+        if len(tagged) == 1:
+            return tagged[0]
+        terminal_saves = [
+            candidate
+            for candidate in candidates
+            if candidate.meta.get("terminal_image_save")
+        ]
+        if terminal_saves:
+            return terminal_saves[0]
+        return cls.choose_unique_candidate(candidates) or candidates[0]
+
     def analyze(self, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         overrides = overrides or {}
         self.validate_api_format()
@@ -3144,16 +3183,15 @@ class WorkflowAnalyzer:
                 automatic_empty_input_ids.append(candidate.id)
 
         output_override = str(overrides.get("output") or "")
-        output_choice = self.find_candidate(output_candidates, output_override) if output_override else self.choose_unique_candidate(output_candidates)
+        output_choice = (
+            self.find_candidate(output_candidates, output_override)
+            if output_override
+            else self.choose_preferred_output_candidate(output_candidates)
+        )
         if output_override and not output_choice:
             self.error(
                 "The previously selected Output image no longer exists. Open Workflow settings and select it again.",
                 "selected_output_missing",
-            )
-        elif not output_choice and output_candidates:
-            self.error(
-                "Several options were found for Output image. Select the required option in Workflow settings or add #PS-OUTPUT to the corresponding node title.",
-                "output_ambiguous",
             )
 
         requested_size_mode = str(overrides.get("size_mode") or "auto").lower()
