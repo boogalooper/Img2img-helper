@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.202",
+	VER = "0.203",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -6581,7 +6581,6 @@ function Locale() {
 		empty_roles_missing: ["Некоторые ноды с ролью «Пустое изображение» больше не существуют и были пропущены: %1", "Some LoadImage empty roles no longer exist and were ignored: %1"],
 		selected_output_missing: ["Ранее выбранное «Выходное изображение» больше не существует. Откройте настройки workflow и выберите его заново.", "The previously selected Output image no longer exists. Open Workflow settings and select it again."],
 		output_auto_selected: ["Найдено несколько выходных нод. В качестве «Выходного изображения» автоматически выбрана нода %1.", "Several output nodes were found. Node %1 was automatically selected as Output image."],
-		output_ambiguous: ["Найдено несколько вариантов для параметра «Выходное изображение». Выберите нужный вариант в настройках workflow или добавьте #PS-OUTPUT к названию соответствующей ноды.", "Several options were found for Output image. Select the required option in Workflow settings or add #PS-OUTPUT to the corresponding node title."],
 		size_binding_required: ["Для параметра «Управление размером» выбраны «Поля width / height», но сама пара полей не указана.", "Width / height fields is selected under Size control, but no field pair is specified."],
 		selected_size_missing: ["Ранее выбранная пара «Поля width / height» больше не существует. Откройте настройки workflow и выберите её заново.", "The previously selected Width / height fields pair no longer exists. Open Workflow settings and select it again."],
 		size_ambiguous: ["Найдено несколько вариантов для параметра «Поля width / height». При автоматическом «Управлении размером» будет использован «Размер входного изображения». Если workflow требует изменения конкретных полей, выберите пару вручную.", "Several options were found for Width / height fields. Automatic Size control will use Input image size. If the workflow requires specific fields to be changed, select a pair manually."],
