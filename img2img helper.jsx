@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.203",
+	VER = "0.209",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -923,7 +923,10 @@ function mainDialog(selection, initial, responseSeconds) {
 				fullReset = messages.confirm(operations.rebuildConfirm, APP.name);
 			if (fullReset === null) return;
 			runSchemaAction(function () {
-				if (fullReset) operations.resetProfile(profileId);
+				if (fullReset) {
+					operations.resetProfile(profileId);
+					state.workflowDiagnosticSignature = "";
+				}
 				else saveCurrentValues();
 				operations.rebuild(profileId);
 			});
@@ -4929,11 +4932,9 @@ function GenerationProgress() {
 		return false;
 	}
 	this.stageOne = function () {
-		// Comfy остаётся на первом сегменте до реального начала sampler, а
-		// загрузка крупной модели может занимать больше прежних двух минут.
-		var prepareTimeout = payload && payload.type == "forge_generate"
-				? 5 * 60 * 1000
-				: cfg.generationTimeout * 1000,
+		// Первый сегмент использует общий пользовательский тайм-аут генерации:
+		// загрузка крупной модели может занимать значительную часть этого времени.
+		var prepareTimeout = cfg.generationTimeout * 1000,
 			answer = api.startGeneration({
 				command: payload,
 				timeout: prepareTimeout,
@@ -6581,6 +6582,7 @@ function Locale() {
 		empty_roles_missing: ["Некоторые ноды с ролью «Пустое изображение» больше не существуют и были пропущены: %1", "Some LoadImage empty roles no longer exist and were ignored: %1"],
 		selected_output_missing: ["Ранее выбранное «Выходное изображение» больше не существует. Откройте настройки workflow и выберите его заново.", "The previously selected Output image no longer exists. Open Workflow settings and select it again."],
 		output_auto_selected: ["Найдено несколько выходных нод. В качестве «Выходного изображения» автоматически выбрана нода %1.", "Several output nodes were found. Node %1 was automatically selected as Output image."],
+		forge_result_image_invalid: ["Forge Neo не вернул корректное изображение PNG, JPEG или WebP.", "Forge Neo did not return a valid PNG, JPEG, or WebP image."],
 		size_binding_required: ["Для параметра «Управление размером» выбраны «Поля width / height», но сама пара полей не указана.", "Width / height fields is selected under Size control, but no field pair is specified."],
 		selected_size_missing: ["Ранее выбранная пара «Поля width / height» больше не существует. Откройте настройки workflow и выберите её заново.", "The previously selected Width / height fields pair no longer exists. Open Workflow settings and select it again."],
 		size_ambiguous: ["Найдено несколько вариантов для параметра «Поля width / height». При автоматическом «Управлении размером» будет использован «Размер входного изображения». Если workflow требует изменения конкретных полей, выберите пару вручную.", "Several options were found for Width / height fields. Automatic Size control will use Input image size. If the workflow requires specific fields to be changed, select a pair manually."],

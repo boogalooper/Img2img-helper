@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.203"
+VERSION = "0.209"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -324,7 +324,12 @@ def _run_python_module(arguments: Sequence[str], timeout: int = 10 * 60) -> bool
     return completed.returncode == 0
 
 
-def ensure_python_module(import_name: str, package_name: str = "") -> Any:
+def ensure_python_module(
+    import_name: str,
+    package_name: str = "",
+    *,
+    publish_startup_status: bool = True,
+) -> Any:
     """Импортирует модуль и при необходимости устанавливает его через pip."""
 
     try:
@@ -336,7 +341,8 @@ def ensure_python_module(import_name: str, package_name: str = "") -> Any:
     LOGGER.info("Module %s was not found; starting automatic installation of %s", import_name, package)
     # Состояние installing публикуется только после реального ImportError.
     # Обычный запуск с уже установленным модулем не показывает этот этап JSX.
-    write_startup_status("installing", package)
+    if publish_startup_status:
+        write_startup_status("installing", package)
 
     if not _run_python_module(["pip", "--version"], timeout=60):
         LOGGER.info("pip is unavailable; running ensurepip")
@@ -367,7 +373,8 @@ def ensure_python_module(import_name: str, package_name: str = "") -> Any:
             f"Restart {APP_NAME}. Log: {LOG_FILE}"
         ) from exc
     LOGGER.info("Module %s was installed and loaded successfully", package)
-    write_startup_status("starting", "Preparing required Python modules")
+    if publish_startup_status:
+        write_startup_status("starting", "Preparing required Python modules")
     return module
 
 
@@ -375,31 +382,18 @@ DEEP_TRANSLATOR_MODULE: Any = None
 PIL_IMAGE_MODULE: Any = None
 PIL_IMAGE_OPS_MODULE: Any = None
 WEBSOCKET_MODULE: Any = None
+OPTIONAL_MODULES_ACTIVE = threading.Event()
 
 
 def prepare_required_modules() -> None:
-    """Prepare required and optional third-party modules used by the helper.
+    """Prepare third-party modules required by every helper backend.
 
     The local API socket is already open while this function runs. JSX polls
     the lightweight ping command and receives installing only after a real
     ImportError. Other API commands remain gated until the state becomes ready.
     """
 
-    global DEEP_TRANSLATOR_MODULE, PIL_IMAGE_MODULE, PIL_IMAGE_OPS_MODULE
-    global WEBSOCKET_MODULE
-
-    errors: List[str] = []
-
-    # Перевод prompt является дополнительной функцией. Как и WebSocket,
-    # переводчик устанавливается по возможности, но не блокирует весь API.
-    try:
-        DEEP_TRANSLATOR_MODULE = ensure_python_module(
-            "deep_translator",
-            "deep-translator",
-        )
-    except Exception as exc:
-        DEEP_TRANSLATOR_MODULE = None
-        LOGGER.warning("deep-translator is unavailable; prompt translation is disabled: %s", exc)
+    global PIL_IMAGE_MODULE, PIL_IMAGE_OPS_MODULE
 
     try:
         PIL_IMAGE_MODULE = ensure_python_module("PIL.Image", "Pillow")
@@ -407,35 +401,60 @@ def prepare_required_modules() -> None:
         # not start another pip operation.
         PIL_IMAGE_OPS_MODULE = importlib.import_module("PIL.ImageOps")
     except Exception as exc:
-        errors.append(f"Pillow: {exc}")
-
-    # WebSocket улучшает только определение момента начала sampling. Если его
-    # установить не удалось, генерация сохраняет полностью рабочий HTTP-путь.
-    try:
-        WEBSOCKET_MODULE = ensure_python_module("websocket", "websocket-client")
-        if not hasattr(WEBSOCKET_MODULE, "create_connection"):
-            raise UserVisibleError(
-                "The installed websocket module is not websocket-client."
-            )
-    except Exception as exc:
-        WEBSOCKET_MODULE = None
-        LOGGER.warning(
-            "websocket-client is unavailable; Comfy progress will use HTTP fallback: %s",
-            exc,
-        )
-
-    if errors:
         raise UserVisibleError(
             "Could not prepare required Python modules:\n"
-            + "\n".join(f"- {item}" for item in errors)
-            + f"\n\nDetails: {LOG_FILE}"
-        )
+            f"- Pillow: {exc}\n\nDetails: {LOG_FILE}"
+        ) from exc
 
-    LOGGER.info(
-        "Required Python modules are ready: Pillow%s%s",
-        ", deep-translator" if DEEP_TRANSLATOR_MODULE is not None else "",
-        ", websocket-client" if WEBSOCKET_MODULE is not None else "",
-    )
+    LOGGER.info("Required Python modules are ready: Pillow")
+
+
+def prepare_optional_modules() -> None:
+    """Prepare optional integrations after the core API becomes ready."""
+
+    global DEEP_TRANSLATOR_MODULE, WEBSOCKET_MODULE
+
+    # Optional packages install in this background worker and never replace the
+    # already published ready status of the core API.
+    OPTIONAL_MODULES_ACTIVE.set()
+    try:
+        try:
+            DEEP_TRANSLATOR_MODULE = ensure_python_module(
+                "deep_translator",
+                "deep-translator",
+                publish_startup_status=False,
+            )
+        except Exception as exc:
+            DEEP_TRANSLATOR_MODULE = None
+            LOGGER.warning("deep-translator is unavailable; prompt translation is disabled: %s", exc)
+
+        # WebSocket улучшает только определение момента начала sampling. Если его
+        # установить не удалось, генерация сохраняет полностью рабочий HTTP-путь.
+        try:
+            WEBSOCKET_MODULE = ensure_python_module(
+                "websocket",
+                "websocket-client",
+                publish_startup_status=False,
+            )
+            if not hasattr(WEBSOCKET_MODULE, "create_connection"):
+                raise UserVisibleError(
+                    "The installed websocket module is not websocket-client."
+                )
+        except Exception as exc:
+            WEBSOCKET_MODULE = None
+            LOGGER.warning(
+                "websocket-client is unavailable; Comfy progress will use HTTP fallback: %s",
+                exc,
+            )
+
+        LOGGER.info(
+            "Optional Python modules prepared:%s%s",
+            ", deep-translator" if DEEP_TRANSLATOR_MODULE is not None else "",
+            ", websocket-client" if WEBSOCKET_MODULE is not None else "",
+        )
+    finally:
+        OPTIONAL_MODULES_ACTIVE.clear()
+        touch_activity()
 
 
 def now_timestamp() -> str:
@@ -4967,17 +4986,18 @@ def _decode_forge_image(value: Any, destination_without_suffix: Path) -> Path:
     if "," in raw_value and raw_value.lower().startswith("data:"):
         raw_value = raw_value.split(",", 1)[1]
     try:
-        content = base64.b64decode(raw_value)
+        content = base64.b64decode(re.sub(r"\s+", "", raw_value), validate=True)
     except Exception as exc:
-        raise UserVisibleError("Forge Neo returned an invalid base64 image.") from exc
-    if content.startswith(b"\x89PNG"):
-        suffix = ".png"
-    elif content.startswith(b"\xff\xd8"):
-        suffix = ".jpg"
-    elif content.startswith(b"RIFF") and b"WEBP" in content[:12]:
-        suffix = ".webp"
-    else:
-        suffix = ".bin"
+        raise UserVisibleError(
+            "Forge Neo returned an invalid base64 image.",
+            "forge_result_image_invalid",
+        ) from exc
+    suffix = _detect_image_suffix(content)
+    if suffix == ".bin":
+        raise UserVisibleError(
+            "Forge Neo did not return a supported PNG, JPEG, or WebP image.",
+            "forge_result_image_invalid",
+        )
     destination = destination_without_suffix.with_suffix(suffix)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(content)
@@ -6374,6 +6394,9 @@ def save_forge_schema_values(
     normalized_loras = _normalize_forge_loras(raw_selected_loras)
     if normalized_loras:
         raw["loras"] = normalized_loras
+    elif str(raw.get("extends") or "").strip():
+        # An explicit empty list overrides LoRAs inherited from the base schema.
+        raw["loras"] = []
     else:
         raw.pop("loras", None)
 
@@ -7093,10 +7116,9 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
             else HISTORY_PREPARE_POLL_INTERVAL
         )
     else:
-        try:
-            client.interrupt(actual_prompt_id)
-        except Exception:
-            pass
+        # Reuse the request-aware cancellation path: it removes a pending prompt
+        # from the queue and interrupts only this prompt when it is already running.
+        cancel_current_generation(request_id)
         raise UserVisibleError("Timed out while waiting for ComfyUI generation.")
 
     if not history_entry:
@@ -7953,6 +7975,7 @@ def idle_watcher() -> None:
             and not GENERATION.queued
             and GENERATION_QUEUE.empty()
             and not forge_post_in_progress()
+            and not OPTIONAL_MODULES_ACTIVE.is_set()
         ):
             LOGGER.info("Shutting down after %.0f seconds of inactivity", idle)
             WORKER_STOP.set()
@@ -8017,6 +8040,12 @@ def initialize_server_runtime() -> None:
         return
     write_startup_status("ready", "Python API is ready")
     start_backend_monitor()
+    optional_modules_thread = threading.Thread(
+        target=prepare_optional_modules,
+        name="OptionalModules",
+        daemon=True,
+    )
+    optional_modules_thread.start()
     # Временные файлы очищаются после публикации ready.
     try:
         cleanup_old_temp_files()
