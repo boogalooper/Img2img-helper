@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.211",
+	VER = "0.213",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -69,6 +69,7 @@ var APP = {
 	MAIN_UI_BACKEND_BOTTOM_MARGIN = 0,
 	MAIN_UI_SELECTOR_TOP_MARGIN = 5,
 	MAIN_UI_SELECTOR_BOTTOM_MARGIN = 5,
+	PROMPT_HISTORY_LIMIT = 100,
 	DESC_PROFILE_CLEANUP_INTERVAL = 500,
 	BACKEND_COMFY = "comfy",
 	BACKEND_FORGE = "forge",
@@ -442,7 +443,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			noticeKeysShown: {},
 			workflowDiagnosticSignature: "",
 			emptyDropdownIds: initial.emptyDropdownIds instanceof Array ? initial.emptyDropdownIds : [],
-			controls: {}, forgeLoraControl: null, comfyMainLabels: {}, result: null
+			controls: {}, forgeLoraControl: null, comfyMainLabels: {}, promptHistories: {}, result: null
 		},
 		mainControlLayout = [
 			{ prefix: "checkpoint" },
@@ -668,7 +669,11 @@ function mainDialog(selection, initial, responseSeconds) {
 	// параметры от ранее выбранного профиля не должны примешиваться к LOAD.
 	// Поля profile копируются только из явного whitelist allowed.
 	function applyMetadataToProfile(metadata, profile, allowed) {
-		if (isObjectMap(metadata.values)) profile.values = cloneObj(metadata.values);
+		if (isObjectMap(metadata.values)) {
+			profile.values = cloneObj(metadata.values);
+			profile.promptUndo = {};
+			state.promptHistories = {};
+		}
 		if (!isObjectMap(profile.values)) profile.values = {};
 		if (isObjectMap(metadata.profile)) {
 			for (var i = 0; i < allowed.length; i++)
@@ -925,6 +930,7 @@ function mainDialog(selection, initial, responseSeconds) {
 			runSchemaAction(function () {
 				if (fullReset) {
 					operations.resetProfile(profileId);
+					state.promptHistories = {};
 					state.workflowDiagnosticSignature = "";
 				}
 				else saveCurrentValues();
@@ -1218,10 +1224,21 @@ function mainDialog(selection, initial, responseSeconds) {
 			stored = ui.normalizeMultiselect(definition, stored);
 			if (hasStoredValue) profile.values[definition.id] = cloneObj(stored);
 		}
-		state.controls[definition.id] = ui.addDynamic(parent, displayDefinition, stored, preferredWidth, {
+		var dynamicOptions = {
 			backend: backend.schemaBackend(state.schema),
 			profile: profile
-		});
+		};
+		if (definition.id == "positive_prompt" || definition.id == "negative_prompt")
+			dynamicOptions.promptHistory = promptHistory(definition.id);
+		state.controls[definition.id] = ui.addDynamic(parent, displayDefinition, stored, preferredWidth, dynamicOptions);
+	}
+	function promptHistory(controlId) {
+		var schemaId = state.schema
+			? String(state.schema.workflow_id || state.schema.workspace_id || state.schema.relative_path || "")
+			: "",
+			key = state.backend + ":" + schemaId + ":" + String(controlId || "");
+		if (!(state.promptHistories[key] instanceof Array)) state.promptHistories[key] = [];
+		return state.promptHistories[key];
 	}
 
 	// Сохраняет только реально созданные (видимые) контролы. Скрытые поля
@@ -4478,6 +4495,9 @@ function UI() {
 		var context = schema.id == "negative_prompt" ? "negative" : "positive",
 			presetStore = cfg.getPromptPresetStore(context),
 			profile = options && options.profile ? options.profile : null,
+			history = options && options.promptHistory instanceof Array ? options.promptHistory : [],
+			lastText = String(storedValue === undefined ? "" : storedValue),
+			applyingHistory = false,
 			storedPresetName = profile && profile.selectedPromptPresets
 				? String(profile.selectedPromptPresets[context] || "")
 				: "";
@@ -4486,18 +4506,17 @@ function UI() {
 		title.helpTip = self.help(schema);
 		translate.text = str.translate + " → EN";
 		translate.helpTip = str.translatePromptHelp;
-		edit.text = String(storedValue === undefined ? "" : storedValue);
+		edit.text = lastText;
+		seedSavedHistory();
 		fillPresets(storedPresetName);
 		rememberSelectedPreset();
 		updateControlState();
 		presetList.onChange = function () {
 			rememberSelectedPreset();
-			edit.text = presets.applyPrompt(selectedPresetText());
-			updateControlState();
+			setPromptText(presets.applyPrompt(selectedPresetText()));
 		};
 		refresh.onClick = function () {
-			edit.text = presets.applyPrompt(selectedPresetText());
-			updateControlState();
+			setPromptText(presets.applyPrompt(selectedPresetText()));
 		};
 		add.onClick = function () {
 			var currentName = presetList.selection ? presetList.selection.text : str.presetDefault,
@@ -4529,7 +4548,20 @@ function UI() {
 			rememberSelectedPreset();
 			updateControlState();
 		};
-		edit.onChanging = function () { updateControlState(); };
+		edit.onChanging = function () {
+			if (!applyingHistory) rememberTextChange(String(edit.text));
+			updateControlState();
+		};
+		try {
+			edit.addEventListener("keydown", function (event) {
+				if (!event || (!event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey) return;
+				var key = String(event.keyName || event.keyIdentifier || "").toLowerCase();
+				if (key != "z" && key != "keyz" && key != "u+005a") return;
+				undoPromptText();
+				try { if (typeof event.preventDefault == "function") event.preventDefault(); } catch (_) { }
+				try { if (typeof event.stopPropagation == "function") event.stopPropagation(); } catch (_) { }
+			});
+		} catch (_) { }
 		translate.onClick = function () {
 			if (!edit.text.length) return;
 			try {
@@ -4537,8 +4569,7 @@ function UI() {
 					return api.translate(String(edit.text).replace(/\r?\n/g, " "), progress);
 				});
 				if (translated && String(translated).length) {
-					edit.text = translated;
-					updateControlState();
+					setPromptText(translated);
 				} else {
 					messages.error(str.errTranslate);
 				}
@@ -4559,6 +4590,51 @@ function UI() {
 			profile.selectedPromptPresets[context] = presetList.selection && presetList.selection.index > 0
 				? String(presetList.selection.text)
 				: "";
+		}
+		function seedSavedHistory() {
+			if (!history.length && profile && isObjectMap(profile.promptUndo) &&
+				profile.promptUndo.hasOwnProperty(context)) {
+				var saved = String(profile.promptUndo[context]);
+				if (saved != lastText) history.push(saved);
+			}
+			syncSavedHistory();
+		}
+		function pushHistory(value) {
+			value = String(value);
+			if (!history.length || history[history.length - 1] != value) history.push(value);
+			while (history.length > PROMPT_HISTORY_LIMIT) history.shift();
+			syncSavedHistory();
+		}
+		function syncSavedHistory() {
+			if (!profile) return;
+			if (!isObjectMap(profile.promptUndo)) profile.promptUndo = {};
+			if (history.length) profile.promptUndo[context] = String(history[history.length - 1]);
+			else delete profile.promptUndo[context];
+		}
+		function rememberTextChange(value) {
+			value = String(value);
+			if (value == lastText) return;
+			pushHistory(lastText);
+			lastText = value;
+		}
+		function setPromptText(value) {
+			value = String(value === undefined || value === null ? "" : value);
+			if (value == lastText) { edit.text = value; updateControlState(); return; }
+			pushHistory(lastText);
+			applyingHistory = true;
+			try { edit.text = value; } finally { applyingHistory = false; }
+			lastText = value;
+			updateControlState();
+		}
+		function undoPromptText() {
+			if (!history.length) return;
+			var value = String(history.pop());
+			applyingHistory = true;
+			try { edit.text = value; } finally { applyingHistory = false; }
+			lastText = value;
+			syncSavedHistory();
+			updateControlState();
+			try { edit.active = true; } catch (_) { }
 		}
 		function updateControlState() {
 			var cur = presets.promptText(edit.text),
@@ -5611,6 +5687,11 @@ function Config() {
 	}
 	function normalizeBaseProfile(profile) {
 		if (!isObjectMap(profile.values)) profile.values = {};
+		if (!isObjectMap(profile.promptUndo)) profile.promptUndo = {};
+		for (var promptContext in profile.promptUndo)
+			if (profile.promptUndo.hasOwnProperty(promptContext) &&
+				(promptContext != "positive" && promptContext != "negative" || typeof profile.promptUndo[promptContext] != "string"))
+				delete profile.promptUndo[promptContext];
 		if (!isObjectMap(profile.selectedPromptPresets))
 			profile.selectedPromptPresets = { positive: "", negative: "" };
 		if (typeof profile.selectedPromptPresets.positive != "string") profile.selectedPromptPresets.positive = "";
@@ -5756,11 +5837,15 @@ function Config() {
 		delete res.backendMonitorInterval;
 		var profiles = isObjectMap(res.workflowProfiles) ? res.workflowProfiles : {};
 		for (var workflowId in profiles) if (profiles.hasOwnProperty(workflowId) && profiles[workflowId]) {
+			delete profiles[workflowId].promptUndo;
 			delete profiles[workflowId].schemaCache;
 			delete profiles[workflowId].schemaCacheStamp;
 			delete profiles[workflowId].schemaCacheVersion;
 			delete profiles[workflowId].schemaCacheUsed;
 		}
+		profiles = isObjectMap(res.forgeProfiles) ? res.forgeProfiles : {};
+		for (var presetId in profiles) if (profiles.hasOwnProperty(presetId) && profiles[presetId])
+			delete profiles[presetId].promptUndo;
 		return res;
 	}
 	function settingsFile(suffix) {
@@ -5941,7 +6026,7 @@ function Config() {
 	this.getProfile = function (workflowId) {
 		var profiles = profileStore("workflowProfiles"), profile = profiles[workflowId];
 		if (!isObjectMap(profile)) profile = profiles[workflowId] = {
-			relativePath: "", values: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null,
+			relativePath: "", values: {}, promptUndo: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null,
 			bindingOverrides: { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" },
 			referenceFiles: {}, sizeMultiple: self.sizeMultiple,
 			autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
@@ -5970,7 +6055,7 @@ function Config() {
 	this.getForgeProfile = function (presetId) {
 		var profiles = profileStore("forgeProfiles"), profile = profiles[presetId];
 		if (!isObjectMap(profile)) profile = profiles[presetId] = {
-			values: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null, selectedLoras: [], imageStitchInputs: ["", "", ""],
+			values: {}, promptUndo: {}, selectedPromptPresets: { positive: "", negative: "" }, visibleControls: null, selectedLoras: [], imageStitchInputs: ["", "", ""],
 			sizeMultiple: null, autoResize: self.autoResize,
 			resizePreset: presets.normalizeResizeName("", self.resizePresets), manualScale: 1,
 			lorasInitialized: false

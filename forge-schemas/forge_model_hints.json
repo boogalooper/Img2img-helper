@@ -278,8 +278,7 @@
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "8",
-        "cfg": "1",
-        "shift": "1.15"
+        "cfg": "1"
       }
     },
     "krea2_raw": {
@@ -303,8 +302,7 @@
         "sampler": "LCM",
         "scheduler": "Simple",
         "steps": "4",
-        "cfg": "1",
-        "shift": "1.5"
+        "cfg": "1"
       }
     },
     "wan22_fast": {
@@ -340,8 +338,7 @@
         "sampler": "Euler a",
         "scheduler": "Normal",
         "steps": "20–28 (24 start)",
-        "cfg": "4–7 (5 start)",
-        "shift": "8–12 (9 start)"
+        "cfg": "4–7 (5 start)"
       }
     },
     "chroma": {
@@ -350,8 +347,7 @@
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "40",
-        "cfg": "3",
-        "shift": "3"
+        "cfg": "3"
       },
       "note": "Uses standard CFG; do not use the usual FLUX.1 CFG 1 / Distilled CFG 3 recipe."
     },
