@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.215",
+	VER = "0.216",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -6567,6 +6567,7 @@ function Locale() {
 		forge_save_json_required: ["Схему Forge необходимо сохранить как JSON-файл:\n%1", "The Forge schema must be saved as a JSON file:\n%1"],
 		forge_save_write_failed: ["Не удалось записать JSON-схему Forge:\n%1\n\n%2\n\nПроверьте права доступа к файлу и папке.", "Could not write Forge schema JSON:\n%1\n\n%2\n\nCheck file and folder permissions."],
 		translate_failed: ["Не удалось перевести промпт:\n%1", "Could not translate the prompt:\n%1"],
+		translation_service_error: ["Сервис перевода вернул серверную ошибку. Повторите попытку позже.", "The translation service returned a server error. Please try again later."],
 		forge_field_invalid_value: ["Значение «%1» недоступно для поля Forge %2. Обновите данные схемы или выберите другое значение.", "Value “%1” is unavailable for Forge field %2. Refresh the schema data or select another value."],
 		forge_field_no_values: ["Для поля Forge %1 нет доступных значений. Обновите данные схемы.", "Forge field %1 has no available values. Refresh the schema data."],
 		forge_field_list_expected: ["Поле Forge %1 должно содержать список значений.", "Forge field %1 expects a list of values."],

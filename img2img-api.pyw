@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.215"
+VERSION = "0.216"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -544,6 +544,20 @@ def format_http_error_body(raw_body: str, limit: int = 12000) -> str:
     if len(formatted) > limit:
         formatted = formatted[:limit].rstrip() + "\n\n… message truncated"
     return formatted
+
+
+def is_translation_service_error(value: Any) -> bool:
+    """Detect an error page returned by the translator as ordinary text."""
+
+    text = str(value or "").replace("\u2018", "'").replace("\u2019", "'").lower()
+    text = re.sub(r"\s+", " ", text)
+    server_error = "server error" in text
+    status_error = bool(re.search(r"\berror\s+5\d{2}\b", text))
+    retry_page = (
+        "try again later" in text
+        and ("that's an error" in text or "there was an error" in text)
+    )
+    return server_error and (status_error or retry_page)
 
 
 def normalize_output_format(value: Any) -> str:
@@ -7814,6 +7828,12 @@ def handle_command(command: Dict[str, Any]) -> None:
                     "translate_failed",
                     [exc],
                 ) from exc
+            if is_translation_service_error(translated):
+                LOGGER.warning("Translation service returned an error page instead of translated text")
+                raise UserVisibleError(
+                    "Translation service returned a server error. Please try again later.",
+                    "translation_service_error",
+                )
             answer(str(translated or ""), request_id)
             return
 
