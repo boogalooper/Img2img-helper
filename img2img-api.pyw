@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.210"
+VERSION = "0.211"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -4345,6 +4345,15 @@ def _render_forge_model_hint(rule: Dict[str, Any], profile: Dict[str, Any]) -> s
         lines.append(f"Forge Neo support: {support}")
 
     settings = profile.get("settings") if isinstance(profile.get("settings"), dict) else {}
+    module_labels = (
+        ("text_encoder", "Text Encoder"),
+        ("vae", "VAE"),
+    )
+    for key, caption in module_labels:
+        value = settings.get(key)
+        if value not in (None, ""):
+            lines.append(f"{caption}: {value}")
+
     setting_labels = (
         ("sampler", "Sampler"),
         ("scheduler", "Scheduler"),

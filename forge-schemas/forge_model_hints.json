@@ -1,19 +1,22 @@
 {
   "kind": "img2img-helper-forge-model-hints",
   "version": 2,
-  "description": "Optional Forge checkpoint helpTip database. Missing file or unmatched model means no model-specific helpTip.",
+  "description": "Optional Forge checkpoint helpTip database with inference settings and module recommendations. Missing file or unmatched model means no model-specific helpTip.",
+  "source": "https://github.com/Haoming02/sd-webui-forge-classic/wiki/Download-Models",
   "behavior": {
     "first_match_wins": true,
     "match_target": "checkpoint basename; use Forge filename when available, otherwise catalog title",
     "normalization": "lowercase and remove non-alphanumeric characters from both target and match tokens",
     "unknown_model": "no_help_tip",
     "use_folder_for_classification": false,
-    "schema_fallback": false
+    "schema_fallback": false,
+    "module_recommendations": "display_only"
   },
   "profiles": {
     "sd15": {
       "family": "SD 1.x",
       "settings": {
+        "vae": "vae-ft-mse-840000-ema-pruned.safetensors",
         "sampler": "Euler a",
         "scheduler": "Automatic",
         "steps": "32",
@@ -24,6 +27,7 @@
       "family": "SD 1.x Inpainting",
       "task": "inpaint",
       "settings": {
+        "vae": "vae-ft-mse-840000-ema-pruned.safetensors",
         "sampler": "Euler a",
         "scheduler": "Automatic",
         "steps": "32",
@@ -33,6 +37,7 @@
     "sdxl": {
       "family": "SDXL",
       "settings": {
+        "vae": "sdxl_vae.safetensors",
         "sampler": "Euler a",
         "scheduler": "Automatic",
         "steps": "24",
@@ -42,6 +47,8 @@
     "flux1": {
       "family": "FLUX.1",
       "settings": {
+        "text_encoder": "clip_l.safetensors + t5xxl_fp16.safetensors or t5xxl_fp8_e4m3fn_scaled.safetensors",
+        "vae": "ae.safetensors",
         "sampler": "Euler",
         "scheduler": "Beta",
         "steps": "20",
@@ -53,6 +60,8 @@
       "family": "FLUX.1 image edit",
       "task": "image_edit",
       "settings": {
+        "text_encoder": "clip_l.safetensors + t5xxl_fp16.safetensors or t5xxl_fp8_e4m3fn_scaled.safetensors",
+        "vae": "ae.safetensors",
         "sampler": "Euler",
         "scheduler": "Beta",
         "steps": "20",
@@ -76,38 +85,48 @@
     "qwen_image_full": {
       "family": "Qwen-Image",
       "settings": {
+        "text_encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors or GGUF",
+        "vae": "qwen_image_vae.safetensors or Qwen2D_VAE.safetensors",
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "50",
         "cfg": "4"
-      }
+      },
+      "note": "GGUF qwen_2.5_vl_7b requires the matching mmproj file for img2img."
     },
     "qwen_edit_full": {
       "family": "Qwen-Image-Edit",
       "task": "image_edit",
       "settings": {
+        "text_encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors or GGUF",
+        "vae": "qwen_image_vae.safetensors or Qwen2D_VAE.safetensors",
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "40",
         "cfg": "4",
         "denoise": "1.0"
-      }
+      },
+      "note": "GGUF qwen_2.5_vl_7b requires the matching mmproj file for img2img."
     },
     "qwen_edit_fast": {
       "family": "Qwen-Image-Edit few-step",
       "task": "image_edit",
       "settings": {
+        "text_encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors or GGUF",
+        "vae": "qwen_image_vae.safetensors or Qwen2D_VAE.safetensors",
         "sampler": "LCM",
         "scheduler": "Normal",
         "steps": "8",
         "cfg": "1",
         "denoise": "1.0"
-      }
+      },
+      "note": "GGUF qwen_2.5_vl_7b requires the matching mmproj file for img2img."
     },
     "klein_distilled": {
       "family": "FLUX.2 Klein",
       "task": "image_generation / image_edit",
       "settings": {
+        "vae": "flux2-vae.safetensors or full_encoder_small_decoder.safetensors",
         "sampler": "Euler",
         "scheduler": "Beta",
         "steps": "4",
@@ -119,6 +138,59 @@
       "family": "FLUX.2 Klein Base",
       "task": "image_generation / image_edit",
       "settings": {
+        "vae": "flux2-vae.safetensors or full_encoder_small_decoder.safetensors",
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "50",
+        "cfg": "4",
+        "denoise": "1.0"
+      }
+    },
+    "klein4_distilled": {
+      "family": "FLUX.2 Klein 4B",
+      "task": "image_generation / image_edit",
+      "settings": {
+        "text_encoder": "qwen_3_4b.safetensors or qwen3_4b_fp8_scaled.safetensors or GGUF",
+        "vae": "flux2-vae.safetensors or full_encoder_small_decoder.safetensors",
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "4",
+        "cfg": "1",
+        "denoise": "1.0"
+      }
+    },
+    "klein4_base": {
+      "family": "FLUX.2 Klein 4B Base",
+      "task": "image_generation / image_edit",
+      "settings": {
+        "text_encoder": "qwen_3_4b.safetensors or qwen3_4b_fp8_scaled.safetensors or GGUF",
+        "vae": "flux2-vae.safetensors or full_encoder_small_decoder.safetensors",
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "50",
+        "cfg": "4",
+        "denoise": "1.0"
+      }
+    },
+    "klein9_distilled": {
+      "family": "FLUX.2 Klein 9B",
+      "task": "image_generation / image_edit",
+      "settings": {
+        "text_encoder": "qwen_3_8b.safetensors or qwen_3_8b_fp8mixed.safetensors or GGUF",
+        "vae": "flux2-vae.safetensors or full_encoder_small_decoder.safetensors",
+        "sampler": "Euler",
+        "scheduler": "Beta",
+        "steps": "4",
+        "cfg": "1",
+        "denoise": "1.0"
+      }
+    },
+    "klein9_base": {
+      "family": "FLUX.2 Klein 9B Base",
+      "task": "image_generation / image_edit",
+      "settings": {
+        "text_encoder": "qwen_3_8b.safetensors or qwen_3_8b_fp8mixed.safetensors or GGUF",
+        "vae": "flux2-vae.safetensors or full_encoder_small_decoder.safetensors",
         "sampler": "Euler",
         "scheduler": "Beta",
         "steps": "50",
@@ -129,6 +201,8 @@
     "zimage_turbo": {
       "family": "Z-Image Turbo",
       "settings": {
+        "text_encoder": "qwen_3_4b.safetensors or qwen3_4b_fp8_scaled.safetensors or GGUF",
+        "vae": "ae.safetensors",
         "sampler": "Euler",
         "scheduler": "Beta",
         "steps": "9",
@@ -139,6 +213,8 @@
     "zimage_base": {
       "family": "Z-Image Base",
       "settings": {
+        "text_encoder": "qwen_3_4b.safetensors or qwen3_4b_fp8_scaled.safetensors or GGUF",
+        "vae": "ae.safetensors",
         "sampler": "Euler",
         "scheduler": "Beta",
         "steps": "28–50 (40 start)",
@@ -149,6 +225,8 @@
     "ernie_turbo": {
       "family": "ERNIE-Image Turbo",
       "settings": {
+        "text_encoder": "ministral-3-3b.safetensors",
+        "vae": "flux2-vae.safetensors or full_encoder_small_decoder.safetensors",
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "8",
@@ -159,6 +237,8 @@
     "ernie_base": {
       "family": "ERNIE-Image",
       "settings": {
+        "text_encoder": "ministral-3-3b.safetensors",
+        "vae": "flux2-vae.safetensors or full_encoder_small_decoder.safetensors",
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "50",
@@ -169,6 +249,8 @@
     "anima_turbo": {
       "family": "Anima Turbo",
       "settings": {
+        "text_encoder": "qwen_3_06b_base.safetensors",
+        "vae": "qwen_image_vae.safetensors or Qwen2D_VAE.safetensors",
         "sampler": "Euler",
         "scheduler": "Beta",
         "steps": "8–12 (10 start)",
@@ -179,6 +261,8 @@
     "anima_full": {
       "family": "Anima",
       "settings": {
+        "text_encoder": "qwen_3_06b_base.safetensors",
+        "vae": "qwen_image_vae.safetensors or Qwen2D_VAE.safetensors",
         "sampler": "ER SDE",
         "scheduler": "Beta",
         "steps": "30–50 (32 start)",
@@ -189,6 +273,8 @@
     "krea2_turbo": {
       "family": "Krea 2 Turbo",
       "settings": {
+        "text_encoder": "qwen3vl_4b (bf16 or fp8_scaled)",
+        "vae": "qwen_image_vae.safetensors or Qwen2D_VAE.safetensors",
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "8",
@@ -199,6 +285,8 @@
     "krea2_raw": {
       "family": "Krea 2 Raw",
       "settings": {
+        "text_encoder": "qwen3vl_4b (bf16 or fp8_scaled)",
+        "vae": "qwen_image_vae.safetensors or Qwen2D_VAE.safetensors",
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "52",
@@ -210,6 +298,8 @@
       "family": "PiD",
       "task": "decoder_upscale",
       "settings": {
+        "text_encoder": "gemma_2_2b_it_elm_bf16.safetensors or gemma_2_2b_it_elm_fp8_scaled.safetensors",
+        "vae": "Model dependent",
         "sampler": "LCM",
         "scheduler": "Simple",
         "steps": "4",
@@ -221,6 +311,8 @@
       "family": "Wan 2.2 distilled",
       "task": "video",
       "settings": {
+        "text_encoder": "umt5_xxl_fp16.safetensors or umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        "vae": "wan_2.1_vae.safetensors",
         "sampler": "Euler",
         "scheduler": "Simple",
         "steps": "4",
@@ -232,6 +324,8 @@
       "family": "Wan 2.2 14B",
       "task": "video",
       "settings": {
+        "text_encoder": "umt5_xxl_fp16.safetensors or umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        "vae": "wan_2.1_vae.safetensors",
         "sampler": "Euler",
         "scheduler": "Beta",
         "steps": "~20 Forge reference",
@@ -264,6 +358,8 @@
     "lumina2": {
       "family": "Lumina-Image-2.0",
       "settings": {
+        "text_encoder": "gemma_2_2b_fp16.safetensors",
+        "vae": "ae.safetensors",
         "sampler": "Res Multistep",
         "scheduler": "Simple",
         "steps": "32–50 (32 start)",
@@ -411,6 +507,36 @@
       "profile": "qwen_image_full"
     },
     {
+      "id": "klein4_base",
+      "match": {
+        "all": [
+          "flux2",
+          "klein",
+          "4b",
+          "base"
+        ],
+        "not": [
+          "pid"
+        ]
+      },
+      "profile": "klein4_base"
+    },
+    {
+      "id": "klein9_base",
+      "match": {
+        "all": [
+          "flux2",
+          "klein",
+          "9b",
+          "base"
+        ],
+        "not": [
+          "pid"
+        ]
+      },
+      "profile": "klein9_base"
+    },
+    {
       "id": "klein_base",
       "match": {
         "all": [
@@ -423,6 +549,36 @@
         ]
       },
       "profile": "klein_base"
+    },
+    {
+      "id": "klein4_distilled",
+      "match": {
+        "all": [
+          "flux2",
+          "klein",
+          "4b"
+        ],
+        "not": [
+          "base",
+          "pid"
+        ]
+      },
+      "profile": "klein4_distilled"
+    },
+    {
+      "id": "klein9_distilled",
+      "match": {
+        "all": [
+          "flux2",
+          "klein",
+          "9b"
+        ],
+        "not": [
+          "base",
+          "pid"
+        ]
+      },
+      "profile": "klein9_distilled"
     },
     {
       "id": "klein_distilled",
