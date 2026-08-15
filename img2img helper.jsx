@@ -37,7 +37,7 @@ var APP = {
 		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.209",
+	VER = "0.210",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -6734,8 +6734,8 @@ function toBooleanValue(value) {
 function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
 function roundTo(value, digits) { var k = Math.pow(10, digits || 0); return Math.round(value * k) / k; }
 // Единая дискретизация ScriptUI Slider.
-// Drag привязывается к сетке step, а клавиша/колесо вне drag всегда дают
-// ровно один логический шаг независимо от собственного native шага ScriptUI.
+// Drag привязывается к сетке step, обычная клавиша/колесо вне drag дают один
+// логический шаг, а Shift со стрелкой — пять шагов конкретного слайдера.
 function createSliderStepper(slider, step, origin) {
 	step = Math.abs(Number(step));
 	if (!isFinite(step) || step <= 0) step = 1;
@@ -6746,14 +6746,36 @@ function createSliderStepper(slider, step, origin) {
 		step: step,
 		origin: origin,
 		snappedValue: null,
+		shiftTarget: null,
 		pointerActive: false
 	};
-	try { slider.addEventListener("mousedown", function () { state.pointerActive = true; }); } catch (_) { }
+	try { slider.addEventListener("mousedown", function () { state.shiftTarget = null; state.pointerActive = true; }); } catch (_) { }
+	try {
+		slider.addEventListener("keydown", function (event) {
+			state.shiftTarget = null;
+			if (!event || !event.shiftKey) return;
+			var key = String(event.keyName || event.keyIdentifier || ""), direction = 0;
+			if (key == "Right" || key == "Up" || key == "ArrowRight" || key == "ArrowUp") direction = 1;
+			else if (key == "Left" || key == "Down" || key == "ArrowLeft" || key == "ArrowDown") direction = -1;
+			if (!direction) return;
+			var minimum = Number(slider.minvalue), maximum = Number(slider.maxvalue),
+				base = state.snappedValue === null ? roundByStep(Number(slider.value), step, origin) : state.snappedValue,
+				target = clamp(roundByStep(base + direction * step * 5, step, origin), minimum, maximum);
+			state.shiftTarget = target;
+			// Оставляем native-обработчику стрелки небольшой ход, а sync затем
+			// устанавливает точное значение ускоренного шага.
+			slider.value = clamp(target - direction * Math.min(step, maximum - minimum), minimum, maximum);
+		});
+	} catch (_) { }
 	state.sync = function (reset) {
+		if (reset) state.shiftTarget = null;
 		var raw = Number(slider.value),
 			previous = reset ? null : state.snappedValue,
 			value;
-		if (!state.pointerActive && previous !== null && raw != previous)
+		if (!reset && state.shiftTarget !== null) {
+			value = state.shiftTarget;
+			state.shiftTarget = null;
+		} else if (!state.pointerActive && previous !== null && raw != previous)
 			value = roundByStep(previous + (raw > previous ? step : -step), step, origin);
 		else value = roundByStep(raw, step, origin);
 		value = clamp(value, Number(slider.minvalue), Number(slider.maxvalue));
