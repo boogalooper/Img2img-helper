@@ -30,14 +30,9 @@ var APP = {
 		namespace: "http://ns.img2img-helper.local/generation/1.0/",
 		prefix: "Img2imgHelper:",
 		property: "generationSettings"
-	},
-	cache: {
-		schemaVersion: 1,
-		comfyAnalysisUuid: "fbb6e4b0-5c1a-4d42-9a87-63e2f449ce18",
-		maxWorkflowSchemas: 6
 	}
 },
-	VER = "0.216",
+	VER = "0.217",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -649,7 +644,7 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (!workflow && metadata.relative_path) for (var i = 0; i < state.workflows.length; i++) if (state.workflows[i].relative_path == metadata.relative_path) { workflow = state.workflows[i]; break; }
 		if (!workflow) return false;
 		cfg.selectedWorkflow = cfg.data.selectedWorkflow = workflow.id;
-		var profile = cfg.getProfile(workflow.id), previous = cloneObj(profile.bindingOverrides);
+		var profile = cfg.getProfile(workflow.id);
 		applyMetadataToProfile(metadata, profile, ["autoResize", "resizePreset", "manualScale", "sizeMultiple", "bindingOverrides", "referenceFiles", "outputFormat", "selectedPromptPresets"]);
 		if (!isObjectMap(profile.bindingOverrides)) profile.bindingOverrides = { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" };
 		if (profile.bindingOverrides.mask === undefined) profile.bindingOverrides.mask = "";
@@ -659,12 +654,6 @@ function mainDialog(selection, initial, responseSeconds) {
 		if (profile.bindingOverrides.sizeMode !== "source_image" && profile.bindingOverrides.sizeMode !== "binding")
 			profile.bindingOverrides.sizeMode = "auto";
 		if (profile.bindingOverrides.sizeMode != "binding") profile.bindingOverrides.size = "";
-		if (!bindingOverridesEqual(previous, profile.bindingOverrides)) {
-			profile.schemaCache = null;
-			profile.schemaCacheStamp = null;
-			profile.schemaCacheVersion = 0;
-			profile.schemaCacheUsed = 0;
-		}
 		reloadSelectedWorkflow(false, progress); return true;
 	}
 	// Значения слоя заменяют profile.values целиком. Это важно: скрытые
@@ -1060,12 +1049,6 @@ function mainDialog(selection, initial, responseSeconds) {
 				if (!showWorkflowSettings(state.schema, profile)) return null;
 				var bindingsChanged = !bindingOverridesEqual(previous, profile.bindingOverrides);
 				return function () {
-					if (bindingsChanged) {
-						profile.schemaCache = null;
-						profile.schemaCacheStamp = null;
-						profile.schemaCacheVersion = 0;
-						profile.schemaCacheUsed = 0;
-					}
 					// Сохраняем принятые настройки до повторного анализа.
 					// Если API снова вернёт ошибку сопоставления, выбранные
 					// input/mask/output/size bindings всё равно останутся в
@@ -1075,7 +1058,7 @@ function mainDialog(selection, initial, responseSeconds) {
 						ui.runWithPaletteProgress(str.progressAnalyze, function (progress) {
 							reloadSelectedWorkflow(false, progress, true);
 						});
-						// После успешного анализа сохраняем и обновлённый cache.
+						// После успешного анализа сохраняем обновлённые настройки.
 						action.saveAcceptedSettings();
 					}
 				};
@@ -1154,8 +1137,7 @@ function mainDialog(selection, initial, responseSeconds) {
 	function reloadSelectedWorkflow(force, progress, noShow) {
 		var workflow = backend.findWorkflow(state.workflows, cfg.selectedWorkflow); if (!workflow) throw new Error(str.errSelectedWorkflowMissing);
 		var profile = cfg.getProfile(workflow.id); profile.relativePath = workflow.relative_path || profile.relativePath || "";
-		var schema = force ? null : cfg.getCachedSchema(workflow.id, workflow);
-		if (!schema) { schema = backend.analyzeWorkflow(workflow, profile, force, progress); cfg.cacheSchema(schema, workflow); }
+		var schema = backend.analyzeWorkflow(workflow, profile, force, progress);
 		state.schema = schema; if (!noShow) showControls();
 	}
 	// Главное окно Comfy показывает короткие подписи, но не меняет schema/bindings.
@@ -3319,13 +3301,9 @@ function BackendRuntime() {
 			if (!sel) throw new Error(str.errSelectedWorkflowMissing);
 			var profile = cfg.getProfile(sel.id);
 			profile.relativePath = sel.relative_path || profile.relativePath || "";
-			res.schema = cfg.getCachedSchema(sel.id, sel);
-			if (!res.schema) {
-				if (!startupProgress) startupProgress = ui.createDelayedStartupProgress(str.progressAnalyze, ANALYZE_TIMEOUT, STARTUP_PROGRESS_DELAY);
-				if (progress) progress.setStage(str.progressAnalyze, 63);
-				res.schema = analyzeWorkflow(sel, profile, false, progress);
-				cfg.cacheSchema(res.schema, sel);
-			}
+			if (!startupProgress) startupProgress = ui.createDelayedStartupProgress(str.progressAnalyze, ANALYZE_TIMEOUT, STARTUP_PROGRESS_DELAY);
+			if (progress) progress.setStage(str.progressAnalyze, 63);
+			res.schema = analyzeWorkflow(sel, profile, false, progress);
 		}
 		return finalizeInitialData(res);
 	};
@@ -5689,6 +5667,10 @@ function Config() {
 	function normalizeBaseProfile(profile) {
 		if (!isObjectMap(profile.values)) profile.values = {};
 		delete profile.promptUndo;
+		delete profile.schemaCache;
+		delete profile.schemaCacheStamp;
+		delete profile.schemaCacheVersion;
+		delete profile.schemaCacheUsed;
 		if (!isObjectMap(profile.selectedPromptPresets))
 			profile.selectedPromptPresets = { positive: "", negative: "" };
 		if (typeof profile.selectedPromptPresets.positive != "string") profile.selectedPromptPresets.positive = "";
@@ -5834,13 +5816,6 @@ function Config() {
 		delete res.descSaveCount;
 		delete res.pythonIdleTimeout;
 		delete res.backendMonitorInterval;
-		var profiles = isObjectMap(res.workflowProfiles) ? res.workflowProfiles : {};
-		for (var workflowId in profiles) if (profiles.hasOwnProperty(workflowId) && profiles[workflowId]) {
-			delete profiles[workflowId].schemaCache;
-			delete profiles[workflowId].schemaCacheStamp;
-			delete profiles[workflowId].schemaCacheVersion;
-			delete profiles[workflowId].schemaCacheUsed;
-		}
 		return res;
 	}
 	function settingsFile(suffix) {
@@ -6025,8 +6000,7 @@ function Config() {
 			bindingOverrides: { input: "", mask: "", references: [], referencesConfigured: false, emptyInputs: [], output: "", sizeMode: "auto", size: "" },
 			referenceFiles: {}, sizeMultiple: self.sizeMultiple,
 			autoResize: self.autoResize, resizePreset: presets.normalizeResizeName("", self.resizePresets),
-			outputFormat: "jpg", manualScale: 1, workflowInformationSeen: false,
-			schemaCache: null, schemaCacheStamp: null, schemaCacheVersion: 0, schemaCacheUsed: 0
+			outputFormat: "jpg", manualScale: 1, workflowInformationSeen: false
 		};
 		normalizeBaseProfile(profile);
 		if (!isObjectMap(profile.bindingOverrides))
@@ -6128,51 +6102,8 @@ function Config() {
 			self.getProfile(item.id).relativePath = item.relative_path || "";
 		}
 	};
-	this.getCachedSchema = function (workflowId, workflow) {
-		var profile = self.getProfile(workflowId);
-		if (!profile.schemaCache || !profile.schemaCacheStamp) return null;
-		if (profile.schemaCacheVersion != APP.cache.schemaVersion) return null;
-		if (profile.schemaCache.analysis_uuid != APP.cache.comfyAnalysisUuid) return null;
-		var stamp = workflowStamp(workflow.relative_path || profile.relativePath);
-		if (!stamp) return null;
-		if (stamp.size != profile.schemaCacheStamp.size || stamp.modified != profile.schemaCacheStamp.modified) return null;
-		profile.schemaCacheUsed = (new Date()).getTime();
-		return profile.schemaCache;
-	};
-	this.cacheSchema = function (schema, workflow) {
-		if (!schema || !schema.workflow_id) return;
-		var profile = self.getProfile(schema.workflow_id);
-		profile.relativePath = schema.relative_path || (workflow ? workflow.relative_path : profile.relativePath) || "";
-		profile.schemaCache = schema;
-		profile.schemaCacheStamp = workflowStamp(profile.relativePath);
-		profile.schemaCacheVersion = APP.cache.schemaVersion;
-		profile.schemaCacheUsed = (new Date()).getTime();
-		var cached = [], workflowId;
-		for (workflowId in self.workflowProfiles) if (self.workflowProfiles.hasOwnProperty(workflowId)) {
-			var cachedProfile = self.workflowProfiles[workflowId];
-			if (cachedProfile && cachedProfile.schemaCache)
-				cached.push({ id: workflowId, used: Number(cachedProfile.schemaCacheUsed) || 0 });
-		}
-		cached.sort(function (a, b) { return b.used - a.used; });
-		for (var i = APP.cache.maxWorkflowSchemas; i < cached.length; i++) {
-			var staleProfile = self.workflowProfiles[cached[i].id];
-			staleProfile.schemaCache = null;
-			staleProfile.schemaCacheStamp = null;
-			staleProfile.schemaCacheVersion = 0;
-			staleProfile.schemaCacheUsed = 0;
-		}
-	};
 	this.bindProperties();
 	if (!this.resizePresets || !this.resizePresets.length) this.resizePresets = this.data.resizePresets = presets.defaultResize();
-	function workflowStamp(relativePath) {
-		if (!relativePath) return null;
-		var file = new File(self.workflowsFolder + "/" + relativePath);
-		if (!file.exists) return null;
-		return {
-			size: file.length,
-			modified: file.modified ? file.modified.getTime() : 0
-		};
-	}
 	function defaultData() {
 		return {
 			backendHost: "127.0.0.1",
