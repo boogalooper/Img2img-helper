@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.219",
+	VER = "0.220",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -2868,7 +2868,7 @@ function BackendRuntime() {
 		for (var i = 0; i < items.length; i++) if (items[i].id == itemId) return items[i];
 		return null;
 	}
-	function chooseItem(items, selectedId, label, itemLabel, noticePrefix) {
+	function chooseItem(items, selectedId, label, itemLabel, noticePrefix, selectedLabel) {
 		var sel = findItem(items, selectedId);
 		if (sel) return selectedId;
 		if (!items.length) {
@@ -2876,13 +2876,15 @@ function BackendRuntime() {
 			return "";
 		}
 		var fallback = items[0], fallbackId = fallback.id;
-		if (selectedId !== undefined && selectedId !== null && String(selectedId) !== "")
-			replacementNotice(
-				noticePrefix + ":missing:" + String(selectedId),
-				label,
-				selectedId,
-				itemLabel(fallback)
-			);
+		if (selectedId !== undefined && selectedId !== null && String(selectedId) !== "") {
+			var previousLabel = selectedLabel === undefined ? selectedId : selectedLabel,
+				fallbackLabel = itemLabel(fallback),
+				noticeKey = noticePrefix + ":missing:" + String(selectedId);
+			if (previousLabel)
+				replacementNotice(noticeKey, label, previousLabel, fallbackLabel);
+			else
+				pushNotice(noticeKey, String(label) + ": " + str.selectionMissingFallback + quotedValue(fallbackLabel));
+		}
 		return fallbackId;
 	}
 	function workflowLabel(item) {
@@ -2892,7 +2894,11 @@ function BackendRuntime() {
 		return String(item && (item.label || item.id) || "");
 	}
 	function chooseWorkflow(workflows) {
-		return chooseItem(workflows, cfg.selectedWorkflow, str.workflow, workflowLabel, "workflow");
+		var workflowId = String(cfg.selectedWorkflow || ""),
+			profiles = isObjectMap(cfg.workflowProfiles) ? cfg.workflowProfiles : {},
+			profile = profiles[workflowId],
+			previousLabel = profile && profile.relativePath ? String(profile.relativePath) : "";
+		return chooseItem(workflows, workflowId, str.workflow, workflowLabel, "workflow", previousLabel);
 	}
 	function findWorkflow(workflows, workflowId) { return findItem(workflows, workflowId); }
 	function fastWorkflowSelection() {
@@ -6428,6 +6434,7 @@ function Delay() {
 function Locale() {
 	var localized = {
 		all: ["Все", "All"], recordSettingsToAction: ["Записывать настройки в экшен", "Record settings to action"], automatic: ["Автоматически", "Automatic"],
+		selectionMissingFallback: ["ранее выбранный вариант не найден; используется ", "previously selected item was not found; using "],
 		autoResize: ["Автомасштаб", "Auto resize"], brushSettings: ["Настройки кисти", "Brush settings"], browse: ["Обзор…", "Browse…"],
 		connectionSettings: ["Подключение", "Connection"], pythonServerSettings: ["Python-сервер", "Python server"],
 		pythonApiVersion: ["Версия Python API:", "Python API version:"],
