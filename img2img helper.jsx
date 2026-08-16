@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.217",
+	VER = "0.218",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -65,7 +65,7 @@ var APP = {
 	MAIN_UI_SELECTOR_TOP_MARGIN = 5,
 	MAIN_UI_SELECTOR_BOTTOM_MARGIN = 5,
 	PROMPT_HISTORY_LIMIT = 100,
-	DESC_PROFILE_CLEANUP_INTERVAL = 500,
+	DESC_PROFILE_CLEANUP_INTERVAL = 100,
 	BACKEND_COMFY = "comfy",
 	BACKEND_FORGE = "forge",
 	TRANSFORM_STRETCH = "stretch",
@@ -96,6 +96,7 @@ var APP = {
 	isCancelled = false,
 	actionPlaybackMode = false,
 	actionUsesRecordedSettings = false,
+	interfaceWasShown = false,
 	globalSettings = null,
 	settingsReady = false,
 	keyboardState = ScriptUI.environment.keyboardState;
@@ -261,6 +262,7 @@ function init() {
 			startupProgress.complete(); startupProgress.close(); startupProgress = null;
 		}
 		if (showInterface) {
+			interfaceWasShown = true;
 			var res = mainDialog(selection, initial, responseSeconds);
 			if (!res || res.cancelled) {
 				if (res && res.saveSettings) action.saveAcceptedSettings();
@@ -270,8 +272,8 @@ function init() {
 				return;
 			}
 			action.saveAcceptedSettings();
-			var generationStatus = generation.run(selection, res.schema, res.values);
-			if (!generationStatus.keepDialog) $.setenv(APP.dialogEnvKey, "false");
+			generation.run(selection, res.schema, res.values);
+			$.setenv(APP.dialogEnvKey, "false");
 			return;
 		}
 		if (!initial.schema) return;
@@ -279,8 +281,8 @@ function init() {
 			silentValues = backend.profileValues(initial.schema, silentProfile);
 		if (!actionPlaybackMode) cfg.saveToAction();
 		try {
-			var silentGenerationStatus = generation.run(selection, initial.schema, silentValues);
-			if (!silentGenerationStatus.keepDialog) $.setenv(APP.dialogEnvKey, "false");
+			generation.run(selection, initial.schema, silentValues);
+			$.setenv(APP.dialogEnvKey, "false");
 		} catch (silentGenerationError) {
 			if (isUserCancellation(silentGenerationError))
 				throw silentGenerationError;
@@ -305,6 +307,7 @@ function init() {
 				initial.notices = (initial.notices instanceof Array ? initial.notices : []).concat([generationNotice]);
 			}
 			initial.forceDialog = true;
+			interfaceWasShown = true;
 			var retryResult = mainDialog(selection, initial, responseSeconds);
 			if (!retryResult || retryResult.cancelled) {
 				if (retryResult && retryResult.saveSettings) action.saveAcceptedSettings();
@@ -313,8 +316,8 @@ function init() {
 				return;
 			}
 			action.saveAcceptedSettings();
-			var retryGenerationStatus = generation.run(selection, retryResult.schema, retryResult.values);
-			if (!retryGenerationStatus.keepDialog) $.setenv(APP.dialogEnvKey, "false");
+			generation.run(selection, retryResult.schema, retryResult.values);
+			$.setenv(APP.dialogEnvKey, "false");
 		}
 	} finally {
 		if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
@@ -528,6 +531,7 @@ function mainDialog(selection, initial, responseSeconds) {
 	};
 	bOk.onClick = function () {
 		try {
+			resolveDisplayedSeeds();
 			saveCurrentValues();
 			if (!state.schema) return;
 			if (!state.schema.valid) throw new Error(str.errWorkflowInvalid);
@@ -1235,6 +1239,16 @@ function mainDialog(selection, initial, responseSeconds) {
 		for (key in state.controls) if (state.controls.hasOwnProperty(key) && state.controls[key] && state.controls[key].getValue)
 			res[key] = state.controls[key].getValue();
 		return res;
+	}
+	// Случайный маркер превращается в конкретное значение до сохранения
+	// принятого диалога. Числовой seed остаётся фиксированным.
+	function resolveDisplayedSeeds() {
+		var definitions = state.schema && state.schema.controls instanceof Array ? state.schema.controls : [];
+		for (var i = 0; i < definitions.length; i++) {
+			var definition = definitions[i], control = state.controls[definition.id];
+			if (!generation.isSeedControl(definition) || !control || !control.getValue || !control.setValue) continue;
+			control.setValue(generation.resolveSeedValue(definition, control.getValue()));
+		}
 	}
 	// Формирует полный набор для генерации. Для Forge скрытые контролы
 	// дополняются проверенными default из схемы, поскольку endpoint ожидает
@@ -2174,6 +2188,25 @@ function GenerationRuntime() {
 		if (isNaN(max) || max > 4294967295 || max <= min) max = 4294967295;
 		return min + Math.floor(Math.random() * (max - min + 1));
 	}
+	function isRandomSeedValue(value) {
+		var text = String(value === undefined || value === null ? "" : value)
+			.replace(/^\s+|\s+$/g, "").toLowerCase();
+		return !text || text == "-1" || text == "random";
+	}
+	function resolveSeedValue(schema, value) {
+		return isRandomSeedValue(value) ? String(makeRandomUiSeed(schema)) : value;
+	}
+	// Генерация работает с копией значений: тихий запуск не меняет профиль,
+	// но маркер случайного seed всё равно получает конкретное значение.
+	function resolveSeedValues(schema, source) {
+		var values = cloneObj(source || {}), controls = schema && schema.controls instanceof Array ? schema.controls : [];
+		for (var i = 0; i < controls.length; i++) {
+			var definition = controls[i];
+			if (isSeedControl(definition) && values.hasOwnProperty(definition.id))
+				values[definition.id] = resolveSeedValue(definition, values[definition.id]);
+		}
+		return values;
+	}
 	function collectReferenceFiles(schema, profile) {
 		var res = [],
 			bindings = schema && schema.bindings ? (schema.bindings.reference_images || []) : [];
@@ -2207,8 +2240,8 @@ function GenerationRuntime() {
 		var requestId = createRequestId(),
 			inputFile = null,
 			maskFile = null,
-			resultFile = null,
-			keepDialog = false;
+			resultFile = null;
+		values = resolveSeedValues(schema, values);
 		try {
 			var currentBackend = backend.schemaBackend(schema),
 				profile = backend.schemaProfile(schema),
@@ -2328,29 +2361,12 @@ function GenerationRuntime() {
 			placementSelection = selection;
 			try {
 				app.activeDocument.suspendHistory(localize(str.historyPlaceResult), "placeResultHistory()");
-				// С этого момента результат принадлежит документу. Ошибки
-				// обновления seed, DESC или Action-параметров не должны
-				// откатывать историю к initialState.
+				// С этого момента результат принадлежит документу, и ошибки
+				// финализации не должны откатывать историю к initialState.
 				generationResultPlaced = true;
 			} finally {
 				placementResultFile = null;
 				placementSelection = null;
-			}
-			advanceVisibleSeeds(schema, profile, values);
-			try {
-				action.saveAfterGeneration();
-			} catch (saveError) {
-				// Сохранение настроек является постобработкой, а не частью
-				// самой генерации. Результат уже размещён и остаётся в
-				// документе; пользователю показывается отдельная ошибка.
-				$.setenv(APP.dialogEnvKey, "true");
-				keepDialog = true;
-				messages.error(
-					str.errSettingsSaveAfterGeneration +
-					"\n" + errorMessageText(saveError) +
-					(saveError && saveError.line ? "\n\n" + str.jsxLine + saveError.line : ""),
-					APP.name
-				);
 			}
 			if (typeof answer == "object" && answer.warnings instanceof Array && answer.warnings.length) {
 				var localizedGenerationWarnings = [];
@@ -2358,7 +2374,6 @@ function GenerationRuntime() {
 					localizedGenerationWarnings.push(workflowDiagnosticText(answer.warnings[warningIndex]));
 				messages.show({ title: str.generationDiagnostics, warnings: localizedGenerationWarnings });
 			}
-			return { keepDialog: keepDialog };
 		} finally {
 			if (inputFile && inputFile.exists) try { inputFile.remove(); } catch (_) { }
 			if (maskFile && maskFile.exists) try { maskFile.remove(); } catch (_) { }
@@ -2427,21 +2442,6 @@ function GenerationRuntime() {
 		var text = firstProgressValue(value).replace(/\\/g, "/"), parts = text.split("/");
 		text = parts.length ? parts[parts.length - 1] : text;
 		return text.replace(/\./g, "-").replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "");
-	}
-	function advanceVisibleSeeds(schema, profile, sentValues) {
-		if (!schema || !profile || !sentValues) return;
-		var controls = schema.controls || [];
-		for (var i = 0; i < controls.length; i++) {
-			var definition = controls[i];
-			if (!isSeedControl(definition)) continue;
-			if (!sentValues.hasOwnProperty(definition.id)) continue;
-			var previous = String(sentValues[definition.id]),
-				next = previous;
-			for (var attempt = 0; attempt < 5 && next == previous; attempt++) {
-				next = String(makeRandomUiSeed(definition));
-			}
-			profile.values[definition.id] = next;
-		}
 	}
 	function prepareSelectionLayer(selection) {
 		if (selection.previousGeneration) doc.hideSelectedLayers();
@@ -2665,6 +2665,7 @@ function GenerationRuntime() {
 	this.placeResultHistory = placeResultHistory;
 	this.isSeedControl = isSeedControl;
 	this.makeRandomSeed = makeRandomUiSeed;
+	this.resolveSeedValue = resolveSeedValue;
 	this.prepareSelectionLayer = prepareSelectionLayer;
 	this.checkSelection = checkSelection;
 }
@@ -2722,12 +2723,9 @@ function ActionRuntime() {
 		cfg.save();
 		cfg.saveToAction();
 	};
-	this.saveAfterGeneration = function () {
-		if (actionPlaybackMode && cfg.recordSettingsToAction) cfg.saveToAction();
-		else cfg.save();
-	};
 	this.saveAfterError = function () {
-		if (!settingsReady) return "";
+		// До показа интерфейса тихий запуск не изменяет DESC или Action.
+		if (!settingsReady || !interfaceWasShown) return "";
 		try {
 			this.saveAcceptedSettings();
 			return "";
@@ -4225,7 +4223,12 @@ function UI() {
 			seedRefresh.text = "↻";
 			seedRefresh.helpTip = str.randomSeed;
 			seedRefresh.onClick = function () { seedEdit.text = String(generation.makeRandomSeed(schema)); };
-			return { getValue: function () { return seedEdit.text; }, control: seedEdit, container: seedGroup };
+			return {
+				getValue: function () { return seedEdit.text; },
+				setValue: function (nextValue) { seedEdit.text = String(nextValue); },
+				control: seedEdit,
+				container: seedGroup
+			};
 		}
 		var hasMinimum = hasNumericSchemaValue(schema.min),
 			hasMaximum = hasNumericSchemaValue(schema.max),
@@ -5375,7 +5378,7 @@ function BridgeApi() {
 				}
 				if (expectedRequestId && String(answer.request_id || "") != String(expectedRequestId)) continue;
 				listener.close();
-				if (trackDelay && delayKey) {
+				if (trackDelay && delayKey && interfaceWasShown) {
 					try { generationTimings.saveDelay(delayKey, t2 - t1); } catch (_) { }
 				}
 				return answer;
@@ -5716,7 +5719,7 @@ function Config() {
 			if (!arrayContainsCaseInsensitive(res, cur[i])) res.push(cur[i]);
 		self.referenceHistory = self.data.referenceHistory = res;
 	};
-	// Раз в несколько сотен сохранений DESC удаляем только профили, чьи
+	// Раз в сотню сохранений DESC удаляем только профили, чьи
 	// исходные JSON уже отсутствуют. Проверка выполняется отдельно для каждого
 	// реально доступного backend; существующий, но повреждённый JSON не удаляет профиль.
 	function probeCleanupBackends() {
@@ -5919,7 +5922,11 @@ function Config() {
 	this.save = function () {
 		syncData();
 		var previousSaveCount = parseInt(self.descSaveCount, 10);
-		if (isNaN(previousSaveCount) || previousSaveCount < 0 || previousSaveCount >= DESC_PROFILE_CLEANUP_INTERVAL) previousSaveCount = 0;
+		if (isNaN(previousSaveCount) || previousSaveCount < 0) previousSaveCount = 0;
+		// Счётчик старой версии мог уже превысить новый предел. В таком
+		// случае очистка выполняется при ближайшем сохранении интерфейса.
+		else if (previousSaveCount >= DESC_PROFILE_CLEANUP_INTERVAL)
+			previousSaveCount = DESC_PROFILE_CLEANUP_INTERVAL - 1;
 		var nextSaveCount = previousSaveCount + 1,
 			cleanupDue = nextSaveCount >= DESC_PROFILE_CLEANUP_INTERVAL,
 			cleanupBackends = cleanupDue ? probeCleanupBackends() : null,
@@ -6413,7 +6420,6 @@ function Locale() {
 		pythonIdleTimeout: ["Остановка после простоя, мин (0 — выкл.):", "Stop after idle, min (0 = off):"],
 		backendMonitorInterval: ["Проверка бэкендов в фоне, с:", "Background backend check, s:"],
 		errSettingsSaveAfterError: ["Операция завершилась с ошибкой, и настройки сохранить не удалось:", "The operation failed and the settings could not be saved:"],
-		errSettingsSaveAfterGeneration: ["Результат создан, но настройки сохранить не удалось:", "The result was created, but the settings could not be saved:"],
 		errSettingsReadFile: ["Не удалось прочитать файл настроек.", "Could not read the settings file."],
 		errSettingsWriteFile: ["Не удалось записать временный файл настроек.", "Could not write the temporary settings file."],
 		errSettingsBackupFile: ["Не удалось сохранить предыдущий файл настроек как резервную копию.", "Could not preserve the previous settings file as a backup."],
