@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.218",
+	VER = "0.219",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -218,18 +218,14 @@ function init() {
 				if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
 			}
 		} else if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
-		// Видимый UI использует сохранённый каталог, если выбранный элемент ещё
-		// присутствует в нём. Изменение выбранного JSON проверяется по stamp, а
-		// полный поиск новых файлов выполняется при первом запуске и по кнопке ↻.
+		// Видимый UI Comfy всегда обновляет список workflow. Сохранённый каталог
+		// остаётся быстрым путём для тихого запуска, включая Action без диалога.
 		var interfaceRequestedAtStartup = showInterface,
 			hasCachedForgeSelection = showInterface && cfg.activeBackend == BACKEND_FORGE &&
 				cfg.forgeCatalog instanceof Array &&
 				!!backend.findForgeSchema(cfg.forgeCatalog, cfg.selectedForgePreset),
-			hasCachedComfySelection = showInterface && cfg.activeBackend == BACKEND_COMFY &&
-				cfg.workflowCatalog instanceof Array &&
-				!!backend.findWorkflow(cfg.workflowCatalog, cfg.selectedWorkflow),
 			allowFastInitialLoad = !backendChangedAtStartup && !settingsWarnings.length &&
-				(!showInterface || hasCachedForgeSelection || hasCachedComfySelection),
+				(!showInterface || hasCachedForgeSelection),
 			initial = backend.loadInitialData(startupProgress, allowFastInitialLoad);
 		if (actionPlaybackMode && actionUsesRecordedSettings && globalSettings)
 			cfg.copyPromptUndoFrom(globalSettings);
@@ -240,7 +236,7 @@ function init() {
 			$.setenv(APP.dialogEnvKey, "true");
 		}
 		// Если тихий запуск сам потребовал UI, загружаем полный список.
-		// Для UI, запрошенного пользователем изначально, проверенного cached-list достаточно.
+		// При изначально видимом UI быстрый каталог может использовать только Forge.
 		if (showInterface && initial.fastPath && !interfaceRequestedAtStartup) {
 			var fastNotices = initial.notices instanceof Array ? initial.notices : [],
 				fullInitial = backend.loadInitialData(startupProgress, false),
@@ -986,7 +982,12 @@ function mainDialog(selection, initial, responseSeconds) {
 
 	function runSchemaAction(callback, after) {
 		try { callback(); }
-		catch (e) { messages.error(e); }
+		catch (e) {
+			// После ошибки анализа не оставляем на экране контролы ранее
+			// загруженного workflow под именем нового выбранного файла.
+			if (!state.schema && !after) showControls();
+			messages.error(e);
+		}
 		finally { if (after) after(); }
 	}
 	function schemaControlOperations() {
@@ -1141,7 +1142,9 @@ function mainDialog(selection, initial, responseSeconds) {
 	function reloadSelectedWorkflow(force, progress, noShow) {
 		var workflow = backend.findWorkflow(state.workflows, cfg.selectedWorkflow); if (!workflow) throw new Error(str.errSelectedWorkflowMissing);
 		var profile = cfg.getProfile(workflow.id); profile.relativePath = workflow.relative_path || profile.relativePath || "";
-		var schema = backend.analyzeWorkflow(workflow, profile, force, progress);
+		var schema;
+		try { schema = backend.analyzeWorkflow(workflow, profile, force, progress); }
+		catch (e) { state.schema = null; throw e; }
 		state.schema = schema; if (!noShow) showControls();
 	}
 	// Главное окно Comfy показывает короткие подписи, но не меняет schema/bindings.
@@ -3227,7 +3230,8 @@ function BackendRuntime() {
 			informationPending = !!(informationProfile &&
 				informationProfile.workflowInformationSeen !== true &&
 				schemaHasInformationalDiagnostics(res.schema));
-		res.notices = takeNotices().concat(validation.notices);
+		var existingNotices = res.notices instanceof Array ? res.notices : [];
+		res.notices = existingNotices.concat(takeNotices(), validation.notices);
 		res.emptyDropdownIds = validation.emptyDropdownIds;
 		res.forceDialog = !!(res.notices.length || res.emptyDropdownIds.length ||
 			(res.schema && !res.schema.valid) || informationPending);
@@ -3301,7 +3305,17 @@ function BackendRuntime() {
 			profile.relativePath = sel.relative_path || profile.relativePath || "";
 			if (!startupProgress) startupProgress = ui.createDelayedStartupProgress(str.progressAnalyze, ANALYZE_TIMEOUT, STARTUP_PROGRESS_DELAY);
 			if (progress) progress.setStage(str.progressAnalyze, 63);
-			res.schema = analyzeWorkflow(sel, profile, false, progress);
+			try { res.schema = analyzeWorkflow(sel, profile, false, progress); }
+			catch (workflowError) {
+				if (requireRecordedSelection || isUserCancellation(workflowError)) throw workflowError;
+				var workflowErrorText = errorMessageText(workflowError);
+				res.notices = [{
+					key: "workflow-load-error:" + String(sel.id || "") + ":" + workflowErrorText,
+					level: "error",
+					message: workflowErrorText
+				}];
+				res.schema = null;
+			}
 		}
 		return finalizeInitialData(res);
 	};
