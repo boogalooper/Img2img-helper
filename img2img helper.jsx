@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.220",
+	VER = "0.221",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -737,7 +737,9 @@ function mainDialog(selection, initial, responseSeconds) {
 			addControlDefinition(gSettings, def, profile, ui.contentWidth());
 		}
 		if (state.backend != BACKEND_FORGE) ui.addImageReferenceControls(gSettings, state.schema, profile);
-		ui.addResizeControl(gSettings, selectionBounds, profile, state.schema);
+		ui.addResizeControl(gSettings,
+			selection.exportGeometry ? selection.exportGeometry.bounds : selectionBounds,
+			profile, state.schema);
 		if (state.backend == BACKEND_FORGE && arrayContains(visible, "image_stitch")) {
 			ui.addForgeImageStitchControls(gSettings, state.schema, profile, state.controls, function () {
 				saveCurrentValues();
@@ -2250,7 +2252,8 @@ function GenerationRuntime() {
 				profile = backend.schemaProfile(schema),
 				inpaintMode = getComfyInpaintMode(selection, schema);
 			fitSelectionBounds(selection, resolveProfileSizeMultiple(schema, profile));
-			var targetSize = getProfileTargetSize(selection.bounds, profile, schema),
+			var exportBounds = selection.exportGeometry ? selection.exportGeometry.bounds : selection.bounds,
+				targetSize = getProfileTargetSize(exportBounds, profile, schema),
 				width = targetSize.width,
 				height = targetSize.height;
 			app.activeDocument.suspendHistory(localize(str.historyPrepareSelection), "prepareSelectionLayer(selection)");
@@ -2471,7 +2474,9 @@ function GenerationRuntime() {
 	function exportSelectionFiles(selection, width, height, requestId, inpaintMode, preferredFolder) {
 		var hst = activeDocument.activeHistoryState,
 			hiddenLayerIds = [],
-			c = null;
+			c = null,
+			geometry = selection.exportGeometry,
+			exportBounds = selection.bounds;
 		try { c = doc.getProperty("center").value; } catch (_) { }
 		var p = preferredFolder
 			? new Folder(String(preferredFolder))
@@ -2483,6 +2488,18 @@ function GenerationRuntime() {
 		var inputFile = new File(p.fsName + "/IMG2IMG_" + requestId + ".jpg"),
 			maskFile = inpaintMode ? new File(p.fsName + "/INPAINT_MASK_" + requestId + ".png") : null;
 		try {
+			if (geometry) {
+				// Canvas добавляется только у нужных границ; левое и верхнее
+				// поле смещают координаты исходного содержимого документа.
+				var canvasOffset = doc.expandCanvas(geometry.padding);
+				exportBounds = {
+					left: geometry.bounds.left + canvasOffset.left,
+					top: geometry.bounds.top + canvasOffset.top,
+					right: geometry.bounds.right + canvasOffset.left,
+					bottom: geometry.bounds.bottom + canvasOffset.top
+				};
+				doc.makeSelection(exportBounds);
+			}
 			if (inpaintMode) {
 				doc.selectLayersByIDs([selection.junk]);
 				lr.selectChannel("mask");
@@ -2501,7 +2518,7 @@ function GenerationRuntime() {
 			} else {
 				hiddenLayerIds = hideLayersAboveSource(selection.junk);
 			}
-			doc.makeSelection(selection.bounds);
+			doc.makeSelection(exportBounds);
 			doc.crop(true);
 			doc.flatten();
 			if (inpaintMode) doc.pastePixels();
@@ -2583,12 +2600,24 @@ function GenerationRuntime() {
 			}
 		}
 	}
-	// Place создаёт Smart Object. Затем изображение растягивается либо
-	// пропорционально вписывается в исходное выделение и получает маску.
+	// Place центрирует Smart Object по текущему выделению. При внешнем поле
+	// сначала смещаем центр выделения, затем восстанавливаем исходную маску.
 	function generatedImageToLayer(resultFile, selection) {
+		var geometry = selection.exportGeometry,
+			target = geometry ? geometry.bounds : selection.bounds,
+			visibleTarget = selection.bounds;
+		if (geometry) {
+			var shiftX = target.left + target.right - visibleTarget.left - visibleTarget.right,
+				shiftY = target.top + target.bottom - visibleTarget.top - visibleTarget.bottom;
+			doc.makeSelection({
+				left: visibleTarget.left + Math.max(0, shiftX),
+				top: visibleTarget.top + Math.max(0, shiftY),
+				right: visibleTarget.right + Math.min(0, shiftX),
+				bottom: visibleTarget.bottom + Math.min(0, shiftY)
+			});
+		}
 		doc.place(resultFile);
-		var placed = doc.descToObject(lr.getProperty("bounds").value),
-			target = selection.bounds;
+		var placed = doc.descToObject(lr.getProperty("bounds").value);
 		var placedWidth = placed.right - placed.left, placedHeight = placed.bottom - placed.top;
 		if (!placedWidth || !placedHeight) throw new Error(str.errPlacedBounds);
 		var scaleX = (target.right - target.left) / placedWidth,
@@ -2611,8 +2640,8 @@ function GenerationRuntime() {
 		// иначе Make попытается добавить вторую маску к служебному слою.
 		var resultLayerId = lr.getProperty("layerID");
 		try { doc.makeSelectionFromLayer("mask", selection.junk); }
-		catch (_) { doc.makeSelection(target); }
-		if (!doc.hasProperty("selection")) doc.makeSelection(target);
+		catch (_) { doc.makeSelection(visibleTarget); }
+		if (!doc.hasProperty("selection")) doc.makeSelection(visibleTarget);
 		doc.selectLayersByIDs([resultLayerId]);
 		doc.makeSelectionMask();
 		doc.deleteLayer(selection.junk);
@@ -5053,9 +5082,9 @@ function placeResultHistory() { return generation.placeResultHistory(); }
 function runGenerationProgress() { return generationProgress.run(); }
 function generationStageOne() { return generationProgress.stageOne(); }
 function generationStageTwo() { return generationProgress.stageTwo(); }
-// Уменьшает выделение до ближайшей меньшей кратности, никогда не расширяя
-// исходную область. sourceBounds хранит первоначальные границы, поэтому функция
-// безопасно вызывается повторно после смены workflow/preset.
+// Внутри документа выделение уменьшается до ближайшей меньшей кратности.
+// У его границ исходные пиксели сохраняются: exportGeometry описывает поле,
+// временный canvas и crop, существующие только во время экспорта изображения.
 function fitSelectionBounds(res, multiple) {
 	multiple = clamp(parseInt(multiple, 10) || 1, 1, 256);
 	if (!res.sourceBounds) res.sourceBounds = cloneObj(res.bounds);
@@ -5086,16 +5115,53 @@ function fitSelectionBounds(res, multiple) {
 	}
 	if (b.right - b.left < multiple || b.bottom - b.top < multiple)
 		throw new Error(str.errSelectionTooSmall + " " + multiple + " px.");
-	fitAxis("left", "right", canvas.right);
-	fitAxis("top", "bottom", canvas.bottom);
+	var horizontal = fitAxis("left", "right", canvas.right),
+		vertical = fitAxis("top", "bottom", canvas.bottom);
 	b.width = b.right - b.left;
 	b.height = b.bottom - b.top;
+	if (horizontal.paddingStart || horizontal.paddingEnd || vertical.paddingStart || vertical.paddingEnd) {
+		var exportBounds = {
+			left: horizontal.exportStart,
+			top: vertical.exportStart,
+			right: horizontal.exportEnd,
+			bottom: vertical.exportEnd
+		};
+		exportBounds.width = exportBounds.right - exportBounds.left;
+		exportBounds.height = exportBounds.bottom - exportBounds.top;
+		res.exportGeometry = {
+			bounds: exportBounds,
+			padding: {
+				left: horizontal.paddingStart,
+				top: vertical.paddingStart,
+				right: horizontal.paddingEnd,
+				bottom: vertical.paddingEnd
+			}
+		};
+	} else res.exportGeometry = null;
 	if (clipped && doc.hasProperty("selection")) doc.makeSelection(b);
 	function fitAxis(startKey, endKey, limit) {
 		var start = b[startKey],
-			end = b[endKey];
-		var size = end - start,
-			target = Math.floor(size / multiple) * multiple;
+			end = b[endKey],
+			size = end - start,
+			paddingStart = 0,
+			paddingEnd = 0;
+		if (size % multiple && (start == 0 || end == limit)) {
+			paddingStart = start == 0 ? multiple : 0;
+			paddingEnd = end == limit ? multiple : 0;
+			var paddedSize = size + paddingStart + paddingEnd,
+				trim = paddedSize % multiple,
+				trimStart = paddingStart ? (paddingEnd ? Math.floor(trim / 2) : trim) : 0,
+				trimEnd = trim - trimStart;
+			b[startKey] = start;
+			b[endKey] = end;
+			return {
+				paddingStart: paddingStart,
+				paddingEnd: paddingEnd,
+				exportStart: start - paddingStart + trimStart,
+				exportEnd: end + paddingEnd - trimEnd
+			};
+		}
+		var target = Math.floor(size / multiple) * multiple;
 		if (target >= size) {
 			start = Math.round((start + end - target) / 2);
 			start = Math.max(0, Math.min(start, limit - target));
@@ -5104,6 +5170,12 @@ function fitSelectionBounds(res, multiple) {
 		}
 		b[startKey] = start;
 		b[endKey] = start + target;
+		return {
+			paddingStart: 0,
+			paddingEnd: 0,
+			exportStart: b[startKey],
+			exportEnd: b[endKey]
+		};
 	}
 }
 // ---
@@ -6269,6 +6341,29 @@ function AM(target, order) {
 	this.crop = function (deletePixels) {
 		var desc = new AD(); desc.putBoolean(s2t("delete"), !!deletePixels);
 		executeAction(s2t("crop"), desc, DialogModes.NO);
+	};
+	this.expandCanvas = function (padding) {
+		padding = padding || {};
+		var left = Math.max(0, Math.round(Number(padding.left) || 0)),
+			top = Math.max(0, Math.round(Number(padding.top) || 0)),
+			right = Math.max(0, Math.round(Number(padding.right) || 0)),
+			bottom = Math.max(0, Math.round(Number(padding.bottom) || 0));
+		if (!left && !top && !right && !bottom) return { left: 0, top: 0 };
+		var horizontal = "center",
+			vertical = "center";
+		if (left > 0 && right === 0) horizontal = "right";
+		else if (right > 0 && left === 0) horizontal = "left";
+		if (top > 0 && bottom === 0) vertical = "bottomEnum";
+		else if (bottom > 0 && top === 0) vertical = "top";
+		var desc = new AD();
+		desc.putBoolean(s2t("relative"), true);
+		desc.putUnitDouble(s2t("width"), s2t("pixelsUnit"), left + right);
+		desc.putUnitDouble(s2t("height"), s2t("pixelsUnit"), top + bottom);
+		desc.putEnumerated(s2t("horizontal"), s2t("horizontalLocation"), s2t(horizontal));
+		desc.putEnumerated(s2t("vertical"), s2t("verticalLocation"), s2t(vertical));
+		desc.putEnumerated(s2t("canvasExtensionColorType"), s2t("canvasExtensionColorType"), s2t("white"));
+		executeAction(s2t("canvasSize"), desc, DialogModes.NO);
+		return { left: left, top: top };
 	};
 	this.imageSize = function (width, height) {
 		var desc = new AD();
