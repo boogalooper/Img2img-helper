@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.221",
+	VER = "0.222",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -2370,6 +2370,7 @@ function GenerationRuntime() {
 				// С этого момента результат принадлежит документу, и ошибки
 				// финализации не должны откатывать историю к initialState.
 				generationResultPlaced = true;
+				if (currentBackend == BACKEND_COMFY) api.cleanupComfyTemp(requestId);
 			} finally {
 				placementResultFile = null;
 				placementSelection = null;
@@ -5337,6 +5338,10 @@ function BridgeApi() {
 	};
 	this.interrupt = function (requestId) {
 		try { fire(makeCommand("interrupt", { request_id: requestId || "" }, requestId)); } catch (_) { }
+	};
+	this.cleanupComfyTemp = function (requestId) {
+		// Fire-and-forget: вызывается только после успешного placeResultHistory().
+		try { fire(makeCommand("cleanup_comfy_temp", { request_id: requestId || "" }, requestId)); } catch (_) { }
 	};
 	this.startGeneration = function (options) {
 		options = options || {};

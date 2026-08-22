@@ -45,7 +45,7 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.221"
+VERSION = "0.222"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -814,6 +814,7 @@ def _detect_comfy_folder(
     port: int,
     option: str,
     default_name: str,
+    explicit_child: str = "",
 ) -> Optional[Path]:
     if not is_local_comfy_host(host):
         return None
@@ -845,11 +846,15 @@ def _detect_comfy_folder(
     explicit = _cli_path(argv, option)
     if explicit:
         if explicit.is_absolute():
-            found = _existing_directory(explicit)
+            candidate = explicit / explicit_child if explicit_child else explicit
+            found = _existing_directory(candidate)
             if found:
                 return found
         for root in roots:
-            found = _existing_directory(root / explicit)
+            candidate = root / explicit
+            if explicit_child:
+                candidate = candidate / explicit_child
+            found = _existing_directory(candidate)
             if found:
                 return found
 
@@ -874,6 +879,17 @@ def detect_comfy_output_folder(
     port: int,
 ) -> Optional[Path]:
     return _detect_comfy_folder(stats, host, port, "--output-directory", "output")
+
+
+def detect_comfy_temp_folder(
+    stats: Optional[Dict[str, Any]],
+    host: str,
+    port: int,
+) -> Optional[Path]:
+    # ComfyUI treats --temp-directory as a base and creates its own temp child.
+    return _detect_comfy_folder(
+        stats, host, port, "--temp-directory", "temp", explicit_child="temp"
+    )
 
 
 def cleanup_stale_comfy_outputs(output_folder: Optional[Path]) -> None:
@@ -5770,6 +5786,7 @@ class RuntimeConfig:
     forge_port: int = 7860
     comfy_input_folder: Optional[Path] = None
     comfy_output_folder: Optional[Path] = None
+    comfy_temp_folder: Optional[Path] = None
     workflows_folder: Path = Path.home() / "Documents" / "Comfy Workflows"
     generation_timeout: int = 20 * 60
     idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS
@@ -5810,6 +5827,13 @@ BACKEND_MONITOR_START_LOCK = threading.Lock()
 BACKEND_MONITOR_STARTED = False
 # Локальные папки Comfy определяются один раз для каждого endpoint.
 COMFY_INPUT_FOLDER_ENDPOINT: Optional[Tuple[str, int]] = None
+
+# PreviewImage сохраняет файлы в общей ComfyUI\temp без request_id в имени.
+# Поэтому запоминаем только точные temp-файлы из history конкретного prompt и
+# удаляем их исключительно после отдельного подтверждения JSX о вставке слоя.
+DEFERRED_COMFY_TEMP_LOCK = threading.Lock()
+DEFERRED_COMFY_TEMP_FILES: "OrderedDict[str, List[Tuple[Path, int, int]]]" = OrderedDict()
+DEFERRED_COMFY_TEMP_MAX_REQUESTS = 32
 
 
 @contextmanager
@@ -6496,6 +6520,111 @@ def select_output_image(
     return image
 
 
+def collect_comfy_temp_images(history_entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return unique temp images produced by this exact ComfyUI prompt."""
+
+    outputs = history_entry.get("outputs", {})
+    if not isinstance(outputs, dict):
+        return []
+    result: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for node_output in outputs.values():
+        if not isinstance(node_output, dict):
+            continue
+        for value in node_output.values():
+            if not isinstance(value, list):
+                continue
+            for image in value:
+                if not isinstance(image, dict):
+                    continue
+                if str(image.get("type") or "output").lower() != "temp":
+                    continue
+                filename = str(image.get("filename") or "")
+                subfolder = str(image.get("subfolder") or "").replace("\\", "/").strip("/")
+                if not filename:
+                    continue
+                key = (filename, subfolder)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append({"filename": filename, "subfolder": subfolder, "type": "temp"})
+    return result
+
+
+def _comfy_temp_image_path(
+    temp_folder: Optional[Path], image: Dict[str, Any]
+) -> Optional[Path]:
+    root = _existing_directory(temp_folder)
+    if not root or str(image.get("type") or "").lower() != "temp":
+        return None
+    filename = str(image.get("filename") or "")
+    if not filename or "/" in filename or "\\" in filename:
+        return None
+    subfolder = str(image.get("subfolder") or "").replace("\\", "/").strip("/")
+    try:
+        base = root.resolve()
+        target = (base / subfolder / filename).resolve() if subfolder else (base / filename).resolve()
+        target.relative_to(base)
+    except (OSError, ValueError):
+        return None
+    return target if target.is_file() else None
+
+
+def defer_comfy_temp_cleanup(
+    request_id: str, temp_folder: Optional[Path], history_entry: Dict[str, Any]
+) -> None:
+    files: List[Tuple[Path, int, int]] = []
+    for image in collect_comfy_temp_images(history_entry):
+        target = _comfy_temp_image_path(temp_folder, image)
+        if target is None:
+            continue
+        try:
+            stat = target.stat()
+            files.append((target, int(stat.st_size), int(stat.st_mtime_ns)))
+        except OSError:
+            continue
+    if not files:
+        return
+    with DEFERRED_COMFY_TEMP_LOCK:
+        DEFERRED_COMFY_TEMP_FILES[str(request_id)] = files
+        DEFERRED_COMFY_TEMP_FILES.move_to_end(str(request_id))
+        while len(DEFERRED_COMFY_TEMP_FILES) > DEFERRED_COMFY_TEMP_MAX_REQUESTS:
+            DEFERRED_COMFY_TEMP_FILES.popitem(last=False)
+    LOGGER.info(
+        "Deferred %s ComfyUI temp file(s) until Photoshop placement: request=%s",
+        len(files),
+        request_id,
+    )
+
+
+def cleanup_deferred_comfy_temp(request_id: str) -> None:
+    with DEFERRED_COMFY_TEMP_LOCK:
+        files = DEFERRED_COMFY_TEMP_FILES.pop(str(request_id), [])
+    if not files:
+        return
+    removed = 0
+    for target, expected_size, expected_mtime_ns in files:
+        try:
+            stat = target.stat()
+            if int(stat.st_size) != expected_size or int(stat.st_mtime_ns) != expected_mtime_ns:
+                LOGGER.warning(
+                    "Skipped changed ComfyUI temp file after Photoshop placement: %s", target
+                )
+                continue
+            target.unlink(missing_ok=True)
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            LOGGER.warning("Could not delete ComfyUI temp file after Photoshop placement: %s", target)
+    LOGGER.info(
+        "ComfyUI temp cleanup after Photoshop placement: request=%s removed=%s/%s",
+        request_id,
+        removed,
+        len(files),
+    )
+
+
 def mark_request_cancelled(request_id: Optional[str]) -> str:
     requested = str(request_id or "")
     current = str(GENERATION.request_id or GENERATION.queued_request_id or "")
@@ -7161,6 +7290,10 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     if _comfy_request_output_path(destination, output_folder, request_id) is not None:
         GENERATION.preserved_output_path = destination
 
+    # PreviewImage может оставить type=temp в общей ComfyUI\temp. Запоминаем
+    # только точные файлы этого prompt; удаление произойдёт после Place в JSX.
+    defer_comfy_temp_cleanup(request_id, RUNTIME.comfy_temp_folder, history_entry)
+
     # Итоговый путь всегда отправляется после init/ACK.
     answer(
         {
@@ -7233,24 +7366,29 @@ def _probe_comfy_full(host: str, port: int, *, update_runtime: bool) -> Dict[str
         if update_runtime and COMFY_INPUT_FOLDER_ENDPOINT == endpoint:
             input_folder = RUNTIME.comfy_input_folder
             output_folder = RUNTIME.comfy_output_folder
+            temp_folder = RUNTIME.comfy_temp_folder
         else:
             input_folder = detect_comfy_input_folder(stats, host, int(port))
             output_folder = detect_comfy_output_folder(stats, host, int(port))
+            temp_folder = detect_comfy_temp_folder(stats, host, int(port))
         if update_runtime:
             RUNTIME.comfy_input_folder = input_folder
             RUNTIME.comfy_output_folder = output_folder
+            RUNTIME.comfy_temp_folder = temp_folder
             COMFY_INPUT_FOLDER_ENDPOINT = endpoint
             schedule_comfy_folder_cleanup(input_folder, output_folder)
         details = {
             "validated": True,
             "input_folder": str(input_folder or ""),
             "output_folder": str(output_folder or ""),
+            "temp_folder": str(temp_folder or ""),
         }
         return _backend_probe_result(available=True, details=details)
     except Exception:
         if update_runtime:
             RUNTIME.comfy_input_folder = None
             RUNTIME.comfy_output_folder = None
+            RUNTIME.comfy_temp_folder = None
             COMFY_INPUT_FOLDER_ENDPOINT = None
         return _backend_probe_result(available=False)
 
@@ -7277,6 +7415,7 @@ def _probe_comfy_regular(host: str, port: int, previous: Dict[str, Any], *,
         if update_runtime and not light.get("available"):
             invalidate_detected_comfy_input_folder()
             RUNTIME.comfy_output_folder = None
+            RUNTIME.comfy_temp_folder = None
         return light
     return _probe_comfy_full(host, port, update_runtime=update_runtime)
 
@@ -7441,6 +7580,7 @@ def _apply_comfy_runtime_status(
     if not comfy.get("available"):
         RUNTIME.comfy_input_folder = None
         RUNTIME.comfy_output_folder = None
+        RUNTIME.comfy_temp_folder = None
         COMFY_INPUT_FOLDER_ENDPOINT = None
         return
     details = comfy.get("details") or {}
@@ -7448,16 +7588,20 @@ def _apply_comfy_runtime_status(
         return
     input_value = str(details.get("input_folder") or "")
     output_value = str(details.get("output_folder") or "")
+    temp_value = str(details.get("temp_folder") or "")
     input_folder = Path(input_value) if input_value else None
     output_folder = Path(output_value) if output_value else None
+    temp_folder = Path(temp_value) if temp_value else None
     comfy_endpoint = (endpoints[0], endpoints[1])
     changed = (
         COMFY_INPUT_FOLDER_ENDPOINT != comfy_endpoint
         or RUNTIME.comfy_input_folder != input_folder
         or RUNTIME.comfy_output_folder != output_folder
+        or RUNTIME.comfy_temp_folder != temp_folder
     )
     RUNTIME.comfy_input_folder = input_folder
     RUNTIME.comfy_output_folder = output_folder
+    RUNTIME.comfy_temp_folder = temp_folder
     COMFY_INPUT_FOLDER_ENDPOINT = comfy_endpoint
     if changed:
         schedule_comfy_folder_cleanup(input_folder, output_folder)
@@ -7618,6 +7762,7 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     if endpoints_changed:
         invalidate_detected_comfy_input_folder()
         RUNTIME.comfy_output_folder = None
+        RUNTIME.comfy_temp_folder = None
     status_mode = str(message.get("backendStatusMode") or "cached").lower()
     verify_backend = str(message.get("verifyBackend") or "").strip().lower()
     tested_status = _take_backend_test_result(
@@ -7643,6 +7788,7 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         "forge_port": RUNTIME.forge_port,
         "comfy_input_folder": str(RUNTIME.comfy_input_folder or ""),
         "comfy_output_folder": str(RUNTIME.comfy_output_folder or ""),
+        "comfy_temp_folder": str(RUNTIME.comfy_temp_folder or ""),
         "workflows_folder": str(RUNTIME.workflows_folder),
         "generation_timeout": RUNTIME.generation_timeout,
         "idle_timeout_seconds": RUNTIME.idle_timeout_seconds,
@@ -7655,6 +7801,7 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "version": VERSION,
         "comfy_input_folder": str(RUNTIME.comfy_input_folder or ""),
+        "comfy_temp_folder": str(RUNTIME.comfy_temp_folder or ""),
         "mode": status.get("mode", "none"),
         "backends": status.get("backends", {}),
     }
@@ -7870,6 +8017,13 @@ def handle_command(command: Dict[str, Any]) -> None:
                 GENERATION.ack_event.set()
             return
 
+        if command_type == "cleanup_comfy_temp":
+            # Этот fire-and-forget приходит только после успешного Place в Photoshop.
+            cleanup_request_id = str(request_id or message.get("request_id") or "")
+            if cleanup_request_id:
+                cleanup_deferred_comfy_temp(cleanup_request_id)
+            return
+
         if command_type == "interrupt":
             interrupt_request_id = str(message.get("request_id") or request_id or "")
             cancel_current_generation(interrupt_request_id)
@@ -8030,6 +8184,8 @@ def load_runtime_file() -> None:
         RUNTIME.comfy_input_folder = Path(input_folder) if input_folder else None
         output_folder = str(data.get("comfy_output_folder") or "")
         RUNTIME.comfy_output_folder = Path(output_folder) if output_folder else None
+        temp_folder = str(data.get("comfy_temp_folder") or "")
+        RUNTIME.comfy_temp_folder = Path(temp_folder) if temp_folder else None
         folder = data.get("workflows_folder")
         if folder:
             RUNTIME.workflows_folder = Path(str(folder))
