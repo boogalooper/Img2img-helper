@@ -42,10 +42,11 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 API_HOST = "127.0.0.1"
 DEFAULT_COMFY_HOST = "127.0.0.1"
-API_RECEIVE_PORT = 6370   # На этом порту Python принимает команды JSX.
-API_REPLY_PORT = 6371     # На этот порт Python отправляет ответы JSX.
+API_RECEIVE_PORT = 6380   # На этом порту Python принимает команды JSX.
+API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.223"
+VERSION = "0.225"
+API_BUILD_ID = "0.225-translation-multibackend-runtime-id"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -378,7 +379,6 @@ def ensure_python_module(
     return module
 
 
-DEEP_TRANSLATOR_MODULE: Any = None
 PIL_IMAGE_MODULE: Any = None
 PIL_IMAGE_OPS_MODULE: Any = None
 WEBSOCKET_MODULE: Any = None
@@ -412,22 +412,12 @@ def prepare_required_modules() -> None:
 def prepare_optional_modules() -> None:
     """Prepare optional integrations after the core API becomes ready."""
 
-    global DEEP_TRANSLATOR_MODULE, WEBSOCKET_MODULE
+    global WEBSOCKET_MODULE
 
     # Optional packages install in this background worker and never replace the
     # already published ready status of the core API.
     OPTIONAL_MODULES_ACTIVE.set()
     try:
-        try:
-            DEEP_TRANSLATOR_MODULE = ensure_python_module(
-                "deep_translator",
-                "deep-translator",
-                publish_startup_status=False,
-            )
-        except Exception as exc:
-            DEEP_TRANSLATOR_MODULE = None
-            LOGGER.warning("deep-translator is unavailable; prompt translation is disabled: %s", exc)
-
         # WebSocket улучшает только определение момента начала sampling. Если его
         # установить не удалось, генерация сохраняет полностью рабочий HTTP-путь.
         try:
@@ -448,8 +438,7 @@ def prepare_optional_modules() -> None:
             )
 
         LOGGER.info(
-            "Optional Python modules prepared:%s%s",
-            ", deep-translator" if DEEP_TRANSLATOR_MODULE is not None else "",
+            "Optional Python modules prepared:%s",
             ", websocket-client" if WEBSOCKET_MODULE is not None else "",
         )
     finally:
@@ -546,8 +535,34 @@ def format_http_error_body(raw_body: str, limit: int = 12000) -> str:
     return formatted
 
 
+TRANSLATION_REQUEST_TIMEOUT_SECONDS = 6
+TRANSLATION_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/138.0.0.0 Safari/537.36"
+)
+TRANSLATION_STATE_FILE = STATE_DIR / "translation.json"
+TRANSLATION_STATE_LOCK = threading.Lock()
+# Порядок по умолчанию. После первого успешного запроса последний рабочий
+# сервер сохраняется в translation.json и ставится первым при следующем переводе.
+# Lingva выполняет запрос к Google со стороны своего сервера, поэтому помогает,
+# когда прямые Google endpoint'ы ограничили именно IP пользователя.
+TRANSLATION_SERVERS: Tuple[Tuple[str, str, str], ...] = (
+    ("google_clients5", "google_clients5", "https://clients5.google.com/translate_a/t"),
+    ("google_api", "google", "https://translate.googleapis.com/translate_a/single"),
+    ("google_web", "google", "https://translate.google.com/translate_a/single"),
+    ("lingva_plausibility", "lingva", "https://translate.plausibility.cloud"),
+    ("lingva_projectsegfau", "lingva", "https://translate.projectsegfau.lt"),
+    ("lingva_lunar", "lingva", "https://lingva.lunar.icu"),
+    ("lingva_jae", "lingva", "https://translate.jae.fi"),
+    ("mymemory", "mymemory", "https://api.mymemory.translated.net/get"),
+    ("libre_skitzen", "libre", "https://translate.api.skitzen.com/translate"),
+    ("libre_mentality", "libre", "https://translate.mentality.rip/translate"),
+)
+
+
 def is_translation_service_error(value: Any) -> bool:
-    """Detect an error page returned by the translator as ordinary text."""
+    """Detect an error page returned by a translator as ordinary text."""
 
     text = str(value or "").replace("\u2018", "'").replace("\u2019", "'").lower()
     text = re.sub(r"\s+", " ", text)
@@ -559,6 +574,390 @@ def is_translation_service_error(value: Any) -> bool:
     )
     return server_error and (status_error or retry_page)
 
+
+def _translation_text_from_payload(payload: Any) -> str:
+    """Extract translated text from known Google translate_a response shapes."""
+
+    if isinstance(payload, dict):
+        sentences = payload.get("sentences")
+        if isinstance(sentences, list):
+            parts = [
+                str(item.get("trans") or "")
+                for item in sentences
+                if isinstance(item, dict)
+            ]
+            return "".join(parts).strip()
+
+    if isinstance(payload, list) and payload and isinstance(payload[0], list):
+        parts: List[str] = []
+        for item in payload[0]:
+            if isinstance(item, list) and item and item[0] is not None:
+                parts.append(str(item[0]))
+        return "".join(parts).strip()
+
+    return ""
+
+
+def _decode_translation_response(response: Any) -> str:
+    raw = response.read()
+    charset = response.headers.get_content_charset() or "utf-8"
+    text = raw.decode(charset, errors="replace").strip()
+    if is_translation_service_error(text):
+        raise RuntimeError("server-error page")
+    return text
+
+
+def _google_translate_request(endpoint: str, source_text: str) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "client": "gtx",
+            "sl": "auto",
+            "tl": "en",
+            "dt": "t",
+            "dj": "1",
+            "q": source_text,
+        }
+    )
+    request = urllib.request.Request(
+        f"{endpoint}?{query}",
+        headers={
+            "User-Agent": TRANSLATION_USER_AGENT,
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+        text = _decode_translation_response(response)
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unexpected non-JSON response") from exc
+
+    translated = _translation_text_from_payload(payload)
+    if not translated:
+        raise RuntimeError("empty or unexpected response")
+    return translated
+
+
+def _google_clients5_translate_request(endpoint: str, source_text: str) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "client": "dict-chrome-ex",
+            "sl": "auto",
+            "tl": "en",
+            "q": source_text,
+        }
+    )
+    request = urllib.request.Request(
+        f"{endpoint}?{query}",
+        headers={
+            "User-Agent": TRANSLATION_USER_AGENT,
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://translate.google.com/",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+        text = _decode_translation_response(response)
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unexpected non-JSON response") from exc
+
+    translated = _translation_text_from_payload(payload)
+    if not translated and isinstance(payload, dict):
+        sentences = payload.get("sentences")
+        if isinstance(sentences, list):
+            translated = "".join(
+                str(item.get("trans") or "")
+                for item in sentences
+                if isinstance(item, dict)
+            ).strip()
+    if not translated:
+        raise RuntimeError("empty or unexpected response")
+    return translated
+
+
+def _lingva_translate_request(endpoint: str, source_text: str) -> str:
+    quoted = urllib.parse.quote(source_text, safe="")
+    request = urllib.request.Request(
+        endpoint.rstrip("/") + f"/api/v1/auto/en/{quoted}",
+        headers={
+            "User-Agent": TRANSLATION_USER_AGENT,
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+        text = _decode_translation_response(response)
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unexpected non-JSON response") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("unexpected JSON response")
+    translated = str(payload.get("translation") or "").strip()
+    if not translated:
+        raise RuntimeError(str(payload.get("error") or "empty or unexpected response"))
+    return translated
+
+
+def _guess_mymemory_source_language(source_text: str) -> str:
+    text = source_text.lower()
+    # MyMemory requires an explicit langpair. This fallback intentionally uses
+    # only high-confidence script clues; otherwise it is skipped rather than
+    # risking a translation from the wrong source language.
+    if re.search(r"[іїєґ]", text):
+        return "uk"
+    if "ў" in text:
+        return "be"
+    if re.search(r"[а-яё]", text):
+        return "ru"
+    if re.search(r"[ąćęłńóśźż]", text):
+        return "pl"
+    if re.search(r"[äöüß]", text):
+        return "de"
+    if re.search(r"[ñ¿¡]", text):
+        return "es"
+    return ""
+
+
+def _split_mymemory_segments(source_text: str, max_bytes: int = 450) -> List[str]:
+    words = re.split(r"(\s+)", source_text.strip())
+    segments: List[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        value = current.strip()
+        if value:
+            segments.append(value)
+        current = ""
+
+    for token in words:
+        if not token:
+            continue
+        candidate = current + token
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            current = candidate
+            continue
+        flush()
+        if len(token.encode("utf-8")) <= max_bytes:
+            current = token
+            continue
+        # Extremely long token: split safely by Unicode code point.
+        chunk = ""
+        for char in token:
+            if len((chunk + char).encode("utf-8")) > max_bytes:
+                if chunk:
+                    segments.append(chunk)
+                chunk = char
+            else:
+                chunk += char
+        current = chunk
+    flush()
+    return segments
+
+
+def _mymemory_translate_request(endpoint: str, source_text: str) -> str:
+    source_lang = _guess_mymemory_source_language(source_text)
+    if not source_lang:
+        raise RuntimeError("source language cannot be inferred safely")
+
+    translated_parts: List[str] = []
+    for segment in _split_mymemory_segments(source_text):
+        query = urllib.parse.urlencode(
+            {
+                "q": segment,
+                "langpair": f"{source_lang}|en",
+                "mt": "1",
+            }
+        )
+        request = urllib.request.Request(
+            f"{endpoint}?{query}",
+            headers={
+                "User-Agent": TRANSLATION_USER_AGENT,
+                "Accept": "application/json,text/plain,*/*",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+            text = _decode_translation_response(response)
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("unexpected non-JSON response") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("unexpected JSON response")
+        response_data = payload.get("responseData")
+        translated = (
+            str(response_data.get("translatedText") or "").strip()
+            if isinstance(response_data, dict)
+            else ""
+        )
+        if not translated:
+            detail = str(payload.get("responseDetails") or payload.get("message") or "").strip()
+            raise RuntimeError(detail or "empty or unexpected response")
+        translated_parts.append(translated)
+    if not translated_parts:
+        raise RuntimeError("empty or unexpected response")
+    return " ".join(translated_parts)
+
+
+def _libre_translate_request(endpoint: str, source_text: str) -> str:
+    body = json_dumps(
+        {
+            "q": source_text,
+            "source": "auto",
+            "target": "en",
+            "format": "text",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "User-Agent": TRANSLATION_USER_AGENT,
+            "Accept": "application/json,text/plain,*/*",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+        text = _decode_translation_response(response)
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unexpected non-JSON response") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("unexpected JSON response")
+    translated = payload.get("translatedText")
+    if isinstance(translated, list):
+        translated = "".join(str(item or "") for item in translated)
+    translated = str(translated or "").strip()
+    if not translated:
+        detail = str(payload.get("error") or "").strip()
+        raise RuntimeError(detail or "empty or unexpected response")
+    return translated
+
+
+def _load_translation_preferred_server() -> str:
+    with TRANSLATION_STATE_LOCK:
+        try:
+            payload = json.loads(TRANSLATION_STATE_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return ""
+    preferred = str(payload.get("preferred_server") or "") if isinstance(payload, dict) else ""
+    valid = {item[0] for item in TRANSLATION_SERVERS}
+    return preferred if preferred in valid else ""
+
+
+def _save_translation_preferred_server(server_id: str) -> None:
+    valid = {item[0] for item in TRANSLATION_SERVERS}
+    if server_id not in valid:
+        return
+    with TRANSLATION_STATE_LOCK:
+        try:
+            current = {}
+            if TRANSLATION_STATE_FILE.is_file():
+                current = json.loads(TRANSLATION_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(current, dict) and current.get("preferred_server") == server_id:
+                return
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+        payload = {
+            "preferred_server": server_id,
+            "updated_at": time.time(),
+        }
+        temp_path = TRANSLATION_STATE_FILE.with_name(
+            f".{TRANSLATION_STATE_FILE.name}.{os.getpid()}.tmp"
+        )
+        try:
+            TRANSLATION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, TRANSLATION_STATE_FILE)
+        except OSError as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            LOGGER.warning("Could not save preferred translation server: %s", exc)
+
+
+def _translation_server_order() -> List[Tuple[str, str, str]]:
+    preferred = _load_translation_preferred_server()
+    servers = list(TRANSLATION_SERVERS)
+    if preferred:
+        servers.sort(key=lambda item: 0 if item[0] == preferred else 1)
+    return servers
+
+
+def translate_prompt_to_english(source_text: str) -> str:
+    """Translate to English, remembering the last working server as first choice."""
+
+    failures: List[str] = []
+    servers = _translation_server_order()
+    LOGGER.info(
+        "Prompt translation server order: %s",
+        ", ".join(item[0] for item in servers),
+    )
+
+    for server_id, kind, endpoint in servers:
+        host = urllib.parse.urlparse(endpoint).netloc or endpoint
+        try:
+            if kind == "google":
+                translated = _google_translate_request(endpoint, source_text)
+            elif kind == "google_clients5":
+                translated = _google_clients5_translate_request(endpoint, source_text)
+            elif kind == "lingva":
+                translated = _lingva_translate_request(endpoint, source_text)
+            elif kind == "mymemory":
+                translated = _mymemory_translate_request(endpoint, source_text)
+            elif kind == "libre":
+                translated = _libre_translate_request(endpoint, source_text)
+            else:
+                raise RuntimeError(f"unsupported translator kind: {kind}")
+
+            _save_translation_preferred_server(server_id)
+            LOGGER.info(
+                "Prompt translation succeeded: server=%s host=%s chars=%s",
+                server_id,
+                host,
+                len(source_text),
+            )
+            return translated
+        except urllib.error.HTTPError as exc:
+            failures.append(f"{server_id}: HTTP {exc.code}")
+            LOGGER.warning(
+                "Prompt translation HTTP error: server=%s host=%s status=%s",
+                server_id,
+                host,
+                exc.code,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+            failures.append(f"{server_id}: {exc}")
+            LOGGER.warning(
+                "Prompt translation request failed: server=%s host=%s error=%s",
+                server_id,
+                host,
+                exc,
+            )
+
+    detail = "; ".join(failures) or "all translation servers failed"
+    raise UserVisibleError(
+        detail,
+        "translate_failed",
+        [detail],
+    )
 
 def normalize_output_format(value: Any) -> str:
     text = str(value or "").strip().lower()
@@ -7829,6 +8228,11 @@ def handle_command(command: Dict[str, Any]) -> None:
             startup = startup_status_snapshot()
             answer({
                 "protocol": API_PROTOCOL,
+                "build_id": API_BUILD_ID,
+                "version": VERSION,
+                "script_path": str(Path(__file__).resolve()),
+                "receive_port": API_RECEIVE_PORT,
+                "reply_port": API_REPLY_PORT,
                 "startup_status": str(startup.get("status") or "starting"),
                 "startup_message": str(startup.get("message") or ""),
                 "startup_log_file": str(startup.get("log_file") or LOG_FILE),
@@ -7842,6 +8246,17 @@ def handle_command(command: Dict[str, Any]) -> None:
                         pass
                 except OSError:
                     pass
+            return
+
+        if command_type == "shutdown":
+            answer({"stopping": True, "build_id": API_BUILD_ID}, request_id)
+            WORKER_STOP.set()
+            BACKEND_MONITOR_WAKE.set()
+            try:
+                with socket.create_connection((API_HOST, API_RECEIVE_PORT), timeout=1):
+                    pass
+            except OSError:
+                pass
             return
 
         startup = startup_status_snapshot()
@@ -7957,17 +8372,10 @@ def handle_command(command: Dict[str, Any]) -> None:
             if not source_text:
                 answer("", request_id)
                 return
-            translation_module = DEEP_TRANSLATOR_MODULE
-            if translation_module is None:
-                raise UserVisibleError(
-                    "Prompt translation is unavailable because deep-translator could not be loaded. "
-                    f"Details: {LOG_FILE}",
-                    "translator_unavailable",
-                )
             try:
-                translated = translation_module.GoogleTranslator(
-                    source="auto", target="english"
-                ).translate(source_text)
+                translated = translate_prompt_to_english(source_text)
+            except UserVisibleError:
+                raise
             except Exception as exc:
                 LOGGER.exception("Prompt translation error")
                 raise UserVisibleError(
@@ -7975,13 +8383,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                     "translate_failed",
                     [exc],
                 ) from exc
-            if is_translation_service_error(translated):
-                LOGGER.warning("Translation service returned an error page instead of translated text")
-                raise UserVisibleError(
-                    "Translation service returned a server error. Please try again later.",
-                    "translation_service_error",
-                )
-            answer(str(translated or ""), request_id)
+            answer(translated, request_id)
             return
 
         if command_type in {"generate", "forge_generate"}:

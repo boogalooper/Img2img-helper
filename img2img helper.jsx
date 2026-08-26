@@ -32,14 +32,15 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.223",
+	VER = "0.225",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
 	API_HOST = "127.0.0.1",
-	API_PORT_SEND = 6370,
-	API_PORT_LISTEN = 6371,
+	API_PORT_SEND = 6380,
+	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
+	API_BUILD_ID = "0.225-translation-multibackend-runtime-id",
 	// На запуск Python и установку зависимостей даётся две минуты.
 	START_TIMEOUT = 2 * 60 * 1000,
 	SHORT_TIMEOUT = 8000,
@@ -5247,9 +5248,21 @@ function BridgeApi() {
 				running = false;
 			}
 			if (running) {
-				validatePythonProtocol(runningInfo);
-				progress = waitForPythonReady(runningInfo, progress, deadline);
-				return true;
+				// Совместимый, но устаревший img2img helper сам завершаем перед
+				// запуском новой версии. Это позволяет обновлять .pyw без ручного
+				// поиска зависшего Python-процесса и без постоянной смены портов.
+				if (String(runningInfo && runningInfo.protocol) == String(API_PROTOCOL) &&
+					String(runningInfo && runningInfo.build_id || "") != String(API_BUILD_ID)) {
+					try { call("shutdown", null, SHORT_TIMEOUT, progress); } catch (_) { }
+					var stopDeadline = (new Date()).getTime() + 3000;
+					while (self.isRunning() && (new Date()).getTime() < stopDeadline) $.sleep(50);
+					if (self.isRunning()) validatePythonProtocol(runningInfo);
+					running = false; runningInfo = null;
+				} else {
+					validatePythonProtocol(runningInfo);
+					progress = waitForPythonReady(runningInfo, progress, deadline);
+					return true;
+				}
 			}
 		}
 		var pythonFile = findPythonModule();
@@ -5533,6 +5546,10 @@ function BridgeApi() {
 		if (String(info && info.protocol) != String(API_PROTOCOL))
 			throw new Error(localize(str.errApiProtocolA) + (info ? info.protocol : "") +
 				localize(str.errApiProtocolB) + API_PROTOCOL + ".");
+		if (String(info && info.build_id || "") != String(API_BUILD_ID))
+			throw new Error("Another or outdated img2img helper Python API is running on port " +
+				API_PORT_SEND + ". Expected build " + API_BUILD_ID + ", received " +
+				String(info && info.build_id || "unknown") + ".");
 	}
 	function ensureStartupProgress(progress) {
 		if (progress) return progress;
