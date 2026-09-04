@@ -1,4 +1,4 @@
-#target photoshop
+﻿#target photoshop
 /*
 // BEGIN__HARVEST_EXCEPTION_ZSTRING
 <javascriptresource>
@@ -101,12 +101,16 @@ var APP = {
 	globalSettings = null,
 	settingsReady = false,
 	keyboardState = ScriptUI.environment.keyboardState;
-// ТОЧКА ВХОДА: Shift открывает окно только для текущего запуска.
+// ТОЧКА ВХОДА: Shift открывает окно только при обычном запуске, не из Action.
 try { init(); }
 catch (e) {
 	if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
 	if (isUserCancellation(e)) {
 		isCancelled = true;
+	} else if (isSilentActionPlayback()) {
+		// Не поглощаем ошибку: Photoshop должен остановить Action как ошибочный шаг.
+		isCancelled = false;
+		throw e;
 	} else {
 		// После placeResult не повторяем сохранение при ошибке финализации.
 		var settingsSaveError = generationResultPlaced ? "" : action.saveAfterError(),
@@ -116,7 +120,7 @@ catch (e) {
 			"\n" + settingsSaveError;
 		messages.error(errorText, APP.name);
 		isCancelled = false;
-		$.setenv(APP.dialogEnvKey, "true");
+		setDialogEnvironment("true");
 	}
 }
 finally {
@@ -129,16 +133,30 @@ function restoreInitialDocumentState() {
 	try { app.activeDocument.activeHistoryState = initialState; }
 	catch (_) { }
 }
+// dialogEnvKey хранит только режим обычных запусков. Action имеет собственный
+// флаг Photoshop playbackDisplayDialogs и не должен менять это состояние.
+function setDialogEnvironment(value) {
+	if (!actionPlaybackMode) $.setenv(APP.dialogEnvKey, String(value));
+}
+// Action с выключенным значком диалога Photoshop является строго неинтерактивным.
+function isSilentActionPlayback() {
+	return actionPlaybackMode && app.playbackDisplayDialogs != DialogModes.ALL;
+}
 // Загружает настройки из DESC или Action, проверяет выделение и backend,
 // затем либо открывает интерфейс, либо запускает генерацию в тихом режиме.
 function init() {
-	if (!app.documents.length) return;
+	// Определяем Action до любых проверок документа: даже ранняя ошибка
+	// не должна затронуть состояние dialogEnvKey обычных запусков.
+	actionPlaybackMode = action.isPlayback();
+	if (!app.documents.length) {
+		if (isSilentActionPlayback()) throw new Error(str.errNoDocument);
+		return;
+	}
 	initialState = app.activeDocument.activeHistoryState;
 	if (doc.getProperty("mode").value != "RGBColor") throw new Error(str.errMode);
 	var playbackCount = action.getPlaybackParameterCount(),
 		settingsWarnings = [];
-	actionPlaybackMode = action.isPlayback();
-	var forceDialog = keyboardState.shiftKey || (!actionPlaybackMode && action.hasInterfaceArgument());
+	var forceDialog = !actionPlaybackMode && (keyboardState.shiftKey || action.hasInterfaceArgument());
 	if (actionPlaybackMode) {
 		var actionSettingsMode = action.getRecordedSettingsMode();
 		if (actionSettingsMode === false) {
@@ -160,16 +178,19 @@ function init() {
 		settingsWarnings = settingsWarnings.concat(cfg.consumeLoadWarnings());
 		// Внешний запуск Photoshop может передать один playback-параметр, не являясь Action.
 		// Такой запуск всегда должен открыть интерфейс, даже если прошлый запуск был тихим.
-		if (playbackCount == 1) $.setenv(APP.dialogEnvKey, "true");
+		if (playbackCount == 1) setDialogEnvironment("true");
 	}
 	settingsReady = true;
 	cfg.cleanReferenceHistory();
-	var environmentMode = DEBUG_FIRST_LAUNCH_WITH_INTERFACE ? null : $.getenv(APP.dialogEnvKey),
-		// После ошибки dialog-флаг открывает следующий запуск также внутри Action.
-		// Пользовательская отмена не изменяет сохранённый режим окна.
-		showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
-			? forceDialog || environmentMode == "true" || app.playbackDisplayDialogs == DialogModes.ALL
-			: forceDialog || environmentMode == "true" || environmentMode == null);
+	var environmentMode = (!actionPlaybackMode && !DEBUG_FIRST_LAUNCH_WITH_INTERFACE)
+			? $.getenv(APP.dialogEnvKey)
+			: null,
+		// Action полностью управляется собственным значком диалога Photoshop.
+		// DEBUG/Shift/dialogEnvKey не могут открыть UI у silent Action.
+		showInterface = actionPlaybackMode
+			? !isSilentActionPlayback()
+			: DEBUG_FIRST_LAUNCH_WITH_INTERFACE || forceDialog ||
+				environmentMode == "true" || environmentMode == null;
 	var selection = {
 		result: false,
 		bounds: null,
@@ -179,7 +200,10 @@ function init() {
 		inpaint: false
 	};
 	app.activeDocument.suspendHistory(localize(str.historyCheckSelection), "checkSelection(selection)");
-	if (!selection.result) return;
+	if (!selection.result) {
+		if (isSilentActionPlayback()) throw new Error(str.errNoSelection);
+		return;
+	}
 	try {
 		// TCP-check определяет, нужен ли прогресс запуска.
 		var apiRunning = api.isRunning();
@@ -233,8 +257,9 @@ function init() {
 		initial.notices = settingsWarnings.concat(initial.notices instanceof Array ? initial.notices : []);
 		if (backendChangedAtStartup || initial.forceDialog || initial.notices.length ||
 			(initial.emptyDropdownIds instanceof Array && initial.emptyDropdownIds.length)) {
+			if (isSilentActionPlayback()) throw new Error(initialActionErrorText(initial));
 			showInterface = true;
-			$.setenv(APP.dialogEnvKey, "true");
+			setDialogEnvironment("true");
 		}
 		// Если тихий запуск сам потребовал UI, загружаем полный список.
 		// При изначально видимом UI быстрый каталог может использовать только Forge.
@@ -264,29 +289,34 @@ function init() {
 			if (!res || res.cancelled) {
 				if (res && res.saveSettings) action.saveAcceptedSettings();
 				else if (!actionPlaybackMode) cfg.save();
-				$.setenv(APP.dialogEnvKey, "true");
+				setDialogEnvironment("true");
 				isCancelled = true;
 				return;
 			}
 			action.saveAcceptedSettings();
 			generation.run(selection, res.schema, res.values);
-			$.setenv(APP.dialogEnvKey, "false");
+			setDialogEnvironment("false");
 			return;
 		}
-		if (!initial.schema) return;
+		if (!initial.schema) {
+			if (isSilentActionPlayback()) throw new Error(initialActionErrorText(initial));
+			return;
+		}
 		var silentProfile = backend.schemaProfile(initial.schema),
 			silentValues = backend.profileValues(initial.schema, silentProfile);
 		if (!actionPlaybackMode) cfg.saveToAction();
 		try {
 			generation.run(selection, initial.schema, silentValues);
-			$.setenv(APP.dialogEnvKey, "false");
+			setDialogEnvironment("false");
 		} catch (silentGenerationError) {
 			if (isUserCancellation(silentGenerationError))
+				throw silentGenerationError;
+			if (isSilentActionPlayback())
 				throw silentGenerationError;
 			// GenerationRuntime may temporarily change layers and channels. Restore
 			// the document before presenting controls for a corrected retry.
 			restoreInitialDocumentState();
-			$.setenv(APP.dialogEnvKey, "true");
+			setDialogEnvironment("true");
 			var generationNotice = {
 				key: "silent-generation-error:" + errorMessageText(silentGenerationError),
 				level: "error",
@@ -314,7 +344,7 @@ function init() {
 			}
 			action.saveAcceptedSettings();
 			generation.run(selection, retryResult.schema, retryResult.values);
-			$.setenv(APP.dialogEnvKey, "false");
+			setDialogEnvironment("false");
 		}
 	} finally {
 		if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
@@ -346,6 +376,30 @@ function isUserCancellation(value) {
 	var message = errorMessageText(value).replace(/^\s+|\s+$/g, "");
 	if (message == APP.cancelToken) return true;
 	return /^(?:error:\s*)?(?:user (?:cancelled|canceled)(?: the operation)?|operation (?:cancelled|canceled))[.!]?$/i.test(message);
+}
+function initialActionErrorText(initial) {
+	initial = initial && typeof initial == "object" ? initial : {};
+	var parts = [], seen = {}, i,
+		notices = initial.notices instanceof Array ? initial.notices : [],
+		diagnostics = initial.schema && initial.schema.diagnostics instanceof Array
+			? initial.schema.diagnostics : [];
+	function add(text) {
+		text = String(text || "").replace(/^\s+|\s+$/g, "");
+		if (!text || seen[text]) return;
+		seen[text] = true;
+		parts.push(text);
+	}
+	for (i = 0; i < notices.length; i++) add(errorMessageText(notices[i]));
+	for (i = 0; i < diagnostics.length; i++) add(workflowDiagnosticText(diagnostics[i]));
+	if (!initial.schema) {
+		if (cfg.activeBackend == BACKEND_FORGE)
+			add(backend.forgeFolderReady() ? str.infoEmptyForgePresets : str.infoMissingForgeSchemaFolder);
+		else
+			add(backend.comfyFolderReady() ? str.infoEmptyWorkflowFolder : str.infoMissingWorkflowFolder);
+	}
+	if (initial.schema && !initial.schema.valid && !parts.length) add(str.errWorkflowInvalid);
+	if (!parts.length) add(str.errWorkflowInvalid);
+	return parts.join("\n\n");
 }
 function workflowDiagnosticText(item) {
 	item = item && typeof item == "object" ? item : {};
@@ -429,6 +483,7 @@ function forgeSchemaId(schema) {
 }
 // ГЛАВНОЕ ОКНО: state хранит данные динамической области.
 function mainDialog(selection, initial, responseSeconds) {
+	if (isSilentActionPlayback()) throw new Error(initialActionErrorText(initial));
 	var selectionBounds = selection.bounds,
 		state = {
 			backend: initial.backend || cfg.activeBackend,
@@ -538,7 +593,7 @@ function mainDialog(selection, initial, responseSeconds) {
 	};
 	w.onClose = function () {
 		if (!state.result) {
-			saveCurrentValues(); $.setenv(APP.dialogEnvKey, "true");
+			saveCurrentValues(); setDialogEnvironment("true");
 			state.result = { cancelled: true, saveSettings: true };
 		}
 		return true;
@@ -6575,6 +6630,8 @@ function Locale() {
 		errApiProtocolB: ["). Ожидается версия ", "). Expected protocol: "], errEmptyApiAnswer: ["Пустой ответ Python API.", "Empty response from Python API."],
 		errListenerPort: ["Не удалось открыть listener-порт ", "Cannot open listener port "],
 		errMode: [APP.name + " работает только с RGB-документами.", APP.name + " works only with RGB documents."],
+		errNoDocument: ["Нет открытого документа.", "No document is open."],
+		errNoSelection: ["Не найдено активное выделение или подходящий слой предыдущего результата.", "No active selection or suitable previous-result layer was found."],
 		errSelectionTooSmall: ["Выделение или документ слишком малы. Минимальный размер каждой стороны:", "The selection or document is too small. Minimum size for each side:"],
 		errNoResult: ["Бэкенд не вернул результат.", "The backend returned no result."],
 		errPlacedBounds: ["Не удалось определить размер вставленного слоя.", "Could not determine placed layer bounds."],
