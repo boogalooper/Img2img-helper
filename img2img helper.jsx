@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.227",
+	VER = "0.231",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -186,6 +186,7 @@ function init() {
 			settingsWarnings = settingsWarnings.concat(globalSettings.consumeLoadWarnings());
 			cfg.copySharedLibrariesFrom(globalSettings);
 			cfg.copyPythonRuntimeSettingsFrom(globalSettings);
+			cfg.copyGlobalPreferencesFrom(globalSettings);
 		}
 	} else {
 		cfg.load();
@@ -1867,7 +1868,7 @@ function showGlobalSettings(connectionRecovery) {
 	var temp = cloneObj(cfg.data),
 		w = ui.createDialog({ title: str.scriptSettings, spacing: 10, margins: 14 }),
 		connection = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
-	connection.text = str.connectionSettings;
+	connection.text = str.globalSettings;
 	var connectionRows = ui.addFormRows(connection, [
 			{
 				id: "status", type: "static", label: str.detectedBackends, value: backend.statusLabel(),
@@ -1903,9 +1904,8 @@ function showGlobalSettings(connectionRecovery) {
 	forgeBrowse.onClick = function () { var folder = Folder.selectDialog(str.selectForgeSchemaFolder); if (folder) forgeFolderEdit.text = folder.fsName; };
 	var pythonIdleSeconds = parseInt(temp.pythonIdleTimeout, 10);
 	if (isNaN(pythonIdleSeconds)) pythonIdleSeconds = 15 * 60;
-	var pythonServer = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
-	pythonServer.text = str.pythonServerSettings;
-	var pythonRows = ui.addFormRows(pythonServer, [
+	var pythonRows = ui.addFormRows(connection, [
+			{ id: "timeout", label: str.generationTimeout, value: String(temp.generationTimeout), labelWidth: 220, controlWidth: 65 },
 			{
 				id: "version", type: "static", label: str.pythonApiVersion,
 				value: backend.pythonVersion() ? "v" + backend.pythonVersion() : "—",
@@ -1922,6 +1922,7 @@ function showGlobalSettings(connectionRecovery) {
 				labelWidth: 220, controlWidth: 65
 			}
 		], ui.settingsControlWidth),
+		timeout = pythonRows.timeout.control,
 		pythonIdleTimeout = pythonRows.idleTimeout.control,
 		backendMonitorInterval = pythonRows.monitorInterval.control;
 	function updateBackendFields() {
@@ -1951,9 +1952,11 @@ function showGlobalSettings(connectionRecovery) {
 	};
 	var resize = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
 	resize.text = str.resizePresetManagement;
+	resize.helpTip = str.userSettingsHint;
 	var resizeEditor = resizePresetEditor(resize, temp);
 	var output = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
 	output.text = str.imageSettings;
+	output.helpTip = str.userSettingsHint;
 	var outputFields = ui.addCheckboxes(output, [
 			{ id: "flatten", text: str.flatten, value: temp.flatten },
 			{ id: "rasterize", text: str.rasterize, value: temp.rasterizeImage },
@@ -1964,6 +1967,7 @@ function showGlobalSettings(connectionRecovery) {
 		keepAspectRatio = outputFields.keepAspectRatio;
 	var brush = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
 	brush.text = str.brushSettings;
+	brush.helpTip = str.userSettingsHint;
 	var brushFields = ui.addCheckboxes(brush, [{ id: "selectBrush", text: str.selectBrush, value: temp.selectBrush }]),
 		selectBrush = brushFields.selectBrush,
 		opacityControl = ui.addSlider(brush, str.opacity, 1, 100, temp.brushOpacity, { displayValue: temp.brushOpacity, controlWidth: ui.settingsControlWidth }),
@@ -1979,11 +1983,7 @@ function showGlobalSettings(connectionRecovery) {
 			{ id: "metadata", text: str.layerMetadata, value: temp.writeLayerMetadata }
 		]),
 		recordSettings = generalFields.recordSettings,
-		metadata = generalFields.metadata,
-		timeoutFields = ui.addFormRows(w, [{
-			id: "timeout", label: str.generationTimeout, value: String(temp.generationTimeout), labelWidth: 220, controlWidth: 65
-		}]),
-		timeout = timeoutFields.timeout.control;
+		metadata = generalFields.metadata;
 	function resizePresetEditor(parent, tempCfg) {
 		if (!tempCfg.resizePresets || !tempCfg.resizePresets.length) tempCfg.resizePresets = cloneObj(presets.defaultResize());
 		var toolbar = ui.addPresetToolbar(parent, ui.settingsControlWidth, str.presetRestore),
@@ -2784,6 +2784,7 @@ function ActionRuntime() {
 		if (!globalSettings) return;
 		cfg.copySharedLibrariesTo(globalSettings);
 		cfg.copyPythonRuntimeSettingsTo(globalSettings);
+		cfg.copyGlobalPreferencesTo(globalSettings);
 		cfg.copyPromptUndoTo(globalSettings);
 		globalSettings.save();
 	}
@@ -5836,6 +5837,16 @@ function Config() {
 	var self = this,
 		loadWarnings = [],
 		recoveredFromBackup = false,
+		globalPreferenceKeys = [
+			"backendHost", "comfyPort", "forgePort", "workflowsFolder",
+			"forgeSchemasFolder", "generationTimeout", "writeLayerMetadata"
+		],
+		pythonRuntimeKeys = ["pythonIdleTimeout", "backendMonitorInterval"],
+		actionExcludedKeys = globalPreferenceKeys.concat(pythonRuntimeKeys, [
+			"promptPresets", "promptUndo", "referenceHistory",
+			"workflowCatalog", "forgeCatalog", "descSaveCount"
+		]),
+		actionExcluded = {},
 		keys = [
 			"backendHost", "activeBackend", "comfyPort", "forgePort", "workflowsFolder", "forgeSchemasFolder", "selectedWorkflow", "selectedForgePreset",
 			"autoResize", "sizeMultiple", "resizePresets",
@@ -5843,6 +5854,8 @@ function Config() {
 			"selectBrush", "brushOpacity", "generationTimeout", "pythonIdleTimeout", "backendMonitorInterval", "workflowProfiles", "forgeProfiles",
 			"workflowCatalog", "forgeCatalog", "referenceHistory", "promptPresets", "promptUndo", "descSaveCount"
 		];
+	for (var excludedIndex = 0; excludedIndex < actionExcludedKeys.length; excludedIndex++)
+		actionExcluded[actionExcludedKeys[excludedIndex]] = true;
 	this.data = defaultData();
 	this.bindProperties = function () {
 		for (var i = 0; i < keys.length; i++) this[keys[i]] = this.data[keys[i]];
@@ -5996,18 +6009,11 @@ function Config() {
 			recordSettingsToAction: !!self.recordSettingsToAction
 		};
 		if (!self.recordSettingsToAction) return res;
-		res = cloneObj(self.data);
+		// Исключаем глобальные данные ДО глубокого копирования каталогов.
+		res = {};
+		for (var key in self.data) if (self.data.hasOwnProperty(key) && !actionExcluded.hasOwnProperty(key))
+			res[key] = cloneObj(self.data[key]);
 		res.actionDataVersion = 1;
-		// Эти данные являются общими для DESC и всех Actions либо всегда
-		// восстанавливаются из актуального backend. Не записываем их в шаг Action.
-		delete res.promptPresets;
-		delete res.promptUndo;
-		delete res.referenceHistory;
-		delete res.workflowCatalog;
-		delete res.forgeCatalog;
-		delete res.descSaveCount;
-		delete res.pythonIdleTimeout;
-		delete res.backendMonitorInterval;
 		return res;
 	}
 	function settingsFile(suffix) {
@@ -6281,15 +6287,25 @@ function Config() {
 		if (typeof value.negative == "string") res.negative = value.negative;
 		return res;
 	}
+	// Списки полей также используются при исключении данных из Action.
+	function copySettingsFields(source, target, fieldNames) {
+		if (!source || !target) return;
+		for (var i = 0; i < fieldNames.length; i++) {
+			var key = fieldNames[i];
+			target[key] = target.data[key] = source[key];
+		}
+	}
+	this.copyGlobalPreferencesFrom = function (sourceConfig) {
+		copySettingsFields(sourceConfig, self, globalPreferenceKeys);
+	};
+	this.copyGlobalPreferencesTo = function (targetConfig) {
+		copySettingsFields(self, targetConfig, globalPreferenceKeys);
+	};
 	this.copyPythonRuntimeSettingsFrom = function (sourceConfig) {
-		if (!sourceConfig) return;
-		self.pythonIdleTimeout = self.data.pythonIdleTimeout = sourceConfig.pythonIdleTimeout;
-		self.backendMonitorInterval = self.data.backendMonitorInterval = sourceConfig.backendMonitorInterval;
+		copySettingsFields(sourceConfig, self, pythonRuntimeKeys);
 	};
 	this.copyPythonRuntimeSettingsTo = function (targetConfig) {
-		if (!targetConfig) return;
-		targetConfig.pythonIdleTimeout = targetConfig.data.pythonIdleTimeout = self.pythonIdleTimeout;
-		targetConfig.backendMonitorInterval = targetConfig.data.backendMonitorInterval = self.backendMonitorInterval;
+		copySettingsFields(self, targetConfig, pythonRuntimeKeys);
 	};
 	this.setWorkflowCatalog = function (items) {
 		self.workflowCatalog = self.data.workflowCatalog = items || [];
@@ -6628,7 +6644,7 @@ function Locale() {
 		all: ["Все", "All"], recordSettingsToAction: ["Записывать настройки в экшен", "Record settings to action"], automatic: ["Автоматически", "Automatic"],
 		selectionMissingFallback: ["ранее выбранный вариант не найден; используется ", "previously selected item was not found; using "],
 		autoResize: ["Автомасштаб", "Auto resize"], brushSettings: ["Настройки кисти", "Brush settings"], browse: ["Обзор…", "Browse…"],
-		connectionSettings: ["Подключение", "Connection"], pythonServerSettings: ["Python-сервер", "Python server"],
+		globalSettings: ["Глобальные настройки", "Global settings"],
 		pythonApiVersion: ["Версия Python API:", "Python API version:"],
 		pythonIdleTimeout: ["Остановка после простоя, мин (0 — выкл.):", "Stop after idle, min (0 = off):"],
 		backendMonitorInterval: ["Проверка бэкендов в фоне, с:", "Background backend check, s:"],
@@ -6855,6 +6871,7 @@ function Locale() {
 		infoMissingForgeSchemaFolder: ["Папка JSON-схем Forge не выбрана или не найдена. Нажмите ⚙ и выберите папку со схемами.", "The Forge JSON schema folder is not selected or cannot be found. Click ⚙ and select the schema folder."],
 		detectedBackends: ["Доступные бэкенды:", "Available backends:"], detectBackends: ["Найти запущенные бэкенды", "Detect running backends"],
 		backendsNone: ["не найдены", "none detected"],
+		userSettingsHint: ["Эти параметры сохраняются в экшене, если включена запись настроек. Иначе используются текущие настройки скрипта.", "These parameters are stored in the action when settings recording is enabled. Otherwise, the current script settings are used."],
 		openSettings: ["Открыть настройки", "Open settings"],
 		backendRecoveryHint: ["Можно открыть настройки и указать IP-адрес или имя компьютера с Forge / ComfyUI и порт. После сохранения повторите запуск скрипта.", "Open settings to enter the IP address or computer name and port of Forge / ComfyUI. After saving, run the script again."],
 		errNoBackendAvailable: ["Не найден запущенный ComfyUI или Forge Neo. Запустите хотя бы одну оболочку и повторите запуск скрипта.", "No running ComfyUI or Forge Neo instance was detected. Start at least one backend and run the script again."],
