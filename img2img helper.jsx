@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.225",
+	VER = "0.227",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -118,7 +118,16 @@ catch (e) {
 				(e.line ? "\n\n" + str.jsxLine + e.line : "");
 		if (settingsSaveError) errorText += "\n\n" + str.errSettingsSaveAfterError +
 			"\n" + settingsSaveError;
-		messages.error(errorText, APP.name);
+		var errorDialogResult = messages.error(
+			errorText + (e.backendStartupUnavailable ? "\n\n" + str.backendRecoveryHint : ""),
+			APP.name, !!e.backendStartupUnavailable
+		);
+		if (errorDialogResult === "openSettings") {
+			try {
+				var recoverySettings = showGlobalSettings(true);
+				if (recoverySettings.accepted) action.saveAcceptedSettings();
+			} catch (settingsError) { messages.error(settingsError, APP.name); }
+		}
 		isCancelled = false;
 		setDialogEnvironment("true");
 	}
@@ -128,6 +137,11 @@ finally {
 	restoreInitialDocumentState();
 }
 isCancelled ? "cancel" : undefined;
+function backendStartupError(message) {
+	var error = new Error(message);
+	error.backendStartupUnavailable = true;
+	return error;
+}
 function restoreInitialDocumentState() {
 	if (generationResultPlaced || !initialState || !app.documents.length) return;
 	try { app.activeDocument.activeHistoryState = initialState; }
@@ -237,12 +251,12 @@ function init() {
 		// Тихий запуск и Action не подменяют выбранный backend.
 		if (showInterface) {
 			if (actionPlaybackMode && actionUsesRecordedSettings) {
-				if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
+				if (!backend.isAvailable(cfg.activeBackend)) throw backendStartupError(str.errBackendUnavailable);
 			} else {
 				backendChangedAtStartup = backend.normalizeActiveBackend();
-				if (!backend.hasAvailable()) throw new Error(str.errNoBackendAvailable);
+				if (!backend.hasAvailable()) throw backendStartupError(str.errNoBackendAvailable);
 			}
-		} else if (!backend.isAvailable(cfg.activeBackend)) throw new Error(str.errBackendUnavailable);
+		} else if (!backend.isAvailable(cfg.activeBackend)) throw backendStartupError(str.errBackendUnavailable);
 		// Видимый UI Comfy всегда обновляет список workflow. Сохранённый каталог
 		// остаётся быстрым путём для тихого запуска, включая Action без диалога.
 		var interfaceRequestedAtStartup = showInterface,
@@ -1846,271 +1860,272 @@ function mainDialog(selection, initial, responseSeconds) {
 	function candidateId(dropdown) {
 		return dropdown && dropdown.selection ? dropdown.selection.candidateId : "";
 	}
-	// ГЛОБАЛЬНЫЕ НАСТРОЙКИ: cfg изменяется только после Save.
-	function showGlobalSettings() {
-		var temp = cloneObj(cfg.data),
-			w = ui.createDialog({ title: str.scriptSettings, spacing: 10, margins: 14 }),
-			connection = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
-		connection.text = str.connectionSettings;
-		var connectionRows = ui.addFormRows(connection, [
-				{
-					id: "status", type: "static", label: str.detectedBackends, value: backend.statusLabel(),
-					labelWidth: 120, controlWidth: 220, justify: "center",
-					button: { text: "↻", helpTip: str.detectBackends, width: 35, height: 25 }
-				},
-				{ id: "host", label: str.host, value: temp.backendHost || "127.0.0.1", labelWidth: 105, controlWidth: 275 },
-				{ id: "comfyPort", label: str.comfyPort, value: String(temp.comfyPort || 8188), labelWidth: 105, controlWidth: 70 },
-				{ id: "forgePort", label: str.forgePort, value: String(temp.forgePort || 7860), labelWidth: 105, controlWidth: 70 },
-				{
-					id: "workflowsFolder", label: str.workflowFolder, value: temp.workflowsFolder || "", readOnly: true,
-					labelWidth: 105, controlWidth: 240, button: { text: "...", width: 25, height: 25 }
-				},
-				{
-					id: "forgeSchemasFolder", label: str.forgeSchemaFolder, value: temp.forgeSchemasFolder || backend.defaultForgeFolder(), readOnly: true,
-					labelWidth: 105, controlWidth: 240, button: { text: "...", width: 25, height: 25 }
-				}
-			], ui.settingsControlWidth),
-			statusValue = connectionRows.status.control,
-			testConnection = connectionRows.status.button,
-			hostEdit = connectionRows.host.control,
-			comfyPortRow = connectionRows.comfyPort.row,
-			comfyPortEdit = connectionRows.comfyPort.control,
-			forgePortRow = connectionRows.forgePort.row,
-			forgePortEdit = connectionRows.forgePort.control,
-			folderRow = connectionRows.workflowsFolder.row,
-			folderEdit = connectionRows.workflowsFolder.control,
-			browse = connectionRows.workflowsFolder.button,
-			forgeFolderRow = connectionRows.forgeSchemasFolder.row,
-			forgeFolderEdit = connectionRows.forgeSchemasFolder.control,
-			forgeBrowse = connectionRows.forgeSchemasFolder.button;
-		browse.onClick = function () { var folder = Folder.selectDialog(str.selectWorkflowFolder); if (folder) folderEdit.text = folder.fsName; };
-		forgeBrowse.onClick = function () { var folder = Folder.selectDialog(str.selectForgeSchemaFolder); if (folder) forgeFolderEdit.text = folder.fsName; };
-		var pythonIdleSeconds = parseInt(temp.pythonIdleTimeout, 10);
-		if (isNaN(pythonIdleSeconds)) pythonIdleSeconds = 15 * 60;
-		var pythonServer = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
-		pythonServer.text = str.pythonServerSettings;
-		var pythonRows = ui.addFormRows(pythonServer, [
-				{
-					id: "version", type: "static", label: str.pythonApiVersion,
-					value: backend.pythonVersion() ? "v" + backend.pythonVersion() : "—",
-					labelWidth: 220, controlWidth: 100
-				},
-				{
-					id: "idleTimeout", label: str.pythonIdleTimeout,
-					value: String(Math.round(pythonIdleSeconds / 60)),
-					labelWidth: 220, controlWidth: 65
-				},
-				{
-					id: "monitorInterval", label: str.backendMonitorInterval,
-					value: String(temp.backendMonitorInterval || 5),
-					labelWidth: 220, controlWidth: 65
-				}
-			], ui.settingsControlWidth),
-			pythonIdleTimeout = pythonRows.idleTimeout.control,
-			backendMonitorInterval = pythonRows.monitorInterval.control;
-		function updateBackendFields() {
-			var comfyMode = temp.activeBackend != BACKEND_FORGE;
-			comfyPortRow.enabled = folderRow.enabled = comfyMode;
-			forgePortRow.enabled = forgeFolderRow.enabled = !comfyMode;
-		}
-		updateBackendFields();
-		var probePerformed = false, probeToken = "";
-		testConnection.onClick = function () {
-			var probe = cloneObj(temp);
-			probe.backendHost = String(hostEdit.text || "").replace(/^\s+|\s+$/g, "") || "127.0.0.1";
-			probe.comfyPort = clamp(parseInt(comfyPortEdit.text, 10) || 8188, 1, 65535);
-			probe.forgePort = clamp(parseInt(forgePortEdit.text, 10) || 7860, 1, 65535);
-			probe.workflowsFolder = folderEdit.text || "";
-			probe.forgeSchemasFolder = forgeFolderEdit.text || "";
-			try {
-				probePerformed = true;
-				probeToken = "";
-				ui.runWithPaletteProgress(str.progressHandshake, function (progress) {
-					var probeStatus = api.probeBackends(probe, progress);
-					probeToken = String(probeStatus.probe_token || "");
-					backend.applyStatus(probeStatus);
-				});
-				statusValue.text = backend.statusLabel();
-			} catch (e) { messages.error(e); }
-		};
-		var resize = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
-		resize.text = str.resizePresetManagement;
-		var resizeEditor = resizePresetEditor(resize, temp);
-		var output = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
-		output.text = str.imageSettings;
-		var outputFields = ui.addCheckboxes(output, [
-				{ id: "flatten", text: str.flatten, value: temp.flatten },
-				{ id: "rasterize", text: str.rasterize, value: temp.rasterizeImage },
-				{ id: "keepAspectRatio", text: str.keepAspectRatioDuringPlace, value: temp.keepAspectRatioDuringPlace }
-			]),
-			flatten = outputFields.flatten,
-			rasterize = outputFields.rasterize,
-			keepAspectRatio = outputFields.keepAspectRatio;
-		var brush = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
-		brush.text = str.brushSettings;
-		var brushFields = ui.addCheckboxes(brush, [{ id: "selectBrush", text: str.selectBrush, value: temp.selectBrush }]),
-			selectBrush = brushFields.selectBrush,
-			opacityControl = ui.addSlider(brush, str.opacity, 1, 100, temp.brushOpacity, { displayValue: temp.brushOpacity, controlWidth: ui.settingsControlWidth }),
-			opacityStepper = createSliderStepper(opacityControl.slider, 1, 1);
-		function syncOpacityValue(finalize) {
-			var value = finalize ? opacityStepper.finish() : opacityStepper.sync(false);
-			opacityControl.valueText.text = Math.round(value);
-		}
-		opacityControl.slider.onChange = function () { syncOpacityValue(true); };
-		opacityControl.slider.onChanging = function () { syncOpacityValue(false); };
-		var generalFields = ui.addCheckboxes(w, [
-				{ id: "recordSettings", text: str.recordSettingsToAction, value: temp.recordSettingsToAction },
-				{ id: "metadata", text: str.layerMetadata, value: temp.writeLayerMetadata }
-			]),
-			recordSettings = generalFields.recordSettings,
-			metadata = generalFields.metadata,
-			timeoutFields = ui.addFormRows(w, [{
-				id: "timeout", label: str.generationTimeout, value: String(temp.generationTimeout), labelWidth: 220, controlWidth: 65
-			}]),
-			timeout = timeoutFields.timeout.control;
-		function resizePresetEditor(parent, tempCfg) {
-			if (!tempCfg.resizePresets || !tempCfg.resizePresets.length) tempCfg.resizePresets = cloneObj(presets.defaultResize());
-			var toolbar = ui.addPresetToolbar(parent, ui.settingsControlWidth, str.presetRestore),
-				presetList = toolbar.dropdown,
-				// Slider Max MP хранит значение в сотых MP (2.0 MP = 200),
-				// чтобы ScriptUI работал с целыми шагами без ошибок float.
-				minControl = presetSlider(parent, {
-					title: str.minimumSide, min: 256, max: 4096, value: 512, step: 32, suffix: " px"
-				}),
-				maxControl = presetSlider(parent, {
-					title: str.maximumMp, min: 10, max: 1200, value: 200, step: 10, suffix: " MP"
-				}),
-				minSync = minControl.slider.onChange,
-				maxSync = maxControl.slider.onChange;
-			minControl.slider.onChange = function () { minSync.call(this); checkIntegrity(); };
-			maxControl.slider.onChange = function () { maxSync.call(this); checkIntegrity(); };
-			toolbar.refresh.onClick = function () { loadSelection(); };
-			toolbar.add.onClick = function () {
-				var cur = readPreset(),
-					defaultName = presetList.selection ? tempCfg.resizePresets[presetList.selection.index].name + str.presetCopy : str.resizePresetNew,
-					name = messages.prompt(str.resizePresetPrompt, defaultName, str.resizePresetTitle);
-				name = name == null ? "" : String(name).replace(/^\s+|\s+$/g, "");
-				if (!name.length) return;
-				var found = presets.findResizeIndex(name, tempCfg.resizePresets);
-				if (found >= 0) {
-					if (messages.confirm(String(str.errResizePreset).replace("%1", name), str.resizePresetTitle) !== true) return;
-					tempCfg.resizePresets[found] = presets.createResize(name, cur.minSide, cur.maxMp);
-				} else {
-					tempCfg.resizePresets.push(presets.createResize(name, cur.minSide, cur.maxMp));
-					found = tempCfg.resizePresets.length - 1;
-				}
-				refreshList(found);
-			};
-			toolbar.save.onClick = function () { saveActive(true); };
-			toolbar.remove.onClick = function () {
-				if (!presetList.selection || presets.isProtectedResize(tempCfg.resizePresets[presetList.selection.index].name)) return;
-				tempCfg.resizePresets.splice(presetList.selection.index, 1);
-				refreshList(0);
-			};
-			presetList.onChange = function () { loadSelection(); };
-			refreshList(0);
-			function refreshList(index) {
-				presetList.removeAll();
-				for (var i = 0; i < tempCfg.resizePresets.length; i++) presetList.add("item", tempCfg.resizePresets[i].name);
-				if (!presetList.items.length) return;
-				if (index == null || index < 0) index = 0;
-				presetList.selection = Math.min(index, presetList.items.length - 1);
-				loadSelection();
+
+}
+// ГЛОБАЛЬНЫЕ НАСТРОЙКИ: cfg изменяется только после Save.
+function showGlobalSettings(connectionRecovery) {
+	var temp = cloneObj(cfg.data),
+		w = ui.createDialog({ title: str.scriptSettings, spacing: 10, margins: 14 }),
+		connection = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
+	connection.text = str.connectionSettings;
+	var connectionRows = ui.addFormRows(connection, [
+			{
+				id: "status", type: "static", label: str.detectedBackends, value: backend.statusLabel(),
+				labelWidth: 120, controlWidth: 220, justify: "center",
+				button: { text: "↻", helpTip: str.detectBackends, width: 35, height: 25 }
+			},
+			{ id: "host", label: str.host, value: temp.backendHost || "127.0.0.1", labelWidth: 105, controlWidth: 275 },
+			{ id: "comfyPort", label: str.comfyPort, value: String(temp.comfyPort || 8188), labelWidth: 105, controlWidth: 70 },
+			{ id: "forgePort", label: str.forgePort, value: String(temp.forgePort || 7860), labelWidth: 105, controlWidth: 70 },
+			{
+				id: "workflowsFolder", label: str.workflowFolder, value: temp.workflowsFolder || "", readOnly: true,
+				labelWidth: 105, controlWidth: 240, button: { text: "...", width: 25, height: 25 }
+			},
+			{
+				id: "forgeSchemasFolder", label: str.forgeSchemaFolder, value: temp.forgeSchemasFolder || backend.defaultForgeFolder(), readOnly: true,
+				labelWidth: 105, controlWidth: 240, button: { text: "...", width: 25, height: 25 }
 			}
-			function loadSelection() {
-				if (!presetList.selection) { checkIntegrity(); return; }
-				var preset = tempCfg.resizePresets[presetList.selection.index];
-				minControl.slider.value = preset.minSide;
-				maxControl.slider.value = preset.maxMp * 100;
-				minControl.syncValue(true);
-				maxControl.syncValue(true);
-				checkIntegrity();
+		], ui.settingsControlWidth),
+		statusValue = connectionRows.status.control,
+		testConnection = connectionRows.status.button,
+		hostEdit = connectionRows.host.control,
+		comfyPortRow = connectionRows.comfyPort.row,
+		comfyPortEdit = connectionRows.comfyPort.control,
+		forgePortRow = connectionRows.forgePort.row,
+		forgePortEdit = connectionRows.forgePort.control,
+		folderRow = connectionRows.workflowsFolder.row,
+		folderEdit = connectionRows.workflowsFolder.control,
+		browse = connectionRows.workflowsFolder.button,
+		forgeFolderRow = connectionRows.forgeSchemasFolder.row,
+		forgeFolderEdit = connectionRows.forgeSchemasFolder.control,
+		forgeBrowse = connectionRows.forgeSchemasFolder.button;
+	browse.onClick = function () { var folder = Folder.selectDialog(str.selectWorkflowFolder); if (folder) folderEdit.text = folder.fsName; };
+	forgeBrowse.onClick = function () { var folder = Folder.selectDialog(str.selectForgeSchemaFolder); if (folder) forgeFolderEdit.text = folder.fsName; };
+	var pythonIdleSeconds = parseInt(temp.pythonIdleTimeout, 10);
+	if (isNaN(pythonIdleSeconds)) pythonIdleSeconds = 15 * 60;
+	var pythonServer = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
+	pythonServer.text = str.pythonServerSettings;
+	var pythonRows = ui.addFormRows(pythonServer, [
+			{
+				id: "version", type: "static", label: str.pythonApiVersion,
+				value: backend.pythonVersion() ? "v" + backend.pythonVersion() : "—",
+				labelWidth: 220, controlWidth: 100
+			},
+			{
+				id: "idleTimeout", label: str.pythonIdleTimeout,
+				value: String(Math.round(pythonIdleSeconds / 60)),
+				labelWidth: 220, controlWidth: 65
+			},
+			{
+				id: "monitorInterval", label: str.backendMonitorInterval,
+				value: String(temp.backendMonitorInterval || 5),
+				labelWidth: 220, controlWidth: 65
 			}
-			function checkIntegrity() {
-				if (!presetList.selection) {
-					toolbar.refresh.enabled = toolbar.save.enabled = toolbar.remove.enabled = false;
-					return;
-				}
-				var cur = readPreset(),
-					preset = tempCfg.resizePresets[presetList.selection.index],
-					changed = cur.minSide != preset.minSide || cur.maxMp != preset.maxMp;
-				toolbar.refresh.enabled = toolbar.save.enabled = changed;
-				toolbar.remove.enabled = tempCfg.resizePresets.length > 1 && !presets.isProtectedResize(preset.name);
-			}
-			function readPreset() {
-				return {
-					minSide: Math.round(minControl.slider.value / 32) * 32,
-					maxMp: Math.round(maxControl.slider.value / 10) * 10 / 100
-				};
-			}
-			function saveActive(refresh) {
-				if (!presetList.selection) return false;
-				var cur = readPreset(), index = presetList.selection.index, preset = tempCfg.resizePresets[index];
-				if (cur.minSide == preset.minSide && cur.maxMp == preset.maxMp) return false;
-				tempCfg.resizePresets[index] = presets.createResize(preset.name, cur.minSide, cur.maxMp);
-				if (refresh) refreshList(index); else checkIntegrity();
-				return true;
-			}
-			return { saveActive: function () { return saveActive(false); } };
-		}
-		function presetSlider(parent, options) {
-			var group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}"),
-				titleGroup = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:5,margins:0}");
-			ui.setFixedWidth(group, ui.settingsControlWidth);
-			var label = titleGroup.add('statictext'),
-				valueText = titleGroup.add('statictext{justify:"right"}'),
-				slider = group.add('slider'),
-				control = {
-					slider: slider,
-					value: valueText,
-					suffix: options.suffix,
-					decimal: options.suffix == ' MP',
-					stepper: null
-				};
-			label.text = options.title;
-			label.alignment = ['fill', 'center'];
-			valueText.alignment = ['right', 'center'];
-			slider.minvalue = options.min;
-			slider.maxvalue = options.max;
-			slider.value = options.value;
-			control.stepper = createSliderStepper(slider, options.step, options.min);
-			try { ui.enableHoverFocus(slider); } catch (_) { }
-			function syncValue(reset, finalize) {
-				var value = reset
-					? control.stepper.reset()
-					: (finalize ? control.stepper.finish() : control.stepper.sync(false));
-				control.value.text = (control.decimal ? value / 100 : value) + control.suffix;
-			}
-			slider.onChanging = function () { syncValue(false, false); };
-			slider.onChange = function () { syncValue(false, true); };
-			control.syncValue = function (reset) { syncValue(!!reset, false); };
-			syncValue(true, false);
-			return control;
-		}
-		var accepted = false;
-		ui.addAcceptRow(w, str.saveChanges, function () {
-			var folderChanged = temp.workflowsFolder != folderEdit.text,
-				forgeFolderChanged = temp.forgeSchemasFolder != forgeFolderEdit.text;
-			temp.backendHost = String(hostEdit.text || "").replace(/^\s+|\s+$/g, "") || "127.0.0.1";
-			temp.comfyPort = clamp(parseInt(comfyPortEdit.text, 10) || 8188, 1, 65535);
-			temp.forgePort = clamp(parseInt(forgePortEdit.text, 10) || 7860, 1, 65535);
-			temp.workflowsFolder = folderEdit.text || "";
-			temp.forgeSchemasFolder = forgeFolderEdit.text || "";
-			if (resizeEditor && resizeEditor.saveActive) resizeEditor.saveActive();
-			temp.flatten = flatten.value; temp.rasterizeImage = rasterize.value; temp.keepAspectRatioDuringPlace = keepAspectRatio.value;
-			temp.recordSettingsToAction = recordSettings.value; temp.writeLayerMetadata = metadata.value; temp.selectBrush = selectBrush.value;
-			temp.brushOpacity = clamp(Math.round(opacityControl.slider.value), 1, 100); temp.generationTimeout = clamp(parseInt(timeout.text, 10) || 1200, 30, 86400);
-			var idleMinutes = parseInt(pythonIdleTimeout.text, 10);
-			if (isNaN(idleMinutes)) idleMinutes = 15;
-			temp.pythonIdleTimeout = clamp(idleMinutes, 0, 7 * 24 * 60) * 60;
-			temp.backendMonitorInterval = clamp(parseInt(backendMonitorInterval.text, 10) || 5, 2, 300);
-			if (folderChanged) { temp.workflowCatalog = []; temp.selectedWorkflow = ""; }
-			if (forgeFolderChanged) { temp.forgeCatalog = []; temp.selectedForgePreset = ""; }
-			cfg.data = temp; cfg.bindProperties(); accepted = true; w.close(1);
-		});
-		ui.showDialog(w);
-		return { accepted: accepted, probePerformed: probePerformed, probeToken: probeToken };
+		], ui.settingsControlWidth),
+		pythonIdleTimeout = pythonRows.idleTimeout.control,
+		backendMonitorInterval = pythonRows.monitorInterval.control;
+	function updateBackendFields() {
+		var comfyMode = temp.activeBackend != BACKEND_FORGE;
+		comfyPortRow.enabled = folderRow.enabled = connectionRecovery || comfyMode;
+		forgePortRow.enabled = forgeFolderRow.enabled = connectionRecovery || !comfyMode;
 	}
+	updateBackendFields();
+	var probePerformed = false, probeToken = "";
+	testConnection.onClick = function () {
+		var probe = cloneObj(temp);
+		probe.backendHost = String(hostEdit.text || "").replace(/^\s+|\s+$/g, "") || "127.0.0.1";
+		probe.comfyPort = clamp(parseInt(comfyPortEdit.text, 10) || 8188, 1, 65535);
+		probe.forgePort = clamp(parseInt(forgePortEdit.text, 10) || 7860, 1, 65535);
+		probe.workflowsFolder = folderEdit.text || "";
+		probe.forgeSchemasFolder = forgeFolderEdit.text || "";
+		try {
+			probePerformed = true;
+			probeToken = "";
+			ui.runWithPaletteProgress(str.progressHandshake, function (progress) {
+				var probeStatus = api.probeBackends(probe, progress);
+				probeToken = String(probeStatus.probe_token || "");
+				backend.applyStatus(probeStatus);
+			});
+			statusValue.text = backend.statusLabel();
+		} catch (e) { messages.error(e); }
+	};
+	var resize = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
+	resize.text = str.resizePresetManagement;
+	var resizeEditor = resizePresetEditor(resize, temp);
+	var output = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
+	output.text = str.imageSettings;
+	var outputFields = ui.addCheckboxes(output, [
+			{ id: "flatten", text: str.flatten, value: temp.flatten },
+			{ id: "rasterize", text: str.rasterize, value: temp.rasterizeImage },
+			{ id: "keepAspectRatio", text: str.keepAspectRatioDuringPlace, value: temp.keepAspectRatioDuringPlace }
+		]),
+		flatten = outputFields.flatten,
+		rasterize = outputFields.rasterize,
+		keepAspectRatio = outputFields.keepAspectRatio;
+	var brush = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
+	brush.text = str.brushSettings;
+	var brushFields = ui.addCheckboxes(brush, [{ id: "selectBrush", text: str.selectBrush, value: temp.selectBrush }]),
+		selectBrush = brushFields.selectBrush,
+		opacityControl = ui.addSlider(brush, str.opacity, 1, 100, temp.brushOpacity, { displayValue: temp.brushOpacity, controlWidth: ui.settingsControlWidth }),
+		opacityStepper = createSliderStepper(opacityControl.slider, 1, 1);
+	function syncOpacityValue(finalize) {
+		var value = finalize ? opacityStepper.finish() : opacityStepper.sync(false);
+		opacityControl.valueText.text = Math.round(value);
+	}
+	opacityControl.slider.onChange = function () { syncOpacityValue(true); };
+	opacityControl.slider.onChanging = function () { syncOpacityValue(false); };
+	var generalFields = ui.addCheckboxes(w, [
+			{ id: "recordSettings", text: str.recordSettingsToAction, value: temp.recordSettingsToAction },
+			{ id: "metadata", text: str.layerMetadata, value: temp.writeLayerMetadata }
+		]),
+		recordSettings = generalFields.recordSettings,
+		metadata = generalFields.metadata,
+		timeoutFields = ui.addFormRows(w, [{
+			id: "timeout", label: str.generationTimeout, value: String(temp.generationTimeout), labelWidth: 220, controlWidth: 65
+		}]),
+		timeout = timeoutFields.timeout.control;
+	function resizePresetEditor(parent, tempCfg) {
+		if (!tempCfg.resizePresets || !tempCfg.resizePresets.length) tempCfg.resizePresets = cloneObj(presets.defaultResize());
+		var toolbar = ui.addPresetToolbar(parent, ui.settingsControlWidth, str.presetRestore),
+			presetList = toolbar.dropdown,
+			// Slider Max MP хранит значение в сотых MP (2.0 MP = 200),
+			// чтобы ScriptUI работал с целыми шагами без ошибок float.
+			minControl = presetSlider(parent, {
+				title: str.minimumSide, min: 256, max: 4096, value: 512, step: 32, suffix: " px"
+			}),
+			maxControl = presetSlider(parent, {
+				title: str.maximumMp, min: 10, max: 1200, value: 200, step: 10, suffix: " MP"
+			}),
+			minSync = minControl.slider.onChange,
+			maxSync = maxControl.slider.onChange;
+		minControl.slider.onChange = function () { minSync.call(this); checkIntegrity(); };
+		maxControl.slider.onChange = function () { maxSync.call(this); checkIntegrity(); };
+		toolbar.refresh.onClick = function () { loadSelection(); };
+		toolbar.add.onClick = function () {
+			var cur = readPreset(),
+				defaultName = presetList.selection ? tempCfg.resizePresets[presetList.selection.index].name + str.presetCopy : str.resizePresetNew,
+				name = messages.prompt(str.resizePresetPrompt, defaultName, str.resizePresetTitle);
+			name = name == null ? "" : String(name).replace(/^\s+|\s+$/g, "");
+			if (!name.length) return;
+			var found = presets.findResizeIndex(name, tempCfg.resizePresets);
+			if (found >= 0) {
+				if (messages.confirm(String(str.errResizePreset).replace("%1", name), str.resizePresetTitle) !== true) return;
+				tempCfg.resizePresets[found] = presets.createResize(name, cur.minSide, cur.maxMp);
+			} else {
+				tempCfg.resizePresets.push(presets.createResize(name, cur.minSide, cur.maxMp));
+				found = tempCfg.resizePresets.length - 1;
+			}
+			refreshList(found);
+		};
+		toolbar.save.onClick = function () { saveActive(true); };
+		toolbar.remove.onClick = function () {
+			if (!presetList.selection || presets.isProtectedResize(tempCfg.resizePresets[presetList.selection.index].name)) return;
+			tempCfg.resizePresets.splice(presetList.selection.index, 1);
+			refreshList(0);
+		};
+		presetList.onChange = function () { loadSelection(); };
+		refreshList(0);
+		function refreshList(index) {
+			presetList.removeAll();
+			for (var i = 0; i < tempCfg.resizePresets.length; i++) presetList.add("item", tempCfg.resizePresets[i].name);
+			if (!presetList.items.length) return;
+			if (index == null || index < 0) index = 0;
+			presetList.selection = Math.min(index, presetList.items.length - 1);
+			loadSelection();
+		}
+		function loadSelection() {
+			if (!presetList.selection) { checkIntegrity(); return; }
+			var preset = tempCfg.resizePresets[presetList.selection.index];
+			minControl.slider.value = preset.minSide;
+			maxControl.slider.value = preset.maxMp * 100;
+			minControl.syncValue(true);
+			maxControl.syncValue(true);
+			checkIntegrity();
+		}
+		function checkIntegrity() {
+			if (!presetList.selection) {
+				toolbar.refresh.enabled = toolbar.save.enabled = toolbar.remove.enabled = false;
+				return;
+			}
+			var cur = readPreset(),
+				preset = tempCfg.resizePresets[presetList.selection.index],
+				changed = cur.minSide != preset.minSide || cur.maxMp != preset.maxMp;
+			toolbar.refresh.enabled = toolbar.save.enabled = changed;
+			toolbar.remove.enabled = tempCfg.resizePresets.length > 1 && !presets.isProtectedResize(preset.name);
+		}
+		function readPreset() {
+			return {
+				minSide: Math.round(minControl.slider.value / 32) * 32,
+				maxMp: Math.round(maxControl.slider.value / 10) * 10 / 100
+			};
+		}
+		function saveActive(refresh) {
+			if (!presetList.selection) return false;
+			var cur = readPreset(), index = presetList.selection.index, preset = tempCfg.resizePresets[index];
+			if (cur.minSide == preset.minSide && cur.maxMp == preset.maxMp) return false;
+			tempCfg.resizePresets[index] = presets.createResize(preset.name, cur.minSide, cur.maxMp);
+			if (refresh) refreshList(index); else checkIntegrity();
+			return true;
+		}
+		return { saveActive: function () { return saveActive(false); } };
+	}
+	function presetSlider(parent, options) {
+		var group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}"),
+			titleGroup = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:5,margins:0}");
+		ui.setFixedWidth(group, ui.settingsControlWidth);
+		var label = titleGroup.add('statictext'),
+			valueText = titleGroup.add('statictext{justify:"right"}'),
+			slider = group.add('slider'),
+			control = {
+				slider: slider,
+				value: valueText,
+				suffix: options.suffix,
+				decimal: options.suffix == ' MP',
+				stepper: null
+			};
+		label.text = options.title;
+		label.alignment = ['fill', 'center'];
+		valueText.alignment = ['right', 'center'];
+		slider.minvalue = options.min;
+		slider.maxvalue = options.max;
+		slider.value = options.value;
+		control.stepper = createSliderStepper(slider, options.step, options.min);
+		try { ui.enableHoverFocus(slider); } catch (_) { }
+		function syncValue(reset, finalize) {
+			var value = reset
+				? control.stepper.reset()
+				: (finalize ? control.stepper.finish() : control.stepper.sync(false));
+			control.value.text = (control.decimal ? value / 100 : value) + control.suffix;
+		}
+		slider.onChanging = function () { syncValue(false, false); };
+		slider.onChange = function () { syncValue(false, true); };
+		control.syncValue = function (reset) { syncValue(!!reset, false); };
+		syncValue(true, false);
+		return control;
+	}
+	var accepted = false;
+	ui.addAcceptRow(w, str.saveChanges, function () {
+		var folderChanged = temp.workflowsFolder != folderEdit.text,
+			forgeFolderChanged = temp.forgeSchemasFolder != forgeFolderEdit.text;
+		temp.backendHost = String(hostEdit.text || "").replace(/^\s+|\s+$/g, "") || "127.0.0.1";
+		temp.comfyPort = clamp(parseInt(comfyPortEdit.text, 10) || 8188, 1, 65535);
+		temp.forgePort = clamp(parseInt(forgePortEdit.text, 10) || 7860, 1, 65535);
+		temp.workflowsFolder = folderEdit.text || "";
+		temp.forgeSchemasFolder = forgeFolderEdit.text || "";
+		if (resizeEditor && resizeEditor.saveActive) resizeEditor.saveActive();
+		temp.flatten = flatten.value; temp.rasterizeImage = rasterize.value; temp.keepAspectRatioDuringPlace = keepAspectRatio.value;
+		temp.recordSettingsToAction = recordSettings.value; temp.writeLayerMetadata = metadata.value; temp.selectBrush = selectBrush.value;
+		temp.brushOpacity = clamp(Math.round(opacityControl.slider.value), 1, 100); temp.generationTimeout = clamp(parseInt(timeout.text, 10) || 1200, 30, 86400);
+		var idleMinutes = parseInt(pythonIdleTimeout.text, 10);
+		if (isNaN(idleMinutes)) idleMinutes = 15;
+		temp.pythonIdleTimeout = clamp(idleMinutes, 0, 7 * 24 * 60) * 60;
+		temp.backendMonitorInterval = clamp(parseInt(backendMonitorInterval.text, 10) || 5, 2, 300);
+		if (folderChanged) { temp.workflowCatalog = []; temp.selectedWorkflow = ""; }
+		if (forgeFolderChanged) { temp.forgeCatalog = []; temp.selectedForgePreset = ""; }
+		cfg.data = temp; cfg.bindProperties(); accepted = true; w.close(1);
+	});
+	ui.showDialog(w);
+	return { accepted: accepted, probePerformed: probePerformed, probeToken: probeToken };
 }
 // REFERENCE / IMAGESTITCH
 function isSupportedReferenceImage(path) {
@@ -3454,7 +3469,12 @@ function MessageCenter() {
 			heading = dialog.add("statictext", undefined, errors.length ? str.diagnosticsNeedAttention : str.diagnosticsInformation),
 			details = dialog.add("edittext", undefined, sections.join("\n\n"), { multiline: true, scrollable: true, readonly: true }),
 			buttons = dialog.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,5,0,0]}");
+		var result = true;
 		buttons.add("button", undefined, str.dialogOk, { name: "ok" });
+		if (errors.length && options.allowSettings === true) {
+			var settingsButton = buttons.add("button", undefined, str.openSettings);
+			settingsButton.onClick = function () { result = "openSettings"; dialog.close(1); };
+		}
 		try { heading.graphics.font = ScriptUI.newFont(heading.graphics.font.name, "BOLD", 15); } catch (_) { }
 		var itemCount = errors.length + warnings.length + information.length;
 		details.preferredSize = [700, Math.min(380, Math.max(180, 90 + itemCount * 28))];
@@ -3462,10 +3482,10 @@ function MessageCenter() {
 		details.readonly = true;
 		if (errors.length && options.sound !== false) try { app.beep(); } catch (_) { }
 		ui.showDialog(dialog);
-		return true;
+		return result;
 	};
-	this.error = function (value, title) {
-		return this.show({ title: title || APP.name, errors: [errorMessageText(value)] });
+	this.error = function (value, title, allowSettings) {
+		return this.show({ title: title || APP.name, errors: [errorMessageText(value)], allowSettings: allowSettings === true });
 	};
 	this.confirm = function (message, title, yesText, noText) {
 		var result = null,
@@ -6835,6 +6855,8 @@ function Locale() {
 		infoMissingForgeSchemaFolder: ["Папка JSON-схем Forge не выбрана или не найдена. Нажмите ⚙ и выберите папку со схемами.", "The Forge JSON schema folder is not selected or cannot be found. Click ⚙ and select the schema folder."],
 		detectedBackends: ["Доступные бэкенды:", "Available backends:"], detectBackends: ["Найти запущенные бэкенды", "Detect running backends"],
 		backendsNone: ["не найдены", "none detected"],
+		openSettings: ["Открыть настройки", "Open settings"],
+		backendRecoveryHint: ["Можно открыть настройки и указать IP-адрес или имя компьютера с Forge / ComfyUI и порт. После сохранения повторите запуск скрипта.", "Open settings to enter the IP address or computer name and port of Forge / ComfyUI. After saving, run the script again."],
 		errNoBackendAvailable: ["Не найден запущенный ComfyUI или Forge Neo. Запустите хотя бы одну оболочку и повторите запуск скрипта.", "No running ComfyUI or Forge Neo instance was detected. Start at least one backend and run the script again."],
 		errBackendUnavailable: ["Выбранный бэкенд сейчас недоступен.", "The selected backend is currently unavailable."],
 		workflowTagNote: ["Метки можно дописать прямо к заголовкам нод в ComfyUI: #PS-INPUT, #PS-OUTPUT, #PS-SIZE, #PS-MAIN, #PS-REF, #PS-MASK и #PS-UI. После переименования снова выполните Export Workflow (API). Ручное редактирование JSON не требуется.", "Append tags directly to node titles in ComfyUI: #PS-INPUT, #PS-OUTPUT, #PS-SIZE, #PS-MAIN, #PS-REF, #PS-MASK and #PS-UI. Export Workflow (API) again after renaming. Manual JSON editing is not required."]
