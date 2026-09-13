@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.231",
+	VER = "0.240",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -96,19 +96,27 @@ var APP = {
 	startupProgress = null,
 	isCancelled = false,
 	actionPlaybackMode = false,
+	filePlaybackMode = false,
 	actionUsesRecordedSettings = false,
 	interfaceWasShown = false,
 	globalSettings = null,
 	settingsReady = false,
-	keyboardState = ScriptUI.environment.keyboardState;
+	keyboardState = ScriptUI.environment.keyboardState,
+	topLevelArguments = [];
+// Аргументы запускателя нужно читать здесь: внутри функции arguments уже другой.
+try {
+	if (typeof arguments != "undefined" && arguments)
+		for (var argumentIndex = 0; argumentIndex < arguments.length; argumentIndex++)
+			topLevelArguments.push(arguments[argumentIndex]);
+} catch (_) { }
 // ТОЧКА ВХОДА: Shift открывает окно только при обычном запуске, не из Action.
 try { init(); }
 catch (e) {
 	if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
 	if (isUserCancellation(e)) {
 		isCancelled = true;
-	} else if (isSilentActionPlayback()) {
-		// Не поглощаем ошибку: Photoshop должен остановить Action как ошибочный шаг.
+	} else if (isStrictPlayback()) {
+		// Передаём ошибку Photoshop для тихого Action и запуска из файла.
 		isCancelled = false;
 		throw e;
 	} else {
@@ -150,43 +158,41 @@ function restoreInitialDocumentState() {
 // dialogEnvKey хранит только режим обычных запусков. Action имеет собственный
 // флаг Photoshop playbackDisplayDialogs и не должен менять это состояние.
 function setDialogEnvironment(value) {
-	if (!actionPlaybackMode) $.setenv(APP.dialogEnvKey, String(value));
+	if (!actionPlaybackMode && !filePlaybackMode) $.setenv(APP.dialogEnvKey, String(value));
 }
 // Action с выключенным значком диалога Photoshop является строго неинтерактивным.
 function isSilentActionPlayback() {
 	return actionPlaybackMode && app.playbackDisplayDialogs != DialogModes.ALL;
 }
-// Загружает настройки из DESC или Action, проверяет выделение и backend,
+// Файл запускается строго с записанными параметрами, без подмены схемы.
+function isStrictPlayback() { return filePlaybackMode || isSilentActionPlayback(); }
+// Загружает настройки из DESC, Action или файла, проверяет выделение и backend,
 // затем либо открывает интерфейс, либо запускает генерацию в тихом режиме.
 function init() {
 	// Определяем Action до любых проверок документа: даже ранняя ошибка
 	// не должна затронуть состояние dialogEnvKey обычных запусков.
 	actionPlaybackMode = action.isPlayback();
+	var launchArguments = action.getLaunchArguments();
+	filePlaybackMode = !!launchArguments.file;
 	if (!app.documents.length) {
-		if (isSilentActionPlayback()) throw new Error(str.errNoDocument);
+		if (isStrictPlayback()) throw new Error(str.errNoDocument);
 		return;
 	}
 	initialState = app.activeDocument.activeHistoryState;
 	if (doc.getProperty("mode").value != "RGBColor") throw new Error(str.errMode);
 	var playbackCount = action.getPlaybackParameterCount(),
 		settingsWarnings = [];
-	var forceDialog = !actionPlaybackMode && (keyboardState.shiftKey || action.hasInterfaceArgument());
-	if (actionPlaybackMode) {
-		var actionSettingsMode = action.getRecordedSettingsMode();
+	var forceDialog = !actionPlaybackMode && ((keyboardState.shiftKey && !keyboardState.ctrlKey && !keyboardState.altKey && !keyboardState.metaKey) || launchArguments.dialog);
+	if (filePlaybackMode || actionPlaybackMode) {
+		var actionSettingsMode = filePlaybackMode ? true : action.getRecordedSettingsMode();
 		if (actionSettingsMode === false) {
 			cfg.load();
 			settingsWarnings = settingsWarnings.concat(cfg.consumeLoadWarnings());
 			cfg.recordSettingsToAction = cfg.data.recordSettingsToAction = false;
 			actionUsesRecordedSettings = false;
 		} else {
-			cfg.loadFromAction();
+			cfg.loadFromAction(launchArguments.file);
 			actionUsesRecordedSettings = true;
-			globalSettings = new Config();
-			globalSettings.load();
-			settingsWarnings = settingsWarnings.concat(globalSettings.consumeLoadWarnings());
-			cfg.copySharedLibrariesFrom(globalSettings);
-			cfg.copyPythonRuntimeSettingsFrom(globalSettings);
-			cfg.copyGlobalPreferencesFrom(globalSettings);
 		}
 	} else {
 		cfg.load();
@@ -195,6 +201,14 @@ function init() {
 		// Такой запуск всегда должен открыть интерфейс, даже если прошлый запуск был тихим.
 		if (playbackCount == 1) setDialogEnvironment("true");
 	}
+	if (actionUsesRecordedSettings) {
+		globalSettings = new Config();
+		globalSettings.load();
+		settingsWarnings = settingsWarnings.concat(globalSettings.consumeLoadWarnings());
+		cfg.copySharedLibrariesFrom(globalSettings);
+		cfg.copyPythonRuntimeSettingsFrom(globalSettings);
+		cfg.copyGlobalPreferencesFrom(globalSettings);
+	}
 	settingsReady = true;
 	cfg.cleanReferenceHistory();
 	var environmentMode = (!actionPlaybackMode && !DEBUG_FIRST_LAUNCH_WITH_INTERFACE)
@@ -202,7 +216,7 @@ function init() {
 			: null,
 		// Action полностью управляется собственным значком диалога Photoshop.
 		// DEBUG/Shift/dialogEnvKey не могут открыть UI у silent Action.
-		showInterface = actionPlaybackMode
+		showInterface = filePlaybackMode ? false : actionPlaybackMode
 			? !isSilentActionPlayback()
 			: DEBUG_FIRST_LAUNCH_WITH_INTERFACE || forceDialog ||
 				environmentMode == "true" || environmentMode == null;
@@ -216,7 +230,7 @@ function init() {
 	};
 	app.activeDocument.suspendHistory(localize(str.historyCheckSelection), "checkSelection(selection)");
 	if (!selection.result) {
-		if (isSilentActionPlayback()) throw new Error(str.errNoSelection);
+		if (isStrictPlayback()) throw new Error(str.errNoSelection);
 		return;
 	}
 	try {
@@ -267,12 +281,12 @@ function init() {
 			allowFastInitialLoad = !backendChangedAtStartup && !settingsWarnings.length &&
 				(!showInterface || hasCachedForgeSelection),
 			initial = backend.loadInitialData(startupProgress, allowFastInitialLoad);
-		if (actionPlaybackMode && actionUsesRecordedSettings && globalSettings)
+		if (actionUsesRecordedSettings && globalSettings)
 			cfg.copyPromptUndoFrom(globalSettings);
 		initial.notices = settingsWarnings.concat(initial.notices instanceof Array ? initial.notices : []);
 		if (backendChangedAtStartup || initial.forceDialog || initial.notices.length ||
 			(initial.emptyDropdownIds instanceof Array && initial.emptyDropdownIds.length)) {
-			if (isSilentActionPlayback()) throw new Error(initialActionErrorText(initial));
+			if (isStrictPlayback()) throw new Error(initialActionErrorText(initial));
 			showInterface = true;
 			setDialogEnvironment("true");
 		}
@@ -298,6 +312,14 @@ function init() {
 		if (startupProgress) {
 			startupProgress.complete(); startupProgress.close(); startupProgress = null;
 		}
+		// Файл и тихий Action завершаются здесь: до mainDialog и UI-retry.
+		if (isStrictPlayback()) {
+			if (!initial.schema || !initial.schema.valid) throw new Error(initialActionErrorText(initial));
+			var recordedProfile = backend.schemaProfile(initial.schema),
+				recordedValues = backend.profileValues(initial.schema, recordedProfile);
+			generation.run(selection, initial.schema, recordedValues);
+			return;
+		}
 		if (showInterface) {
 			interfaceWasShown = true;
 			var res = mainDialog(selection, initial, responseSeconds);
@@ -313,20 +335,15 @@ function init() {
 			setDialogEnvironment("false");
 			return;
 		}
-		if (!initial.schema) {
-			if (isSilentActionPlayback()) throw new Error(initialActionErrorText(initial));
-			return;
-		}
+		if (!initial.schema) return;
 		var silentProfile = backend.schemaProfile(initial.schema),
 			silentValues = backend.profileValues(initial.schema, silentProfile);
-		if (!actionPlaybackMode) cfg.saveToAction();
+		if (!actionPlaybackMode && !filePlaybackMode) cfg.saveToAction();
 		try {
 			generation.run(selection, initial.schema, silentValues);
 			setDialogEnvironment("false");
 		} catch (silentGenerationError) {
 			if (isUserCancellation(silentGenerationError))
-				throw silentGenerationError;
-			if (isSilentActionPlayback())
 				throw silentGenerationError;
 			// GenerationRuntime may temporarily change layers and channels. Restore
 			// the document before presenting controls for a corrected retry.
@@ -498,7 +515,7 @@ function forgeSchemaId(schema) {
 }
 // ГЛАВНОЕ ОКНО: state хранит данные динамической области.
 function mainDialog(selection, initial, responseSeconds) {
-	if (isSilentActionPlayback()) throw new Error(initialActionErrorText(initial));
+	if (isStrictPlayback()) throw new Error(str.errUnexpectedPlaybackDialog);
 	var selectionBounds = selection.bounds,
 		state = {
 			backend: initial.backend || cfg.activeBackend,
@@ -598,6 +615,13 @@ function mainDialog(selection, initial, responseSeconds) {
 	};
 	bOk.onClick = function () {
 		try {
+			if (ScriptUI.environment.keyboardState.shiftKey) {
+				if (!state.schema) return;
+				if (!state.schema.valid) throw new Error(str.errWorkflowInvalid);
+				saveCurrentValues();
+				action.exportPresetFile();
+				return;
+			}
 			resolveDisplayedSeeds();
 			saveCurrentValues();
 			if (!state.schema) return;
@@ -2799,16 +2823,55 @@ function ActionRuntime() {
 			return !!(desc && desc.hasKey(marker));
 		} catch (_) { return false; }
 	};
-	this.hasInterfaceArgument = function () {
-		var values = [];
-		try {
-			if ($.arguments && $.arguments.length) for (var i = 0; i < $.arguments.length; i++) values.push($.arguments[i]);
+	this.getLaunchArguments = function () {
+		var values = topLevelArguments.slice(0), result = { dialog: false, file: null };
+		if (!values.length) try {
+			if ($.arguments && $.arguments.length)
+				for (var i = 0; i < $.arguments.length; i++) values.push($.arguments[i]);
+		} catch (_) { }
+		// Некоторые внешние запускатели передают строку в playbackParameters.
+		if (!values.length) try {
+			var desc = app.playbackParameters, key = s2t("scriptArgs");
+			if (desc && desc.hasKey(key) && desc.getType(key) == DescValueType.STRINGTYPE)
+				values.push(desc.getString(key));
+		} catch (_) { }
+		// Внешний запуск может использовать другое имя единственного поля.
+		// Принимаем только путь DESC; путь самого JSX не является набором настроек.
+		if (!values.length && !actionPlaybackMode) try {
+			var single = app.playbackParameters;
+			if (single && single.count == 1) {
+				var singleKey = single.getKey(0);
+				if (single.getType(singleKey) == DescValueType.STRINGTYPE) {
+					var singleValue = single.getString(singleKey);
+					if (/\.desc["']?\s*$/i.test(singleValue)) values.push(singleValue);
+				}
+			}
 		} catch (_) { }
 		for (var j = 0; j < values.length; j++) {
-			var value = String(values[j]).toLowerCase();
-			if (value == "dialog" || value == "ui" || value == "--dialog" || value == "--ui" || value == "/dialog" || value == "/ui") return true;
+			var value = String(values[j]).replace(/^\s+|\s+$/g, "");
+			if (value.length > 1 && ((value.charAt(0) == '"' && value.charAt(value.length - 1) == '"') ||
+				(value.charAt(0) == "'" && value.charAt(value.length - 1) == "'")))
+				value = value.substring(1, value.length - 1);
+			if (!value) continue;
+			if (/^(?:dialog|ui|--dialog|--ui|\/dialog|\/ui)$/i.test(value)) { result.dialog = true; continue; }
+			// Проверяем только аргументы, похожие на пути, без сканирования папок.
+			if (!/[\\\/]/.test(value) && !/^[a-z]:/i.test(value) && !/\.desc$/i.test(value)) continue;
+			// Даже ошибка пути должна обрабатываться как ошибка запуска из файла.
+			filePlaybackMode = true;
+			var file = new File(value);
+			if (!file.exists) throw new Error(str.errPresetFileMissing + "\n" + file.fsName);
+			if (result.file && result.file.fsName != file.fsName) throw new Error(str.errPresetFileArguments);
+			result.file = file;
 		}
-		return false;
+		return result;
+	};
+	this.exportPresetFile = function () {
+		var target = File.saveDialog(str.exportPresetTitle, "DESC:*.desc");
+		if (!target) return false;
+		if (!/\.desc$/i.test(target.name)) target = new File(target.fsName + ".desc");
+		if (target.exists && messages.confirm(str.confirmPresetOverwrite + "\n" + target.fsName, APP.name) !== true) return false;
+		cfg.savePresetFile(target);
+		return true;
 	};
 	this.getRecordedSettingsMode = function () {
 		try {
@@ -2820,6 +2883,7 @@ function ActionRuntime() {
 	// При playback с записанными параметрами профиль остаётся в Action,
 	// а изменённые общие библиотеки отдельно синхронизируются с DESC.
 	this.saveAcceptedSettings = function () {
+		if (filePlaybackMode) { saveSharedSettings(); return; }
 		if (actionPlaybackMode && actionUsesRecordedSettings && cfg.recordSettingsToAction) {
 			cfg.saveToAction();
 			saveSharedSettings();
@@ -3347,7 +3411,7 @@ function BackendRuntime() {
 	}
 	this.loadInitialData = function (progress, allowFastPath) {
 		var res = { backend: cfg.activeBackend, workflows: [], forgePresets: [], forgeCatalog: null, schema: null, fastPath: false },
-			requireRecordedSelection = actionPlaybackMode && actionUsesRecordedSettings;
+			requireRecordedSelection = actionUsesRecordedSettings;
 		if (cfg.activeBackend == BACKEND_FORGE) {
 			var fastForge = allowFastPath ? fastForgeSelection() : null;
 			if (fastForge) {
@@ -6003,12 +6067,12 @@ function Config() {
 	}
 	// Формирует облегчённый снимок Action. Если запись настроек выключена,
 	// сохраняется только маркер и флаг, а при playback читается актуальный DESC.
-	function actionData() {
+	function actionData(forceSnapshot) {
 		var res = {
 			actionDataVersion: 1,
 			recordSettingsToAction: !!self.recordSettingsToAction
 		};
-		if (!self.recordSettingsToAction) return res;
+		if (!forceSnapshot && !self.recordSettingsToAction) return res;
 		// Исключаем глобальные данные ДО глубокого копирования каталогов.
 		res = {};
 		for (var key in self.data) if (self.data.hasOwnProperty(key) && !actionExcluded.hasOwnProperty(key))
@@ -6103,12 +6167,61 @@ function Config() {
 	};
 	// Action загружается поверх defaults, а не поверх текущего DESC. После
 	// этого init() отдельно возвращает общие prompt/reference библиотеки из DESC.
-	this.loadFromAction = function () {
+	this.loadFromAction = function (presetFile) {
+		if (presetFile) { self.loadPresetFile(presetFile); return; }
 		var loaded = {};
 		try { descriptorCodec.readInto(loaded, app.playbackParameters); }
 		catch (_) { loaded = {}; }
 		delete loaded.actionDataVersion;
 		applyLoadedData(loaded);
+	};
+	this.loadPresetFile = function (file) {
+		var loaded;
+		try { loaded = readSettingsData(file); }
+		catch (readError) { throw new Error(str.errPresetFileInvalid + "\n" + file.fsName + "\n\n" + errorMessageText(readError)); }
+		if (!loaded || loaded.presetFileType != APP.uuid || loaded.presetFileVersion !== 1 || loaded.actionDataVersion !== 1)
+			throw new Error(str.errPresetFileInvalid + "\n" + file.fsName);
+		var forge = loaded.activeBackend == BACKEND_FORGE,
+			selected = forge ? loaded.selectedForgePreset : loaded.selectedWorkflow,
+			profiles = forge ? loaded.forgeProfiles : loaded.workflowProfiles;
+		if ((loaded.activeBackend != BACKEND_FORGE && loaded.activeBackend != BACKEND_COMFY) ||
+			!selected || !isObjectMap(profiles) || !isObjectMap(profiles[selected]) || !isObjectMap(profiles[selected].values))
+			throw new Error(str.errPresetFileInvalid + "\n" + file.fsName);
+		delete loaded.presetFileType;
+		delete loaded.presetFileVersion;
+		delete loaded.actionDataVersion;
+		applyLoadedData(loaded);
+	};
+	this.savePresetFile = function (target) {
+		// Не позволяем экспорту заменить рабочие настройки Photoshop.
+		var targetPath = target.fsName, protectedPath = settingsFile("").fsName.toLowerCase();
+		if (targetPath.toLowerCase() == protectedPath || targetPath.toLowerCase() == protectedPath + ".bak" || targetPath.toLowerCase() == protectedPath + ".tmp")
+			throw new Error(str.errPresetFileProtected);
+		syncData();
+		var snapshot = actionData(true);
+		snapshot.presetFileType = APP.uuid;
+		snapshot.presetFileVersion = 1;
+		var stream = descriptorCodec.toDescriptor(snapshot).toStream(),
+			unique = createRequestId(),
+			temp = new File(targetPath + "." + unique + ".tmp"),
+			backup = new File(targetPath + "." + unique + ".bak"),
+			backupPath = backup.fsName, moved = false;
+		try {
+			writeSettingsStream(temp, stream);
+			if (target.exists) {
+				if (!target.rename(backup.name)) throw new Error(operationError(str.errSettingsBackupFile, target));
+				moved = true;
+			}
+			if (!temp.rename((new File(targetPath)).name)) {
+				if (moved && !(new File(backupPath)).rename((new File(targetPath)).name))
+					throw new Error(str.errSettingsRestoreBackup + "\n" + backupPath);
+				throw new Error(operationError(str.errSettingsReplaceFile, new File(targetPath)));
+			}
+			if (moved) try { (new File(backupPath)).remove(); } catch (_) { }
+		} finally {
+			// После rename File меняет свой путь: удаляем только исходный temp.
+			try { var leftover = new File(targetPath + "." + unique + ".tmp"); if (leftover.exists) leftover.remove(); } catch (_) { }
+		}
 	};
 	this.saveToAction = function () {
 		syncData();
@@ -6748,6 +6861,13 @@ function Locale() {
 		workflow_field_number_expected: ["Поле workflow %1 должно содержать число; получено: %2.", "Workflow field %1 expects a number; received: %2."],
 		workflow_field_finite_expected: ["Поле workflow %1 должно содержать конечное число; получено: %2.", "Workflow field %1 expects a finite number; received: %2."],
 		errWorkflowInvalid: ["Workflow не прошёл проверку. Откройте ⚙ или добавьте метки к названиям нод.", "Workflow validation failed. Open ⚙ or add tags to node titles."],
+		exportPresetTitle: ["Сохранить параметры генерации", "Save generation settings"],
+		confirmPresetOverwrite: ["Заменить существующий файл параметров?", "Replace the existing settings file?"],
+		errUnexpectedPlaybackDialog: ["Внутренняя ошибка: попытка открыть главное окно при выполнении сохранённых параметров.", "Internal error: attempted to open the main dialog while running saved settings."],
+		errPresetFileMissing: ["Файл параметров не найден:", "Settings file not found:"],
+		errPresetFileArguments: ["Передайте путь только к одному файлу параметров.", "Pass only one settings file path."],
+		errPresetFileInvalid: ["Файл повреждён или не является поддерживаемым файлом параметров img2img helper:", "The file is damaged or is not a supported img2img helper settings file:"],
+		errPresetFileProtected: ["Нельзя заменить рабочий файл настроек Photoshop экспортируемым набором.", "Cannot overwrite the Photoshop settings file with an exported preset."],
 		generate: ["Генерировать", "Generate"], generationTimeout: ["Таймаут генерации, с:", "Generation timeout, s:"],
 		historyCheckSelection: ["Проверить выделение", "Check selection"], historyPlaceResult: ["Вставить результат генерации", "Place generated result"],
 		historyPrepareSelection: ["Подготовить выделение", "Prepare selection"], inpaintMask: ["Маска inpaint", "Inpaint mask"],
