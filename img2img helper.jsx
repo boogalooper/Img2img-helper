@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.240",
+	VER = "0.241",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.225-translation-multibackend-runtime-id",
+	API_BUILD_ID = "0.226-request-scoped-cancellation",
 	// На запуск Python и установку зависимостей даётся две минуты.
 	START_TIMEOUT = 2 * 60 * 1000,
 	SHORT_TIMEOUT = 8000,
@@ -3331,6 +3331,7 @@ function BackendRuntime() {
 		try {
 			progressCompleted = app.doProgress(str.progressAnalyze, "runWorkflowAnalysisProgress()");
 		} catch (progressError) {
+			if (cancellationRequested) throw progressError;
 			if (!isUserCancellation(progressError)) throw progressError;
 			progressCompleted = false;
 		}
@@ -5142,12 +5143,14 @@ function GenerationProgress() {
 		generateTitle = "",
 		delayKey = "",
 		delayMax = GENERATION_RUN_DEFAULT_EXPECTED_MS,
-		requestId = null;
+		requestId = null,
+		cancellationRequested = false;
 	this.begin = function (options) {
 		options = options || {};
 		payload = options.command || null;
 		res = null;
 		firstAnswer = null;
+		cancellationRequested = false;
 		prepareTitle = options.titles && options.titles.prepare ? options.titles.prepare : "";
 		generateTitle = options.titles && options.titles.generate ? options.titles.generate : "";
 		delayKey = options.timingKey || "";
@@ -5171,13 +5174,18 @@ function GenerationProgress() {
 			)) return cancelProgress();
 			return true;
 		} catch (progressError) {
-			if (!isUserCancellation(progressError)) throw progressError;
+			if (cancellationRequested) throw progressError;
+			if (!isUserCancellation(progressError)) {
+				api.cancelGeneration(requestId);
+				throw progressError;
+			}
 			return cancelProgress();
 		}
 	};
 	function cancelProgress() {
+		cancellationRequested = true;
 		res = { type: "cancelled", message: "" };
-		api.interrupt(requestId);
+		api.cancelGeneration(requestId);
 		return false;
 	}
 	this.stageOne = function () {
@@ -5211,6 +5219,7 @@ function GenerationProgress() {
 		payload = null;
 		res = null;
 		firstAnswer = null;
+		cancellationRequested = false;
 		prepareTitle = "";
 		generateTitle = "";
 		delayKey = "";
@@ -5489,6 +5498,16 @@ function BridgeApi() {
 			selected_loras: selectedLoras instanceof Array ? cloneObj(selectedLoras) : []
 		}, ANALYZE_TIMEOUT, progress);
 	};
+	this.cancelGeneration = function (requestId) {
+		if (!requestId) return;
+		// A distinct reply ID prevents a late image/init from acknowledging cancel.
+		try {
+			return call("cancel_generation", { request_id: requestId }, 90000);
+		} catch (cancelError) {
+			self.interrupt(requestId);
+			throw cancelError;
+		}
+	};
 	this.interrupt = function (requestId) {
 		try { fire(makeCommand("interrupt", { request_id: requestId || "" }, requestId)); } catch (_) { }
 	};
@@ -5578,10 +5597,10 @@ function BridgeApi() {
 		for (; ;) {
 			t2 = (new Date()).getTime();
 			if (t2 - t1 > timeout) {
-				if (interruptOnTimeout && expectedRequestId) {
-					try { self.interrupt(expectedRequestId); } catch (_) { }
-				}
 				listener.close();
+				if (interruptOnTimeout && expectedRequestId) {
+					self.cancelGeneration(expectedRequestId);
+				}
 				throw new Error(str.errApiTimeout);
 			}
 			if (t2 - t3 >= API_POLL_INTERVAL) {
@@ -6833,6 +6852,8 @@ function Locale() {
 		save_destination_missing: ["Файл назначения не выбран. Исходный JSON не изменён.", "No destination file was selected. The source JSON was not changed."],
 		forge_image_stitch_unsupported: ["Выбранная схема Forge не поддерживает ImageStitch.", "The selected Forge schema does not support ImageStitch."],
 		forge_processing_mode_required: ["Выберите хотя бы один режим обработки Forge.", "Select at least one Forge processing mode."],
+		cancellation_pending: ["Отмена ещё завершается. Повторите запуск немного позже.", "Cancellation is still finishing. Please retry shortly."],
+		cancellation_failed: ["Задание в Python освобождено, но подтвердить отмену в ComfyUI/Forge не удалось: %1", "Python released the task, but backend cancellation could not be confirmed: %1"],
 		generation_already_running: ["Предыдущая генерация ещё не завершена.", "The previous generation has not finished yet."],
 		workflow_folder_not_selected: ["Папка API-workflow не выбрана. Укажите её в настройках скрипта.", "The API-workflow folder is not selected. Choose it in the script settings."],
 		workflow_folder_missing: ["Папка API-workflow не существует: %1", "The API-workflow folder does not exist: %1"],

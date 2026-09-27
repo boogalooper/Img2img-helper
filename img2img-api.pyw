@@ -13,6 +13,7 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
+import http.client
 import importlib
 import io
 import json
@@ -45,8 +46,8 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6380   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.225"
-API_BUILD_ID = "0.225-translation-multibackend-runtime-id"
+VERSION = "0.226"
+API_BUILD_ID = "0.226-request-scoped-cancellation"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -1475,6 +1476,114 @@ class CancelledError(UserVisibleError):
     """Генерация отменена пользователем."""
 
 
+# Each generation owns its HTTP sockets. Interrupting the backend alone does not
+# unblock a Forge POST whose response was lost; shutdown also wakes response.read.
+GENERATION_IO = threading.local()
+
+
+class GenerationTransport:
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.lock = threading.Lock()
+        self.sockets = set()
+
+    def check(self):
+        if self.cancelled.is_set():
+            raise CancelledError("Generation was cancelled.")
+
+    def register(self, sock):
+        with self.lock:
+            self.check()
+            self.sockets.add(sock)
+
+    def abort(self):
+        with self.lock:
+            self.cancelled.set()
+            for sock in list(self.sockets):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
+class GenerationHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, transport, **kwargs):
+        self.transport = transport
+        self.generation_socket = None
+        super().__init__(*args, **kwargs)
+
+    def connect(self):
+        self.transport.check()
+        read_timeout = self.timeout
+        self.timeout = min(float(read_timeout or 5), 5.0)
+        try:
+            super().connect()
+            self.sock.settimeout(read_timeout)
+            self.generation_socket = self.sock
+            self.transport.register(self.sock)
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            self.timeout = read_timeout
+
+    def send(self, data):
+        self.transport.check()
+        return super().send(data)
+
+
+class GenerationHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, transport, connections):
+        super().__init__()
+        self.transport = transport
+        self.connections = connections
+
+    def http_open(self, request):
+        def connection(*args, **kwargs):
+            conn = GenerationHTTPConnection(*args, transport=self.transport, **kwargs)
+            self.connections.append(conn)
+            return conn
+        return self.do_open(connection, request)
+
+
+@contextmanager
+def generation_urlopen(request, timeout):
+    transport = getattr(GENERATION_IO, "transport", None)
+    # Keep /prompt submission intact: its response may assign a different ID.
+    # The worker cancels that exact ID immediately after the response arrives.
+    path = urllib.parse.urlsplit(request.full_url).path
+    if transport is None or path == "/prompt":
+        if transport is not None:
+            transport.check()
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            yield response
+        return
+    connections = []
+    opener = urllib.request.build_opener(GenerationHTTPHandler(transport, connections))
+    try:
+        transport.check()
+        with opener.open(request, timeout=timeout) as response:
+            yield response
+        transport.check()
+    except urllib.error.HTTPError as exc:
+        # urllib raises before yielding for HTTP errors. Keep its body read under
+        # the same cancellation token rather than blocking in the caller's except.
+        try:
+            body = exc.read()
+        finally:
+            exc.close()
+            transport.check()
+        raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.headers, io.BytesIO(body)) from exc
+    except Exception:
+        transport.check()
+        raise
+    finally:
+        for conn in connections:
+            with transport.lock:
+                transport.sockets.discard(conn.generation_socket)
+            conn.close()
+
+
 # ============================================================================
 # HTTP-КЛИЕНТ COMFYUI
 # Только транспорт: ping, upload, queue/history, interrupt и загрузка результата.
@@ -1519,7 +1628,7 @@ class ComfyClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+            with generation_urlopen(request, timeout=timeout or self.timeout) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -4596,7 +4705,7 @@ class ForgeClient:
             method = "POST"
         request = urllib.request.Request(self._url(path), data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+            with generation_urlopen(request, timeout=timeout or self.timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             try:
@@ -4622,10 +4731,7 @@ class ForgeClient:
         return self._request(path, payload=payload, timeout=timeout)
 
     def interrupt(self) -> None:
-        try:
-            self.post_json("sdapi/v1/interrupt", {}, timeout=10)
-        except Exception:
-            LOGGER.warning("Could not send interrupt to Forge Neo")
+        self.post_json("sdapi/v1/interrupt", {}, timeout=10)
 
 
 def current_forge_client() -> ForgeClient:
@@ -6087,7 +6193,10 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     post_done = threading.Event()
     post_result: Dict[str, Any] = {"value": None, "error": None}
 
+    transport = GENERATION.transport
+
     def forge_post_worker() -> None:
+        GENERATION_IO.transport = transport
         try:
             post_result["value"] = client.post_json(
                 endpoint,
@@ -6097,6 +6206,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         except Exception as exc:  # исключение повторно поднимет основной worker
             post_result["error"] = exc
         finally:
+            GENERATION_IO.transport = None
             post_done.set()
             with FORGE_POST_THREADS_LOCK:
                 FORGE_POST_THREADS.pop(request_id, None)
@@ -6203,6 +6313,7 @@ class GenerationState:
     uploaded_images: List[Dict[str, Any]] = field(default_factory=list)
     progress_watcher: Optional[ComfyProgressWatcher] = None
     preserved_output_path: Optional[Path] = None
+    transport: Optional[GenerationTransport] = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     # ACK закрывает разрыв между двумя listener-стадиями JSX.
     ack_event: threading.Event = field(default_factory=threading.Event)
@@ -6247,22 +6358,30 @@ def generation_context(task: Dict[str, Any], backend: str):
 
     request_id = str(task.get("request_id") or uuid.uuid4())
     task["request_id"] = request_id
-    GENERATION.request_id = request_id
-    GENERATION.queued_request_id = None
-    GENERATION.prompt_id = None
-    GENERATION.backend = backend
-    GENERATION.input_folder = None
-    GENERATION.output_folder = None
-    GENERATION.uploaded_images = []
-    GENERATION.progress_watcher = None
-    GENERATION.preserved_output_path = None
-    GENERATION.cancel_event.clear()
-    GENERATION.ack_event.clear()
-    GENERATION.active = True
-    GENERATION.queued = False
+    with GENERATION_SUBMIT_LOCK:
+        GENERATION.transport = GenerationTransport()
+        GENERATION_IO.transport = GENERATION.transport
+        GENERATION.request_id = request_id
+        GENERATION.queued_request_id = None
+        GENERATION.prompt_id = None
+        GENERATION.backend = backend
+        GENERATION.input_folder = None
+        GENERATION.output_folder = None
+        GENERATION.uploaded_images = []
+        GENERATION.progress_watcher = None
+        GENERATION.preserved_output_path = None
+        GENERATION.cancel_event.clear()
+        GENERATION.ack_event.clear()
+        GENERATION.active = True
+        GENERATION.queued = False
     try:
         raise_if_generation_cancelled(request_id)
         yield request_id
+    except Exception:
+        # /prompt is deliberately not disconnected during submission. Convert
+        # its late errors too, without replying to the closed generation listener.
+        raise_if_generation_cancelled(request_id)
+        raise
     finally:
         try:
             if GENERATION.progress_watcher is not None:
@@ -6274,22 +6393,25 @@ def generation_context(task: Dict[str, Any], backend: str):
             )
             cleanup_uploaded_images(GENERATION.input_folder, GENERATION.uploaded_images)
         finally:
-            with CANCELLED_REQUESTS_LOCK:
-                CANCELLED_REQUESTS.discard(request_id)
-            GENERATION.request_id = None
-            GENERATION.queued_request_id = None
-            GENERATION.prompt_id = None
-            GENERATION.backend = "comfy"
-            GENERATION.input_folder = None
-            GENERATION.output_folder = None
-            GENERATION.uploaded_images = []
-            GENERATION.progress_watcher = None
-            GENERATION.preserved_output_path = None
-            GENERATION.active = False
-            GENERATION.queued = False
-            GENERATION.cancel_event.clear()
-            GENERATION.ack_event.clear()
-            touch_activity()
+            with GENERATION_SUBMIT_LOCK:
+                with CANCELLED_REQUESTS_LOCK:
+                    CANCELLED_REQUESTS.discard(request_id)
+                GENERATION.request_id = None
+                GENERATION.queued_request_id = None
+                GENERATION.prompt_id = None
+                GENERATION.backend = "comfy"
+                GENERATION.input_folder = None
+                GENERATION.output_folder = None
+                GENERATION.uploaded_images = []
+                GENERATION.progress_watcher = None
+                GENERATION.preserved_output_path = None
+                GENERATION.active = False
+                GENERATION.queued = False
+                GENERATION.cancel_event.clear()
+                GENERATION.ack_event.clear()
+                touch_activity()
+                GENERATION.transport = None
+                GENERATION_IO.transport = None
 
 
 def touch_activity() -> None:
@@ -6321,6 +6443,9 @@ def send_data_to_jsx(message: Dict[str, Any], retries: int = 20) -> bool:
 
     with REPLY_LOCK:
         for attempt in range(retries):
+            transport = getattr(GENERATION_IO, "transport", None)
+            if transport is not None:
+                transport.check()
             try:
                 with socket.create_connection(
                     (API_HOST, API_REPLY_PORT), timeout=2.0
@@ -6431,7 +6556,7 @@ def answer(message: Any, request_id: Optional[str] = None) -> None:
     )
 
 
-def error_answer(message: Any, request_id: Optional[str] = None) -> None:
+def error_answer(message: Any, request_id: Optional[str] = None, retries: int = 20) -> None:
     payload: Dict[str, Any] = {
         "protocol": API_PROTOCOL,
         "request_id": request_id,
@@ -6445,18 +6570,9 @@ def error_answer(message: Any, request_id: Optional[str] = None) -> None:
             payload["params"] = message.params
         if message.details:
             payload["details"] = message.details
-    send_data_to_jsx(payload)
+    send_data_to_jsx(payload, retries=retries)
 
 
-def cancelled_answer(request_id: Optional[str] = None) -> None:
-    send_data_to_jsx(
-        {
-            "protocol": API_PROTOCOL,
-            "request_id": request_id,
-            "type": "cancelled",
-            "message": "",
-        }
-    )
 
 
 OBJECT_INFO_LOCK = threading.Lock()
@@ -6853,9 +6969,10 @@ def save_forge_schema_values(
 
 
 GENERATION_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
-GENERATION_SUBMIT_LOCK = threading.Lock()
+GENERATION_SUBMIT_LOCK = threading.RLock()
 CANCELLED_REQUESTS: set[str] = set()
 CANCELLED_REQUESTS_LOCK = threading.Lock()
+CANCEL_FAILURES: "OrderedDict[str, str]" = OrderedDict()
 WORKER_STOP = threading.Event()
 
 
@@ -7055,17 +7172,38 @@ def raise_if_generation_cancelled(request_id: str) -> None:
 
 
 def cancel_current_generation(request_id: Optional[str] = None) -> None:
-    normalized = mark_request_cancelled(request_id)
-    if not normalized:
-        return
+    # Hold the slot until interrupt has finished. A delayed global Forge interrupt
+    # must never reach the next generation. Workers still own state cleanup.
+    with GENERATION_SUBMIT_LOCK:
+        normalized = mark_request_cancelled(request_id)
+        if not normalized:
+            return
+        GENERATION.cancel_event.set()
+        transport = GENERATION.transport
+        if transport is not None:
+            transport.abort()
+        previous_transport = getattr(GENERATION_IO, "transport", None)
+        GENERATION_IO.transport = None  # control requests must survive cancellation
+        try:
+            _interrupt_generation_backend()
+        except Exception as exc:
+            CANCEL_FAILURES[normalized] = str(exc)
+            while len(CANCEL_FAILURES) > 32:
+                CANCEL_FAILURES.popitem(last=False)
+            raise
+        finally:
+            GENERATION_IO.transport = previous_transport
+            # A disconnected POST can finish late, but its token forbids any more
+            # I/O and its result is private. It must not keep the admission gate shut.
+            if transport is not None:
+                with FORGE_POST_THREADS_LOCK:
+                    FORGE_POST_THREADS.pop(normalized, None)
 
-    GENERATION.cancel_event.set()
+
+def _interrupt_generation_backend() -> None:
     prompt_id = GENERATION.prompt_id
     if GENERATION.backend == "forge":
-        try:
-            current_forge_client().interrupt()
-        except Exception:
-            LOGGER.warning("Forge Neo interrupt error")
+        current_forge_client().interrupt()
         return
     if not prompt_id:
         # Отмена могла прийти во время анализа workflow или загрузки файлов,
@@ -7099,14 +7237,19 @@ def cancel_current_generation(request_id: Optional[str] = None) -> None:
     if is_pending or not queue_known:
         try:
             client.delete_queued_prompt(prompt_id)
-        except Exception:
-            LOGGER.warning("Could not remove the prompt from the ComfyUI queue")
+        except Exception as exc:
+            raise UserVisibleError("Could not remove the prompt from the ComfyUI queue.") from exc
+
+    if is_pending:
+        # A pending prompt can start between GET /queue and POST /queue delete.
+        queue_state = client.get_queue()
+        is_running = comfy_queue_contains_prompt(queue_state, "queue_running", prompt_id)
 
     if is_running or not queue_known:
         try:
             client.interrupt(prompt_id)
-        except Exception:
-            log_exception("ComfyUI interrupt error")
+        except Exception as exc:
+            raise UserVisibleError("Could not send interrupt to ComfyUI.") from exc
 
 
 def read_image_dimensions(path: Path) -> Tuple[int, int]:
@@ -7718,13 +7861,13 @@ def generation_worker() -> None:
             else:
                 run_generation(task)
         except CancelledError:
-            cancelled_answer(task.get("request_id"))
+            LOGGER.info("Generation cancelled and released: request=%s", task.get("request_id"))
         except UserVisibleError as exc:
             LOGGER.warning("Generation error: %s", exc)
-            error_answer(exc, task.get("request_id"))
+            error_answer(exc, task.get("request_id"), retries=1)
         except Exception as exc:
             log_exception("Unhandled generation error")
-            error_answer(f"Internal Python error: {exc}", task.get("request_id"))
+            error_answer(f"Internal Python error: {exc}", task.get("request_id"), retries=1)
         finally:
             # Состояние backend и временные Comfy-upload очищает
             # generation_context; worker отвечает только за очередь задач.
@@ -8425,6 +8568,25 @@ def handle_command(command: Dict[str, Any]) -> None:
             if cleanup_request_id:
                 cleanup_deferred_comfy_temp(cleanup_request_id)
             return
+
+        if command_type == "cancel_generation":
+            target_id = str(message.get("request_id") or "")
+            if not target_id:
+                raise UserVisibleError("Cancellation requires a generation request ID.")
+            cancel_current_generation(target_id)
+            deadline = time.monotonic() + 70.0
+            while time.monotonic() < deadline:
+                with GENERATION_SUBMIT_LOCK:
+                    current = GENERATION.request_id or GENERATION.queued_request_id
+                    released = current != target_id
+                if released:
+                    failure = CANCEL_FAILURES.get(target_id)
+                    if failure:
+                        raise UserVisibleError("Python released the task, but backend cancellation could not be confirmed: " + failure, "cancellation_failed", [failure])
+                    answer({"cancelled": True, "released": True}, request_id)
+                    return
+                time.sleep(0.05)
+            raise UserVisibleError("Cancellation is still finishing. Please retry shortly.", "cancellation_pending")
 
         if command_type == "interrupt":
             interrupt_request_id = str(message.get("request_id") or request_id or "")
