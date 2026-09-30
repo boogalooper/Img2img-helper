@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.226-request-scoped-cancellation",
+	API_BUILD_ID = "0.226-jazzyscripts-local-only",
 	// На запуск Python и установку зависимостей даётся две минуты.
 	START_TIMEOUT = 2 * 60 * 1000,
 	SHORT_TIMEOUT = 8000,
@@ -5750,7 +5750,7 @@ function BridgeApi() {
 	function startupStatusFile() {
 		var root = "";
 		try { root = String($.getenv("LOCALAPPDATA") || ""); } catch (_) { }
-		return root ? new File(root + "/" + APP.tempFolder + "/" + APP.startupFile) : null;
+		return root ? new File(root + "/JazzyScripts/" + APP.tempFolder + "/" + APP.startupFile) : null;
 	}
 	function startupLogPath() {
 		var statusFile = startupStatusFile();
@@ -6792,7 +6792,7 @@ function Locale() {
 		noAvailableValues: ["нет доступных значений; генерация отключена", "no available values; generation is disabled"],
 		invalidForgeSchema: ["Ошибка схемы Forge", "Invalid Forge schema"], unknownFile: ["неизвестный файл", "unknown file"],
 		errApiConnection: ["Нет соединения с Python API.", "Cannot connect to Python API."],
-		errApiTimeout: ["Превышено время ожидания ответа Python API. Лог: %LOCALAPPDATA%\\" + APP.tempFolder + "\\" + API_FILE + ".log", "Python API response timed out. Log: %LOCALAPPDATA%\\" + APP.tempFolder + "\\" + API_FILE + ".log"],
+		errApiTimeout: ["Превышено время ожидания ответа Python API. Лог: %LOCALAPPDATA%\\JazzyScripts\\" + APP.tempFolder + "\\" + API_FILE + ".log", "Python API response timed out. Log: %LOCALAPPDATA%\\JazzyScripts\\" + APP.tempFolder + "\\" + API_FILE + ".log"],
 		errApiInvalidAnswer: ["Python API вернул повреждённый ответ.", "Python API returned an invalid response."],
 		errApiProtocolA: ["Запущена несовместимая версия протокола Python API (", "An incompatible Python API protocol is running ("],
 		errApiProtocolB: ["). Ожидается версия ", "). Expected protocol: "], errEmptyApiAnswer: ["Пустой ответ Python API.", "Empty response from Python API."],

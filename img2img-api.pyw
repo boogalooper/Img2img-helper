@@ -47,7 +47,7 @@ API_RECEIVE_PORT = 6380   # На этом порту Python принимает �
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
 VERSION = "0.226"
-API_BUILD_ID = "0.226-request-scoped-cancellation"
+API_BUILD_ID = "0.226-jazzyscripts-local-only"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -203,7 +203,7 @@ def _local_appdata() -> Path:
     return Path.home() / ".local" / "share"
 
 
-APP_DIR = _local_appdata() / APP["data_folder"]
+APP_DIR = _local_appdata() / "JazzyScripts" / APP["data_folder"]
 CACHE_DIR = APP_DIR / "cache"
 WORKFLOW_CACHE_DIR = CACHE_DIR / "workflows"
 TEMP_DIR = APP_DIR / "temp"
