@@ -4,3 +4,4 @@ forge-schemas/*.py
 forge-schemas/*.bat
 README.txt
 *.zip
+versions/
