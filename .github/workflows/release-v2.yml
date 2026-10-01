@@ -32,7 +32,7 @@ jobs:
 
           # If no version was entered, read VER from the JSX file.
           if [ -z "${VERSION}" ]; then
-            VERSION=$(sed -n 's/.*VER[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "img2img helper.jsx" | head -n 1)
+            VERSION=$(sed -n 's/.*VER[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "Photoshop-files/img2img helper.jsx" | head -n 1)
           fi
 
           # Accept both "0.14" and "v0.14".
@@ -65,11 +65,11 @@ jobs:
 
           mkdir -p "${PACKAGE_DIR}"
 
-          cp "img2img helper.jsx" "${PACKAGE_DIR}/"
-          cp "img2img-api.pyw" "${PACKAGE_DIR}/"
+          cp "install_runtime.bat" "${PACKAGE_DIR}/"
+          cp -R "Photoshop-files" "${PACKAGE_DIR}/"
           cp "README.md" "${PACKAGE_DIR}/"
 
-          cp -R "forge-schemas" "${PACKAGE_DIR}/"
+          cp "LICENSE" "${PACKAGE_DIR}/"
           cp -R "advanced" "${PACKAGE_DIR}/"
 
           cd dist
