@@ -5419,7 +5419,7 @@ function BridgeApi() {
 		if (progress) progress.setStage(str.progressStartPython, 3);
 		clearStartupStatus();
 		var launchStartedAt = (new Date()).getTime();
-		if (pythonFile.execute() === false) throw new Error(str.errPythonExecute + "\n" + pythonFile.fsName);
+		if (jazzyStartPython(pythonFile) === false) throw new Error(str.errPythonExecute + "\n" + pythonFile.fsName);
 		var startupState = waitForConnection(Math.max(1, deadline - (new Date()).getTime()), progress, launchStartedAt);
 		if (startupState !== true) {
 			var logPath = startupState && startupState.log_file ? String(startupState.log_file) : startupLogPath();
@@ -7317,4 +7317,24 @@ function escapeJsonString(value) {
 function jsonParse(text) {
 	if (text === null || text === undefined || text === "") return null;
 	return eval("(" + text + ")");
+}
+
+// Shared launcher is created by install_runtime.bat inside SharedRuntime.
+function jazzyStartPython(moduleFile) {
+    if ($.os.toLowerCase().indexOf('windows') < 0) return moduleFile.execute();
+    var local = $.getenv('LOCALAPPDATA');
+    if (!local) return moduleFile.execute();
+    var root = local + '/JazzyScripts/SharedRuntime';
+    if (!new Folder(root + '/venv').exists) return moduleFile.execute();
+    var python = new File(root + '/venv/Scripts/pythonw.exe');
+    var launcher = new File(root + '/launcher.vbs');
+    if (!python.exists || !launcher.exists)
+        throw new Error('Shared Python is incomplete. Run install_runtime.bat.');
+    var previous = $.getenv('JAZZYSCRIPTS_SERVER');
+    try {
+        $.setenv('JAZZYSCRIPTS_SERVER', moduleFile.fsName);
+        return launcher.execute();
+    } finally {
+        $.setenv('JAZZYSCRIPTS_SERVER', previous || '');
+    }
 }
