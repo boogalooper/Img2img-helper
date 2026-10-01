@@ -2,7 +2,7 @@
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 
-set "INSTALLER_VERSION=3"
+set "INSTALLER_VERSION=4"
 set "RUNTIME=%LOCALAPPDATA%\JazzyScripts\SharedRuntime"
 set "UV_DIR=%RUNTIME%\uv"
 set "UV_STAGE=%RUNTIME%\uv.new"
@@ -13,8 +13,6 @@ set "CACHE=%RUNTIME%\cache"
 set "PY=%VENV%\Scripts\python.exe"
 
 set "PY_VERSION=3.11.16"
-set "NUMPY_VERSION=1.26.4"
-set "OPENCV_VERSION=4.11.0.86"
 set "UV_VERSION=0.12.19"
 set "PIP_INSECURE=0"
 
@@ -46,8 +44,6 @@ echo JazzyScripts - shared Python runtime
 echo Installer revision: %INSTALLER_VERSION%
 echo Runtime: %RUNTIME%
 echo CPython: %PY_VERSION% x64 via uv
-echo NumPy: %NUMPY_VERSION%
-echo OpenCV: %OPENCV_VERSION%
 echo ==============================================
 echo.
 set "PYTHONNOUSERSITE=1"
@@ -103,9 +99,8 @@ echo Installation complete.
 echo ==============================================
 echo Runtime: %RUNTIME%
 echo.
-echo Copy the contents of "Photoshop-files", including the "lib" folder,
-echo into the Photoshop Scripts folder.
-echo This runtime is shared by all four script packages.
+echo Shared runtime is ready. Install the Photoshop files from each script package.
+echo Runtime for img2img helper, Remote API img2img helper and Spell checker.
 echo.
 pause
 exit /b 0
@@ -235,7 +230,7 @@ if errorlevel 1 (
 exit /b 0
 
 :check_server_not_running
-for %%P in (6310 6380 6390 6410) do (
+for %%P in (6380 6390 6410) do (
     "%PY%" -c "import socket; s=socket.socket(); s.settimeout(0.25); r=s.connect_ex(('127.0.0.1',%%P)); s.close(); raise SystemExit(0 if r==0 else 1)" >nul 2>&1
     if not errorlevel 1 (
         echo [ERROR] TCP port %%P is in use. A script server may still be running.
@@ -246,7 +241,7 @@ for %%P in (6310 6380 6390 6410) do (
 exit /b 0
 
 :ensure_packages
-"%PY%" -c "import importlib.metadata as m; expected={'numpy': '1.26.4', 'opencv-python': '4.11.0.86', 'Pillow': '11.1.0', 'requests': '2.32.3', 'websocket-client': '1.8.0', 'pymorphy3': '2.0.3', 'psutil': '7.0.0'}; assert all(m.version(k)==v for k,v in expected.items()); import cv2,numpy,PIL.Image,requests,websocket,pymorphy3,psutil; assert callable(websocket.create_connection); assert not cv2.CascadeClassifier(cv2.data.haarcascades+'haarcascade_frontalface_default.xml').empty(); assert pymorphy3.MorphAnalyzer().parse('test'); assert psutil.virtual_memory().total>0" >nul 2>&1
+"%PY%" -c "import importlib.metadata as m; expected={'Pillow': '11.1.0', 'requests': '2.32.3', 'websocket-client': '1.8.0', 'pymorphy3': '2.0.3'}; assert all(m.version(k)==v for k,v in expected.items()); import PIL.Image,requests,websocket,pymorphy3; assert callable(websocket.create_connection); assert pymorphy3.MorphAnalyzer().parse('test')" >nul 2>&1
 if not errorlevel 1 (
     echo Existing Python packages OK.
     "%UV%" pip check --python "%PY%"
@@ -260,9 +255,9 @@ if errorlevel 1 exit /b 1
 echo.
 echo Installing pinned binary packages into the private venv...
 if "%PIP_INSECURE%"=="1" (
-    "%UV%" pip install --python "%PY%" --upgrade --no-build "numpy==1.26.4" "opencv-python==4.11.0.86" "Pillow==11.1.0" "requests==2.32.3" "websocket-client==1.8.0" "pymorphy3==2.0.3" "psutil==7.0.0" --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
+    "%UV%" pip install --python "%PY%" --upgrade --no-build "Pillow==11.1.0" "requests==2.32.3" "websocket-client==1.8.0" "pymorphy3==2.0.3" --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
 ) else (
-    "%UV%" pip install --python "%PY%" --upgrade --no-build "numpy==1.26.4" "opencv-python==4.11.0.86" "Pillow==11.1.0" "requests==2.32.3" "websocket-client==1.8.0" "pymorphy3==2.0.3" "psutil==7.0.0"
+    "%UV%" pip install --python "%PY%" --upgrade --no-build "Pillow==11.1.0" "requests==2.32.3" "websocket-client==1.8.0" "pymorphy3==2.0.3"
 )
 if errorlevel 1 (
     if "%PIP_INSECURE%"=="1" (
@@ -284,7 +279,7 @@ if errorlevel 1 (
     echo [ERROR] Installed Python packages have dependency conflicts.
     exit /b 1
 )
-"%PY%" -c "import importlib.metadata as m; expected={'numpy': '1.26.4', 'opencv-python': '4.11.0.86', 'Pillow': '11.1.0', 'requests': '2.32.3', 'websocket-client': '1.8.0', 'pymorphy3': '2.0.3', 'psutil': '7.0.0'}; assert all(m.version(k)==v for k,v in expected.items()); import cv2,numpy,PIL.Image,requests,websocket,pymorphy3,psutil; assert callable(websocket.create_connection); assert not cv2.CascadeClassifier(cv2.data.haarcascades+'haarcascade_frontalface_default.xml').empty(); assert pymorphy3.MorphAnalyzer().parse('test'); assert psutil.virtual_memory().total>0"
+"%PY%" -c "import importlib.metadata as m; expected={'Pillow': '11.1.0', 'requests': '2.32.3', 'websocket-client': '1.8.0', 'pymorphy3': '2.0.3'}; assert all(m.version(k)==v for k,v in expected.items()); import PIL.Image,requests,websocket,pymorphy3; assert callable(websocket.create_connection); assert pymorphy3.MorphAnalyzer().parse('test')"
 if errorlevel 1 (
     echo [ERROR] Python package validation failed.
     exit /b 1
@@ -333,7 +328,7 @@ exit /b 0
 :self_test
 echo.
 echo Running runtime self-test...
-"%PY%" -c "import sys,struct; assert sys.version_info[:3]==(3,11,16) and struct.calcsize('P')==8; import importlib.metadata as m; expected={'numpy': '1.26.4', 'opencv-python': '4.11.0.86', 'Pillow': '11.1.0', 'requests': '2.32.3', 'websocket-client': '1.8.0', 'pymorphy3': '2.0.3', 'psutil': '7.0.0'}; assert all(m.version(k)==v for k,v in expected.items()); import cv2,numpy,PIL.Image,requests,websocket,pymorphy3,psutil; assert callable(websocket.create_connection); assert not cv2.CascadeClassifier(cv2.data.haarcascades+'haarcascade_frontalface_default.xml').empty(); assert pymorphy3.MorphAnalyzer().parse('test'); assert psutil.virtual_memory().total>0; print('OK - Python and all shared dependencies')"
+"%PY%" -c "import sys,struct; assert sys.version_info[:3]==(3,11,16) and struct.calcsize('P')==8; import importlib.metadata as m; expected={'Pillow': '11.1.0', 'requests': '2.32.3', 'websocket-client': '1.8.0', 'pymorphy3': '2.0.3'}; assert all(m.version(k)==v for k,v in expected.items()); import PIL.Image,requests,websocket,pymorphy3; assert callable(websocket.create_connection); assert pymorphy3.MorphAnalyzer().parse('test'); print('OK - Python and all shared dependencies')"
 if errorlevel 1 (
     echo [ERROR] Runtime self-test failed.
     exit /b 1
