@@ -47,8 +47,8 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6380   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.232"
-API_BUILD_ID = "0.232-forge-persistent-overrides"
+VERSION = "0.233"
+API_BUILD_ID = "0.233-dead-code-cleanup"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -2051,22 +2051,6 @@ class ComfyClient:
     def get_queue(self) -> Dict[str, Any]:
         result = self.get_json("/queue", timeout=15)
         return result if isinstance(result, dict) else {}
-
-    def interrupt(self, prompt_id: Optional[str] = None) -> None:
-        payload = {"prompt_id": prompt_id} if prompt_id else {}
-        try:
-            self.post_json("/interrupt", payload, timeout=10)
-        except UserVisibleError:
-            self._request(
-                "POST",
-                "/interrupt",
-                data=json_dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json; charset=utf-8"},
-                timeout=10,
-            )
-
-    def delete_queued_prompt(self, prompt_id: str) -> None:
-        self.post_json("/queue", {"delete": [prompt_id]}, timeout=15)
 
     def download_image_for_photoshop(
         self,
@@ -5043,9 +5027,6 @@ class ForgeClient:
     def post_json(self, path: str, payload: Dict[str, Any], timeout: Optional[float] = None) -> Any:
         return self._request(path, payload=payload, timeout=timeout)
 
-    def interrupt(self) -> None:
-        self.post_json("sdapi/v1/interrupt", {}, timeout=10)
-
 
 def current_forge_client() -> ForgeClient:
     return ForgeClient(runtime_config().backend_host, runtime_config().forge_port, timeout=runtime_config().generation_timeout)
@@ -5884,16 +5865,27 @@ def _decode_forge_image(value: Any, destination_without_suffix: Path) -> Path:
 _OPTION_MISSING = object()
 
 
-def _schema_option_controls(schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _forge_option_controls(
+    schema: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Classify controls that map to persistent/request-local Forge options."""
+
     controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
-    result: List[Dict[str, Any]] = []
+    checkpoint_control: Optional[Dict[str, Any]] = None
+    modules_control: Optional[Dict[str, Any]] = None
+    option_controls: List[Dict[str, Any]] = []
     for control in controls:
         if not isinstance(control, dict):
             continue
-        option_key = str(control.get("option_key") or "").strip()
-        if option_key:
-            result.append(control)
-    return result
+        control_id = str(control.get("id") or "")
+        source = str(control.get("source") or "")
+        if checkpoint_control is None and (source == "checkpoints" or control_id == "checkpoint"):
+            checkpoint_control = control
+        if modules_control is None and (source == "modules" or control_id == "modules"):
+            modules_control = control
+        if str(control.get("option_key") or "").strip():
+            option_controls.append(control)
+    return checkpoint_control, modules_control, option_controls
 
 
 def _apply_forge_options(
@@ -5910,19 +5902,7 @@ def _apply_forge_options(
     schema. Controls with ``option_key`` are persistent Forge settings: their
     selected values remain in ``/sdapi/v1/options`` after generation.
     """
-    controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
-    checkpoint_control: Optional[Dict[str, Any]] = None
-    modules_control: Optional[Dict[str, Any]] = None
-    option_controls = _schema_option_controls(schema)
-    for control in controls:
-        if not isinstance(control, dict):
-            continue
-        control_id = str(control.get("id") or "")
-        source = str(control.get("source") or "")
-        if checkpoint_control is None and (source == "checkpoints" or control_id == "checkpoint"):
-            checkpoint_control = control
-        if modules_control is None and (source == "modules" or control_id == "modules"):
-            modules_control = control
+    checkpoint_control, modules_control, option_controls = _forge_option_controls(schema)
 
     if checkpoint_control is None and modules_control is None and not option_controls:
         return
@@ -5990,19 +5970,7 @@ def _forge_request_overrides(
     matches the historical /options path used by non-standard Forge endpoints.
     """
 
-    controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
-    checkpoint_control: Optional[Dict[str, Any]] = None
-    modules_control: Optional[Dict[str, Any]] = None
-    option_controls = _schema_option_controls(schema)
-    for control in controls:
-        if not isinstance(control, dict):
-            continue
-        control_id = str(control.get("id") or "")
-        source = str(control.get("source") or "")
-        if checkpoint_control is None and (source == "checkpoints" or control_id == "checkpoint"):
-            checkpoint_control = control
-        if modules_control is None and (source == "modules" or control_id == "modules"):
-            modules_control = control
+    checkpoint_control, modules_control, option_controls = _forge_option_controls(schema)
 
     runtime_catalog = runtime_catalog or {}
     overrides: Dict[str, Any] = {}
@@ -9267,9 +9235,7 @@ def _apply_handshake_locked(message: Dict[str, Any]) -> Dict[str, Any]:
     except OSError:
         LOGGER.warning("Could not write runtime.json")
     return {
-        "version": VERSION,
         "comfy_input_folder": str(RUNTIME.comfy_input_folder or ""),
-        "comfy_temp_folder": str(RUNTIME.comfy_temp_folder or ""),
         "mode": status.get("mode", "none"),
         "backends": status.get("backends", {}),
     }
@@ -9298,10 +9264,6 @@ def handle_command(command: Dict[str, Any]) -> None:
             answer({
                 "protocol": API_PROTOCOL,
                 "build_id": API_BUILD_ID,
-                "version": VERSION,
-                "script_path": str(Path(__file__).resolve()),
-                "receive_port": API_RECEIVE_PORT,
-                "reply_port": API_REPLY_PORT,
                 "startup_status": str(startup.get("status") or "starting"),
                 "startup_message": str(startup.get("message") or ""),
                 "startup_log_file": str(startup.get("log_file") or LOG_FILE),

@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.248",
+	VER = "0.249",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.232-forge-persistent-overrides",
+	API_BUILD_ID = "0.233-dead-code-cleanup",
 	// Пользовательские runtime-таймауты имеют те же default/границы в JSX и Python.
 	GENERATION_TIMEOUT_DEFAULT = 20 * 60,
 	GENERATION_TIMEOUT_MIN = 30,
@@ -6910,7 +6910,6 @@ function Locale() {
 		workflow_empty: ["Выбранный workflow пуст.", "The selected workflow is empty."],
 		invalid_api_nodes: ["В API-workflow найдены некорректные ноды без class_type или inputs: %1", "The API workflow contains invalid nodes without class_type or inputs: %1"],
 		workflow_not_ready: ["Workflow не готов к запуску. Откройте настройки workflow и исправьте перечисленные проблемы.", "The workflow is not ready to run. Open Workflow settings and correct the listed problems."],
-		translator_unavailable: ["Перевод prompt недоступен: не удалось загрузить deep-translator. Подробности записаны в журнал Python API.", "Prompt translation is unavailable because deep-translator could not be loaded. See the Python API log for details."],
 		inpaint_mask_missing: ["Для параметра «Маска inpaint» не найден подходящий вариант. В настройках workflow выберите MASK основной ноды LoadImage или ноду LoadImageMask.", "No suitable option was found for Inpaint mask. In Workflow settings, select the main LoadImage MASK or a LoadImageMask node."],
 		inpaint_mask_changed: ["Настройка параметра «Маска inpaint» изменилась. Снова откройте главное окно скрипта.", "The Inpaint mask configuration changed. Reopen the main script window."],
 		inpaint_main_mask_unused: ["MASK основной ноды LoadImage не используется в workflow. Подключите выход MASK к inpaint-ветке в ComfyUI или выберите другой вариант параметра «Маска inpaint».", "The main LoadImage MASK is not used by the workflow. Connect its MASK output to the inpaint branch in ComfyUI or select another Inpaint mask option."],
@@ -6937,7 +6936,6 @@ function Locale() {
 		forge_image_stitch_unsupported: ["Выбранная схема Forge не поддерживает ImageStitch.", "The selected Forge schema does not support ImageStitch."],
 		forge_processing_mode_required: ["Выберите хотя бы один режим обработки Forge.", "Select at least one Forge processing mode."],
 		cancellation_pending: ["Отмена ещё завершается. Повторите запуск немного позже.", "Cancellation is still finishing. Please retry shortly."],
-		cancellation_failed: ["Задание в Python освобождено, но подтвердить отмену в ComfyUI/Forge не удалось: %1", "Python released the task, but backend cancellation could not be confirmed: %1"],
 		generation_already_running: ["Предыдущая генерация ещё не завершена.", "The previous generation has not finished yet."],
 		workflow_folder_not_selected: ["Папка API-workflow не выбрана. Укажите её в настройках скрипта.", "The API-workflow folder is not selected. Choose it in the script settings."],
 		workflow_folder_missing: ["Папка API-workflow не существует: %1", "The API-workflow folder does not exist: %1"],
@@ -6953,7 +6951,6 @@ function Locale() {
 		forge_save_json_required: ["Схему Forge необходимо сохранить как JSON-файл:\n%1", "The Forge schema must be saved as a JSON file:\n%1"],
 		forge_save_write_failed: ["Не удалось записать JSON-схему Forge:\n%1\n\n%2\n\nПроверьте права доступа к файлу и папке.", "Could not write Forge schema JSON:\n%1\n\n%2\n\nCheck file and folder permissions."],
 		translate_failed: ["Не удалось перевести промпт:\n%1", "Could not translate the prompt:\n%1"],
-		translation_service_error: ["Сервис перевода вернул серверную ошибку. Повторите попытку позже.", "The translation service returned a server error. Please try again later."],
 		forge_field_invalid_value: ["Значение «%1» недоступно для поля Forge %2. Обновите данные схемы или выберите другое значение.", "Value “%1” is unavailable for Forge field %2. Refresh the schema data or select another value."],
 		forge_field_no_values: ["Для поля Forge %1 нет доступных значений. Обновите данные схемы.", "Forge field %1 has no available values. Refresh the schema data."],
 		forge_field_list_expected: ["Поле Forge %1 должно содержать список значений.", "Forge field %1 expects a list of values."],
