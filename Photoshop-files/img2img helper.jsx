@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.242",
+	VER = "0.248",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -40,13 +40,28 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.226-jazzyscripts-local-only",
-	// На запуск Python и установку зависимостей даётся две минуты.
+	API_BUILD_ID = "0.232-forge-persistent-overrides",
+	// Пользовательские runtime-таймауты имеют те же default/границы в JSX и Python.
+	GENERATION_TIMEOUT_DEFAULT = 20 * 60,
+	GENERATION_TIMEOUT_MIN = 30,
+	GENERATION_TIMEOUT_MAX = 24 * 60 * 60,
+	PYTHON_IDLE_TIMEOUT_DEFAULT = 15 * 60,
+	PYTHON_IDLE_TIMEOUT_MAX = 7 * 24 * 60 * 60,
+	BACKEND_MONITOR_INTERVAL_DEFAULT = 5,
+	BACKEND_MONITOR_INTERVAL_MIN = 2,
+	BACKEND_MONITOR_INTERVAL_MAX = 300,
+	// Обычный запуск ждём до двух минут. Python ограничивает саму установку
+	// зависимостей десятью минутами; JSX оставляет минуту на публикацию ошибки/ready.
 	START_TIMEOUT = 2 * 60 * 1000,
+	INSTALL_TIMEOUT = 11 * 60 * 1000,
 	SHORT_TIMEOUT = 8000,
 	STARTUP_PROGRESS_DELAY = 1000,
-	TRANSLATE_TIMEOUT = 10 * 60 * 1000,
-	ANALYZE_TIMEOUT = 90000,
+	// Python ограничивает перевод 45 с; 10 с остаются на возврат ответа через bridge.
+	TRANSLATE_TIMEOUT = 55 * 1000,
+	// Forge catalog может последовательно опросить несколько endpoint по 30–60 с.
+	// Шесть минут покрывают его максимальный сетевой бюджет и не оставляют Python
+	// продолжать анализ после преждевременного таймаута JSX.
+	ANALYZE_TIMEOUT = 6 * 60 * 1000,
 	// За 7,5 с подготовка проходит половину пути к пределу 20%.
 	GENERATION_PREPARE_EXPECTED_MS = 7500,
 	GENERATION_RUN_DEFAULT_EXPECTED_MS = 7500,
@@ -237,7 +252,7 @@ function init() {
 		// TCP-check определяет, нужен ли прогресс запуска.
 		var apiRunning = api.isRunning();
 		if (!apiRunning) {
-			startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT + ANALYZE_TIMEOUT);
+			startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT + INSTALL_TIMEOUT + ANALYZE_TIMEOUT);
 			startupProgress.show();
 		}
 		api.initialize(startupProgress, apiRunning);
@@ -1927,14 +1942,9 @@ function showGlobalSettings(connectionRecovery) {
 	browse.onClick = function () { var folder = Folder.selectDialog(str.selectWorkflowFolder); if (folder) folderEdit.text = folder.fsName; };
 	forgeBrowse.onClick = function () { var folder = Folder.selectDialog(str.selectForgeSchemaFolder); if (folder) forgeFolderEdit.text = folder.fsName; };
 	var pythonIdleSeconds = parseInt(temp.pythonIdleTimeout, 10);
-	if (isNaN(pythonIdleSeconds)) pythonIdleSeconds = 15 * 60;
+	if (isNaN(pythonIdleSeconds)) pythonIdleSeconds = PYTHON_IDLE_TIMEOUT_DEFAULT;
 	var pythonRows = ui.addFormRows(connection, [
 			{ id: "timeout", label: str.generationTimeout, value: String(temp.generationTimeout), labelWidth: 220, controlWidth: 65 },
-			{
-				id: "version", type: "static", label: str.pythonApiVersion,
-				value: backend.pythonVersion() ? "v" + backend.pythonVersion() : "—",
-				labelWidth: 220, controlWidth: 100
-			},
 			{
 				id: "idleTimeout", label: str.pythonIdleTimeout,
 				value: String(Math.round(pythonIdleSeconds / 60)),
@@ -1942,13 +1952,36 @@ function showGlobalSettings(connectionRecovery) {
 			},
 			{
 				id: "monitorInterval", label: str.backendMonitorInterval,
-				value: String(temp.backendMonitorInterval || 5),
+				value: String(temp.backendMonitorInterval),
 				labelWidth: 220, controlWidth: 65
 			}
 		], ui.settingsControlWidth),
 		timeout = pythonRows.timeout.control,
 		pythonIdleTimeout = pythonRows.idleTimeout.control,
 		backendMonitorInterval = pythonRows.monitorInterval.control;
+    var translatorRow = connection.add("group{orientation:'row',alignChildren:['left','center']}");
+    translatorRow.add("statictext", undefined, str.preferredTranslator);
+    var translator = translatorRow.add("dropdownlist"), translatorOriginal = "";
+    var translatorOptions = [
+        ["google_clients5", "Google (clients5)"], ["google_api", "Google (API)"],
+        ["google_web", "Google (web)"], ["lingva_plausibility", "Lingva — plausibility.cloud"],
+        ["lingva_projectsegfau", "Lingva — projectsegfau.lt"], ["lingva_lunar", "Lingva — lunar.icu"],
+        ["lingva_jae", "Lingva — jae.fi"], ["mymemory", "MyMemory"],
+        ["libre_skitzen", "LibreTranslate — skitzen.com"], ["libre_mentality", "LibreTranslate — mentality.rip"]
+    ];
+    translator.preferredSize.width = 240;
+    translator.helpTip = str.preferredTranslatorHelp;
+    for (var ti = 0; ti < translatorOptions.length; ti++) {
+        var translatorItem = translator.add("item", translatorOptions[ti][1]);
+        translatorItem.serverId = translatorOptions[ti][0];
+    }
+    translator.selection = 0;
+    try {
+        var translationSettings = api.translationSettings();
+        translatorOriginal = String(translationSettings.preferred_server || "google_clients5");
+        for (var tj = 0; tj < translator.items.length; tj++)
+            if (translator.items[tj].serverId == translatorOriginal) translator.selection = tj;
+    } catch (_) { translator.enabled = false; }
 	function updateBackendFields() {
 		var comfyMode = temp.activeBackend != BACKEND_FORGE;
 		comfyPortRow.enabled = folderRow.enabled = connectionRecovery || comfyMode;
@@ -1984,11 +2017,14 @@ function showGlobalSettings(connectionRecovery) {
 	var outputFields = ui.addCheckboxes(output, [
 			{ id: "flatten", text: str.flatten, value: temp.flatten },
 			{ id: "rasterize", text: str.rasterize, value: temp.rasterizeImage },
-			{ id: "keepAspectRatio", text: str.keepAspectRatioDuringPlace, value: temp.keepAspectRatioDuringPlace }
+			{ id: "keepAspectRatio", text: str.keepAspectRatioDuringPlace, value: temp.keepAspectRatioDuringPlace },
+			{ id: "tagResultSRGB", text: str.tagResultSRGB, value: temp.tagResultSRGB }
 		]),
 		flatten = outputFields.flatten,
 		rasterize = outputFields.rasterize,
-		keepAspectRatio = outputFields.keepAspectRatio;
+		keepAspectRatio = outputFields.keepAspectRatio,
+		tagResultSRGB = outputFields.tagResultSRGB;
+	tagResultSRGB.helpTip = str.tagResultSRGBHelp;
 	var brush = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:10}");
 	brush.text = str.brushSettings;
 	brush.helpTip = str.userSettingsHint;
@@ -2137,15 +2173,24 @@ function showGlobalSettings(connectionRecovery) {
 		temp.workflowsFolder = folderEdit.text || "";
 		temp.forgeSchemasFolder = forgeFolderEdit.text || "";
 		if (resizeEditor && resizeEditor.saveActive) resizeEditor.saveActive();
-		temp.flatten = flatten.value; temp.rasterizeImage = rasterize.value; temp.keepAspectRatioDuringPlace = keepAspectRatio.value;
+		temp.flatten = flatten.value; temp.rasterizeImage = rasterize.value; temp.keepAspectRatioDuringPlace = keepAspectRatio.value; temp.tagResultSRGB = tagResultSRGB.value;
 		temp.recordSettingsToAction = recordSettings.value; temp.writeLayerMetadata = metadata.value; temp.selectBrush = selectBrush.value;
-		temp.brushOpacity = clamp(Math.round(opacityControl.slider.value), 1, 100); temp.generationTimeout = clamp(parseInt(timeout.text, 10) || 1200, 30, 86400);
+		temp.brushOpacity = clamp(Math.round(opacityControl.slider.value), 1, 100);
+		var generationTimeoutSeconds = parseInt(timeout.text, 10);
+		if (isNaN(generationTimeoutSeconds)) generationTimeoutSeconds = GENERATION_TIMEOUT_DEFAULT;
+		temp.generationTimeout = clamp(generationTimeoutSeconds, GENERATION_TIMEOUT_MIN, GENERATION_TIMEOUT_MAX);
 		var idleMinutes = parseInt(pythonIdleTimeout.text, 10);
-		if (isNaN(idleMinutes)) idleMinutes = 15;
-		temp.pythonIdleTimeout = clamp(idleMinutes, 0, 7 * 24 * 60) * 60;
-		temp.backendMonitorInterval = clamp(parseInt(backendMonitorInterval.text, 10) || 5, 2, 300);
+		if (isNaN(idleMinutes)) idleMinutes = Math.round(PYTHON_IDLE_TIMEOUT_DEFAULT / 60);
+		temp.pythonIdleTimeout = clamp(idleMinutes * 60, 0, PYTHON_IDLE_TIMEOUT_MAX);
+		var monitorSeconds = parseInt(backendMonitorInterval.text, 10);
+		if (isNaN(monitorSeconds)) monitorSeconds = BACKEND_MONITOR_INTERVAL_DEFAULT;
+		temp.backendMonitorInterval = clamp(monitorSeconds, BACKEND_MONITOR_INTERVAL_MIN, BACKEND_MONITOR_INTERVAL_MAX);
 		if (folderChanged) { temp.workflowCatalog = []; temp.selectedWorkflow = ""; }
 		if (forgeFolderChanged) { temp.forgeCatalog = []; temp.selectedForgePreset = ""; }
+        if (translator.enabled && translator.selection && translator.selection.serverId != translatorOriginal) {
+            try { api.translationSettings(translator.selection.serverId); }
+            catch (translatorError) { messages.error(translatorError); return; }
+        }
 		cfg.data = temp; cfg.bindProperties(); accepted = true; w.close(1);
 	});
 	ui.showDialog(w);
@@ -2378,6 +2423,7 @@ function GenerationRuntime() {
 					values: cloneObj(values),
 					selected_loras: cloneObj(profile.selectedLoras || []),
 					image_inputs: collectForgeImageInputs(schema, profile),
+					tag_srgb: cfg.tagResultSRGB === true,
 					timeout: cfg.generationTimeout
 				};
 			} else {
@@ -2393,6 +2439,7 @@ function GenerationRuntime() {
 					references: collectReferenceFiles(schema, profile),
 					binding_overrides: profile.bindingOverrides,
 					output_format: normalizeOutputFormat(profile.outputFormat),
+					tag_srgb: cfg.tagResultSRGB === true,
 					timeout: cfg.generationTimeout
 				};
 			}
@@ -2477,8 +2524,12 @@ function GenerationRuntime() {
 				messages.show({ title: str.generationDiagnostics, warnings: localizedGenerationWarnings });
 			}
 		} finally {
-			if (inputFile && inputFile.exists) try { inputFile.remove(); } catch (_) { }
-			if (maskFile && maskFile.exists) try { maskFile.remove(); } catch (_) { }
+            // During async cancellation Python removes direct Comfy exports
+            // only after the backend has stopped using them.
+            var keepDirectInputs = generationProgress.wasCancelled() && directComfyFolder && inputFile &&
+                inputFile.parent.fsName == new Folder(directComfyFolder).fsName;
+			if (!keepDirectInputs && inputFile && inputFile.exists) try { inputFile.remove(); } catch (_) { }
+			if (!keepDirectInputs && maskFile && maskFile.exists) try { maskFile.remove(); } catch (_) { }
 			if (resultFile && resultFile.exists) try { resultFile.remove(); } catch (_) { }
 			generationProgress.clear();
 		}
@@ -2912,8 +2963,7 @@ function ActionRuntime() {
 function BackendRuntime() {
 	var status = { mode: "none", backends: { comfy: { available: false }, forge: { available: false } } },
 		pendingNotices = [],
-		localComfyInputFolder = "",
-		pythonApiVersion = "";
+		localComfyInputFolder = "";
 	function pushNotice(key, msg) {
 		key = String(key || msg || "");
 		msg = String(msg || "");
@@ -2941,8 +2991,6 @@ function BackendRuntime() {
 	}
 	function applyStatus(response) {
 		if (!response || typeof response != "object") return;
-		if (response.hasOwnProperty("version"))
-			pythonApiVersion = String(response.version || "");
 		if (response.hasOwnProperty("comfy_input_folder"))
 			localComfyInputFolder = String(response.comfy_input_folder || "");
 		var source = response.backends ? response : { mode: "none", backends: {} };
@@ -3371,7 +3419,6 @@ function BackendRuntime() {
 	this.hasAvailable = function () { return status.mode != "none"; };
 	this.isAvailable = isAvailable;
 	this.statusLabel = statusLabel;
-	this.pythonVersion = function () { return pythonApiVersion; };
 	this.normalizeActiveBackend = normalizeActiveBackend;
 	this.comfyFolderReady = comfyFolderReady;
 	this.defaultForgeFolder = defaultForgeFolder;
@@ -5176,7 +5223,8 @@ function GenerationProgress() {
 		} catch (progressError) {
 			if (cancellationRequested) throw progressError;
 			if (!isUserCancellation(progressError)) {
-				api.cancelGeneration(requestId);
+                cancellationRequested = true;
+                try { api.cancelGeneration(requestId); } catch (_) { }
 				throw progressError;
 			}
 			return cancelProgress();
@@ -5214,6 +5262,7 @@ function GenerationProgress() {
 		res = answer === false ? false : answer;
 		return answer !== false;
 	};
+    this.wasCancelled = function () { return cancellationRequested; };
 	this.getResult = function () { return res; };
 	this.clear = function () {
 		payload = null;
@@ -5436,7 +5485,13 @@ function BridgeApi() {
 		return true;
 	};
 	this.ping = function (progress, timeout) { return call("ping", null, timeout || SHORT_TIMEOUT, progress); };
-	this.translate = function (text, progress) { return call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress); };
+	this.translate = function (text, progress) {
+        var result = call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress);
+        return result && typeof result == "object" ? result.text : result;
+    };
+    this.translationSettings = function (preferred) {
+        return call("translation_settings", { preferred_server: preferred || "" }, SHORT_TIMEOUT);
+    };
 	this.handshake = function (progress, settings, backendStatusMode, verifyBackend, backendProbeToken) {
 		var source = settings || cfg;
 		return call("handshake", {
@@ -5502,7 +5557,7 @@ function BridgeApi() {
 		if (!requestId) return;
 		// A distinct reply ID prevents a late image/init from acknowledging cancel.
 		try {
-			return call("cancel_generation", { request_id: requestId }, 90000);
+			return call("cancel_generation", { request_id: requestId }, SHORT_TIMEOUT);
 		} catch (cancelError) {
 			self.interrupt(requestId);
 			throw cancelError;
@@ -5677,8 +5732,12 @@ function BridgeApi() {
 		return null;
 	}
 	function waitForConnection(timeout, startup, launchStartedAt) {
-		var started = (new Date()).getTime(), lastStatus = null, lastStage = "";
-		while ((new Date()).getTime() - started < timeout) {
+		var started = (new Date()).getTime(),
+			deadline = started + timeout,
+			installDeadlineExtended = false,
+			lastStatus = null,
+			lastStage = "";
+		while ((new Date()).getTime() < deadline) {
 			if (checkConnection(API_HOST, API_PORT_SEND)) {
 				clearStartupStatus();
 				return true;
@@ -5690,6 +5749,10 @@ function BridgeApi() {
 					throw new Error(str.errPythonStartupDetails +
 						(status.message ? "\n\n" + status.message : "") +
 						(status.log_file ? "\n\n" + str.pythonLog + status.log_file : ""));
+				if (status.status == "installing" && !installDeadlineExtended) {
+					deadline = Math.max(deadline, (new Date()).getTime() + INSTALL_TIMEOUT);
+					installDeadlineExtended = true;
+				}
 				var stage = status.status == "installing"
 					? str.progressInstallPython + (status.message ? " " + status.message : "")
 					: str.progressStartPython;
@@ -5712,12 +5775,12 @@ function BridgeApi() {
 	}
 	function ensureStartupProgress(progress) {
 		if (progress) return progress;
-		startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT + ANALYZE_TIMEOUT);
+		startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT + INSTALL_TIMEOUT + ANALYZE_TIMEOUT);
 		startupProgress.show();
 		return startupProgress;
 	}
 	function waitForPythonReady(info, progress, deadline) {
-		var lastStage = "";
+		var lastStage = "", installDeadlineExtended = false;
 		for (; ;) {
 			validatePythonProtocol(info);
 			clearStartupStatus();
@@ -5730,6 +5793,10 @@ function BridgeApi() {
 					(message ? "\n\n" + message : "") +
 					(logPath ? "\n\n" + str.pythonLog + logPath : ""));
 			progress = ensureStartupProgress(progress);
+			if (status == "installing" && !installDeadlineExtended) {
+				deadline = Math.max(deadline, (new Date()).getTime() + INSTALL_TIMEOUT);
+				installDeadlineExtended = true;
+			}
 			var stage = status == "installing"
 				? str.progressInstallPython + (message ? " " + message : "")
 				: str.progressStartPython;
@@ -5922,7 +5989,7 @@ function Config() {
 		recoveredFromBackup = false,
 		globalPreferenceKeys = [
 			"backendHost", "comfyPort", "forgePort", "workflowsFolder",
-			"forgeSchemasFolder", "generationTimeout", "writeLayerMetadata"
+			"forgeSchemasFolder", "generationTimeout", "writeLayerMetadata", "tagResultSRGB"
 		],
 		pythonRuntimeKeys = ["pythonIdleTimeout", "backendMonitorInterval"],
 		actionExcludedKeys = globalPreferenceKeys.concat(pythonRuntimeKeys, [
@@ -5933,14 +6000,26 @@ function Config() {
 		keys = [
 			"backendHost", "activeBackend", "comfyPort", "forgePort", "workflowsFolder", "forgeSchemasFolder", "selectedWorkflow", "selectedForgePreset",
 			"autoResize", "sizeMultiple", "resizePresets",
-			"flatten", "rasterizeImage", "keepAspectRatioDuringPlace", "recordSettingsToAction", "writeLayerMetadata",
+			"flatten", "rasterizeImage", "keepAspectRatioDuringPlace", "tagResultSRGB", "recordSettingsToAction", "writeLayerMetadata",
 			"selectBrush", "brushOpacity", "generationTimeout", "pythonIdleTimeout", "backendMonitorInterval", "workflowProfiles", "forgeProfiles",
 			"workflowCatalog", "forgeCatalog", "referenceHistory", "promptPresets", "promptUndo", "descSaveCount"
 		];
 	for (var excludedIndex = 0; excludedIndex < actionExcludedKeys.length; excludedIndex++)
 		actionExcluded[actionExcludedKeys[excludedIndex]] = true;
 	this.data = defaultData();
+	function normalizeRuntimeTimeouts(target) {
+		var generation = parseInt(target.generationTimeout, 10);
+		if (isNaN(generation)) generation = GENERATION_TIMEOUT_DEFAULT;
+		target.generationTimeout = clamp(generation, GENERATION_TIMEOUT_MIN, GENERATION_TIMEOUT_MAX);
+		var idle = parseInt(target.pythonIdleTimeout, 10);
+		if (isNaN(idle)) idle = PYTHON_IDLE_TIMEOUT_DEFAULT;
+		target.pythonIdleTimeout = clamp(idle, 0, PYTHON_IDLE_TIMEOUT_MAX);
+		var monitor = parseInt(target.backendMonitorInterval, 10);
+		if (isNaN(monitor)) monitor = BACKEND_MONITOR_INTERVAL_DEFAULT;
+		target.backendMonitorInterval = clamp(monitor, BACKEND_MONITOR_INTERVAL_MIN, BACKEND_MONITOR_INTERVAL_MAX);
+	}
 	this.bindProperties = function () {
+		normalizeRuntimeTimeouts(this.data);
 		for (var i = 0; i < keys.length; i++) this[keys[i]] = this.data[keys[i]];
 	};
 	function syncData() {
@@ -6464,13 +6543,14 @@ function Config() {
 			flatten: false,
 			rasterizeImage: false,
 			keepAspectRatioDuringPlace: false,
+			tagResultSRGB: false,
 			recordSettingsToAction: true,
 			writeLayerMetadata: false,
 			selectBrush: true,
 			brushOpacity: 60,
-			generationTimeout: 1200,
-			pythonIdleTimeout: 15 * 60,
-			backendMonitorInterval: 5,
+			generationTimeout: GENERATION_TIMEOUT_DEFAULT,
+			pythonIdleTimeout: PYTHON_IDLE_TIMEOUT_DEFAULT,
+			backendMonitorInterval: BACKEND_MONITOR_INTERVAL_DEFAULT,
 			workflowProfiles: {},
 			forgeProfiles: {},
 			workflowCatalog: [],
@@ -6777,8 +6857,12 @@ function Locale() {
 		selectionMissingFallback: ["ранее выбранный вариант не найден; используется ", "previously selected item was not found; using "],
 		autoResize: ["Автомасштаб", "Auto resize"], brushSettings: ["Настройки кисти", "Brush settings"], browse: ["Обзор…", "Browse…"],
 		globalSettings: ["Глобальные настройки", "Global settings"],
-		pythonApiVersion: ["Версия Python API:", "Python API version:"],
 		pythonIdleTimeout: ["Остановка после простоя, мин (0 — выкл.):", "Stop after idle, min (0 = off):"],
+        preferredTranslator: ["Переводчик:", "Translator:"],
+        preferredTranslatorHelp: ["При ошибке используется другой сервис. Успешный сервис автоматически становится предпочитаемым.", "On failure another service is tried. The successful service becomes preferred automatically."],
+        translation_busy: ["Предыдущий перевод ещё завершается. Повторите попытку через несколько секунд.", "The previous translation is still finishing. Retry shortly."],
+        translation_timeout: ["Перевод занял слишком много времени. Повторите попытку или выберите другой переводчик в глобальных настройках.", "Translation timed out. Retry or select another translator in Global settings."],
+        cancellation_unconfirmed: ["Не удалось подтвердить остановку предыдущей генерации. Проверьте состояние Comfy/Forge и повторите запуск.\n%1", "Could not confirm that the previous generation stopped. Check Comfy/Forge and retry.\n%1"],
 		backendMonitorInterval: ["Проверка бэкендов в фоне, с:", "Background backend check, s:"],
 		errSettingsSaveAfterError: ["Операция завершилась с ошибкой, и настройки сохранить не удалось:", "The operation failed and the settings could not be saved:"],
 		errSettingsReadFile: ["Не удалось прочитать файл настроек.", "Could not read the settings file."],
@@ -6806,7 +6890,7 @@ function Locale() {
 		errPythonMissingA: ["Не найден ", "Could not find "],
 		errPythonMissingB: [".pyw или .py рядом с JSX либо в подпапке lib.", ".pyw or .py next to JSX or in the lib subfolder."],
 		errPythonExecute: ["Windows не смог запустить файл Python. Проверьте установку Python и ассоциацию файлов .pyw/.py:", "Windows could not launch the Python file. Check the Python installation and .pyw/.py file association:"],
-		errPythonInstallTimeout: ["Установка зависимостей Python не завершилась за две минуты. Python может продолжать установку в фоне; повторите запуск скрипта позже.", "Python dependency installation did not finish within two minutes. Python may continue installing in the background; run the script again later."],
+		errPythonInstallTimeout: ["Установка зависимостей Python не завершилась за отведённое время. Python может продолжать установку в фоне; повторите запуск скрипта позже.", "Python dependency installation did not finish within the allowed time. Python may continue installing in the background; run the script again later."],
 		errPythonStartupDetails: ["Python API завершил запуск с ошибкой.", "Python API startup failed."],
 		pythonLog: ["Лог: ", "Log: "],
 		errPythonStartA: ["Python API не запустился на ", "Python API did not start on "], errResultFile: ["Файл результата не найден:", "Result file not found:"],
@@ -6954,6 +7038,8 @@ function Locale() {
 		progressHandshake: ["Подключение к Python API…", "Connecting to Python API…"], progressWorkflows: ["Загрузка списка workflow…", "Loading workflow list…"],
 		progressReady: ["Подготовка интерфейса завершена", "Interface data is ready"], flatten: ["Объединять слои перед генерацией", "Flatten layers before generation"],
 		keepAspectRatioDuringPlace: ["Сохранять пропорции при размещении", "Keep aspect ratio during place"],
+		tagResultSRGB: ["Помечать результат как sRGB (без ICC)", "Tag generated image as sRGB (without ICC)"],
+		tagResultSRGBHelp: ["Добавляет только стандартную метку sRGB без преобразования RGB-значений и без встраивания бинарного ICC-профиля. Уже профилированные файлы не изменяются.", "Adds only standard sRGB metadata without converting RGB values or embedding a binary ICC profile. Files that already contain an ICC profile are left unchanged."],
 		rasterize: ["Растеризовать сгенерированное изображение", "Rasterize generated image"], randomSeed: ["Установить случайный seed", "Set a random seed"],
 		recommended: ["Рекомендуемые", "Recommended"], refreshWorkflows: ["Обновить список JSON", "Refresh JSON list"],
 		rebuildWorkflow: ["Повторно проанализировать или полностью сбросить workflow", "Reanalyze or fully reset the workflow"],
@@ -7319,22 +7405,71 @@ function jsonParse(text) {
 	return eval("(" + text + ")");
 }
 
-// Shared launcher is created by install_runtime.bat inside SharedRuntime.
+// SharedRuntime is preferred. System Python is a fallback only when it is absent.
 function jazzyStartPython(moduleFile) {
     if ($.os.toLowerCase().indexOf('windows') < 0) return moduleFile.execute();
     var local = $.getenv('LOCALAPPDATA');
-    if (!local) return moduleFile.execute();
+    if (!local) throw new Error('LOCALAPPDATA is not defined.');
     var root = local + '/JazzyScripts/SharedRuntime';
-    if (!new Folder(root + '/venv').exists) return moduleFile.execute();
-    var python = new File(root + '/venv/Scripts/pythonw.exe');
-    var launcher = new File(root + '/launcher.vbs');
-    if (!python.exists || !launcher.exists)
-        throw new Error('Shared Python is incomplete. Run install_runtime.bat.');
-    var previous = $.getenv('JAZZYSCRIPTS_SERVER');
-    try {
-        $.setenv('JAZZYSCRIPTS_SERVER', moduleFile.fsName);
-        return launcher.execute();
-    } finally {
-        $.setenv('JAZZYSCRIPTS_SERVER', previous || '');
+    if (new Folder(root).exists) {
+        var python = new File(root + '/venv/Scripts/pythonw.exe');
+        var launcher = new File(root + '/launcher.vbs');
+        if (!python.exists || !launcher.exists)
+            throw new Error('Shared Python is incomplete. Run install_runtime.bat.');
+        var previous = $.getenv('JAZZYSCRIPTS_SERVER');
+        try {
+            $.setenv('JAZZYSCRIPTS_SERVER', moduleFile.fsName);
+            return launcher.execute();
+        } finally { $.setenv('JAZZYSCRIPTS_SERVER', previous || ''); }
     }
+    // A private launcher avoids .pyw associations (which may point to an editor).
+    var base = new Folder(local + '/JazzyScripts');
+    if (!base.exists && !base.create()) throw new Error(str.errPythonExecute);
+    var appFolder = new Folder(base.fsName + '/' + APP.tempFolder);
+    if (!appFolder.exists && !appFolder.create()) throw new Error(str.errPythonExecute);
+    var stateFolder = new Folder(appFolder.fsName + '/state');
+    if (!stateFolder.exists && !stateFolder.create()) throw new Error(str.errPythonExecute);
+    var systemLauncher = new File(stateFolder.fsName + '/system-python-launcher.vbs');
+    function vbsString(value) { return '"' + String(value).replace(/"/g, '""') + '"'; }
+    var statusPath = stateFolder.fsName + '/startup.json';
+    var lines = [
+        'Option Explicit',
+        'Dim sh, fso, cmd, code, status, q, probe, program',
+        'Set sh = CreateObject("WScript.Shell")',
+        'Set fso = CreateObject("Scripting.FileSystemObject")',
+        'q = Chr(34)',
+        'sh.CurrentDirectory = ' + vbsString(moduleFile.parent.fsName),
+        'sh.Environment("PROCESS")("PYTHONUTF8") = "1"',
+        'sh.Environment("PROCESS")("PYTHONIOENCODING") = "utf-8"',
+        'sh.Environment("PROCESS").Remove "PYTHONHOME"',
+        'sh.Environment("PROCESS").Remove "PYTHONPATH"',
+        'program = ""',
+        'On Error Resume Next',
+        // Run probes hidden, explicitly checking Python 3.10+ rather than file association.
+        'For Each probe In Array("py.exe -3", "python.exe")',
+        '  Err.Clear',
+        '  code = sh.Run(probe & " -c " & q & "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" & q, 0, True)',
+        '  If Err.Number = 0 And code = 0 Then',
+        '    program = probe',
+        '    Exit For',
+        '  End If',
+        'Next',
+        'If Len(program) > 0 Then',
+        '  Err.Clear',
+        '  cmd = program & " " & q & ' + vbsString(moduleFile.fsName) + ' & q',
+        '  sh.Run cmd, 0, False',
+        '  If Err.Number = 0 Then WScript.Quit 0',
+        'End If',
+        'Set status = fso.CreateTextFile(' + vbsString(statusPath) + ', True, False)',
+        'status.WriteLine ' + vbsString('{"status":"error","message":"Could not start Python 3.10 or newer. Install SharedRuntime with install_runtime.bat or add Python to PATH."}'),
+        'status.Close',
+        'WScript.Quit 1'
+    ];
+    systemLauncher.encoding = 'UTF-16';
+    if (!systemLauncher.open('w')) throw new Error(str.errPythonExecute);
+    try {
+        if (systemLauncher.write('\uFEFF' + lines.join('\r\n')) === false)
+            throw new Error(str.errPythonExecute);
+    } finally { systemLauncher.close(); }
+    return systemLauncher.execute();
 }

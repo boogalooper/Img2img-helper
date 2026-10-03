@@ -36,6 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -46,8 +47,8 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6380   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.226"
-API_BUILD_ID = "0.226-jazzyscripts-local-only"
+VERSION = "0.232"
+API_BUILD_ID = "0.232-forge-persistent-overrides"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -79,8 +80,22 @@ FORGE_REFERENCE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_API_MESSAGE = 32 * 1024 * 1024
 
 # Handshake заменяет эти значения и сохраняет их в runtime.json.
+# Границы синхронизированы с глобальными настройками JSX.
+DEFAULT_GENERATION_TIMEOUT_SECONDS = 20 * 60
+MIN_GENERATION_TIMEOUT_SECONDS = 30
+MAX_GENERATION_TIMEOUT_SECONDS = 24 * 60 * 60
 DEFAULT_IDLE_TIMEOUT_SECONDS = 15 * 60
+MAX_IDLE_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_BACKEND_MONITOR_INTERVAL_SECONDS = 5
+MIN_BACKEND_MONITOR_INTERVAL_SECONDS = 2
+MAX_BACKEND_MONITOR_INTERVAL_SECONDS = 300
+
+# Внутренние сетевые лимиты не являются пользовательскими настройками.
+COMFY_PROMPT_SUBMIT_TIMEOUT_SECONDS = 60
+CANCEL_SUBMISSION_GRACE_SECONDS = 2
+CANCEL_WORKER_WAIT_SECONDS = 75
+FORGE_OPTIONS_TIMEOUT_SECONDS = 5 * 60
+DEPENDENCY_INSTALL_TIMEOUT_SECONDS = 10 * 60
 
 # После запуска prompt история опрашивается чаще.
 HISTORY_PREPARE_POLL_INTERVAL = 0.35
@@ -92,7 +107,8 @@ UPLOAD_SUBFOLDER = APP["upload_subfolder"]
 OUTPUT_SUBFOLDER = "Img2imgHelper"
 
 # Версия формата внутреннего кеша. При изменении структуры увеличить число.
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+ANALYSIS_CACHE_TTL = 30 * 60
 # Версия сокращённой /object_info-схемы рядом с анализом.
 VALIDATION_SCHEMA_VERSION = 1
 # Новый UUID сбрасывает только кэш анализа workflow.
@@ -298,6 +314,25 @@ def log_exception(prefix: str) -> None:
     LOGGER.error("%s\n%s", prefix, traceback.format_exc())
 
 
+def bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """Parse an integer setting and apply the same explicit bounds everywhere."""
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(int(minimum), min(int(maximum), parsed))
+
+
+def generation_timeout_seconds(value: Any = None, default: int = DEFAULT_GENERATION_TIMEOUT_SECONDS) -> int:
+    return bounded_int(
+        value,
+        default,
+        MIN_GENERATION_TIMEOUT_SECONDS,
+        MAX_GENERATION_TIMEOUT_SECONDS,
+    )
+
+
 def _subprocess_options() -> Dict[str, Any]:
     options: Dict[str, Any] = {
         "stdout": subprocess.PIPE,
@@ -340,25 +375,46 @@ def ensure_python_module(
         pass
 
     package = package_name or import_name
+    shared_venv = _local_appdata() / "JazzyScripts" / "SharedRuntime" / "venv"
+    if os.path.normcase(str(Path(sys.prefix).resolve())) == os.path.normcase(str(shared_venv.resolve())):
+        # Match install_runtime.bat, without forcing its Python 3.11 package
+        # versions on a newer system Python that may require newer wheels.
+        package = {"Pillow": "Pillow==11.1.0", "websocket-client": "websocket-client==1.8.0"}.get(package, package)
     LOGGER.info("Module %s was not found; starting automatic installation of %s", import_name, package)
     # Состояние installing публикуется только после реального ImportError.
     # Обычный запуск с уже установленным модулем не показывает этот этап JSX.
     if publish_startup_status:
         write_startup_status("installing", package)
 
-    if not _run_python_module(["pip", "--version"], timeout=60):
+    install_deadline = time.monotonic() + DEPENDENCY_INSTALL_TIMEOUT_SECONDS
+
+    def install_timeout(cap: float) -> float:
+        remaining = install_deadline - time.monotonic()
+        if remaining <= 0:
+            raise UserVisibleError(
+                f"Timed out while installing Python module {package}. Details: {LOG_FILE}"
+            )
+        return min(float(cap), max(1.0, remaining))
+
+    if not _run_python_module(["pip", "--version"], timeout=install_timeout(60)):
         LOGGER.info("pip is unavailable; running ensurepip")
-        if not _run_python_module(["ensurepip", "--upgrade"], timeout=5 * 60):
+        if not _run_python_module(
+            ["ensurepip", "--upgrade"], timeout=install_timeout(5 * 60)
+        ):
             raise UserVisibleError(
                 f"Could not prepare pip to install module {package}. "
                 f"Details: {LOG_FILE}"
             )
 
-    installed = _run_python_module(["pip", "install", "--disable-pip-version-check", package])
-    if not installed:
+    installed = _run_python_module(
+        ["pip", "install", "--disable-pip-version-check", package],
+        timeout=install_timeout(DEPENDENCY_INSTALL_TIMEOUT_SECONDS),
+    )
+    if not installed and sys.prefix == sys.base_prefix:
         LOGGER.info("Regular installation failed; retrying with --user")
         installed = _run_python_module(
-            ["pip", "install", "--user", "--disable-pip-version-check", package]
+            ["pip", "install", "--user", "--disable-pip-version-check", package],
+            timeout=install_timeout(DEPENDENCY_INSTALL_TIMEOUT_SECONDS),
         )
     if not installed:
         raise UserVisibleError(
@@ -411,12 +467,11 @@ def prepare_required_modules() -> None:
 
 
 def prepare_optional_modules() -> None:
-    """Prepare optional integrations after the core API becomes ready."""
+    """Prepare optional progress integration; HTTP remains the fallback."""
 
     global WEBSOCKET_MODULE
 
-    # Optional packages install in this background worker and never replace the
-    # already published ready status of the core API.
+    # The lightweight socket remains responsive to startup ping during pip.
     OPTIONAL_MODULES_ACTIVE.set()
     try:
         # WebSocket улучшает только определение момента начала sampling. Если его
@@ -537,6 +592,18 @@ def format_http_error_body(raw_body: str, limit: int = 12000) -> str:
 
 
 TRANSLATION_REQUEST_TIMEOUT_SECONDS = 6
+TRANSLATION_TOTAL_TIMEOUT_SECONDS = 45
+TRANSLATION_OPERATION_LOCK = threading.Lock()
+TRANSLATION_CONTEXT = threading.local()
+TRANSLATION_FAILED_UNTIL: Dict[str, float] = {}
+
+
+def translation_request_timeout() -> float:
+    remaining = getattr(TRANSLATION_CONTEXT, "deadline", time.monotonic() + 6) - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Translation time limit exceeded")
+    return min(TRANSLATION_REQUEST_TIMEOUT_SECONDS, remaining)
+
 TRANSLATION_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -629,7 +696,7 @@ def _google_translate_request(endpoint: str, source_text: str) -> str:
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=translation_request_timeout()) as response:
         text = _decode_translation_response(response)
     try:
         payload = json.loads(text)
@@ -661,7 +728,7 @@ def _google_clients5_translate_request(endpoint: str, source_text: str) -> str:
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=translation_request_timeout()) as response:
         text = _decode_translation_response(response)
     try:
         payload = json.loads(text)
@@ -693,7 +760,7 @@ def _lingva_translate_request(endpoint: str, source_text: str) -> str:
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=translation_request_timeout()) as response:
         text = _decode_translation_response(response)
     try:
         payload = json.loads(text)
@@ -786,7 +853,7 @@ def _mymemory_translate_request(endpoint: str, source_text: str) -> str:
             },
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=translation_request_timeout()) as response:
             text = _decode_translation_response(response)
         try:
             payload = json.loads(text)
@@ -828,7 +895,7 @@ def _libre_translate_request(endpoint: str, source_text: str) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=TRANSLATION_REQUEST_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=translation_request_timeout()) as response:
         text = _decode_translation_response(response)
     try:
         payload = json.loads(text)
@@ -894,25 +961,64 @@ def _save_translation_preferred_server(server_id: str) -> None:
             LOGGER.warning("Could not save preferred translation server: %s", exc)
 
 
-def _translation_server_order() -> List[Tuple[str, str, str]]:
-    preferred = _load_translation_preferred_server()
+def _translation_server_order(preferred: str = "") -> List[Tuple[str, str, str]]:
+    preferred = preferred or _load_translation_preferred_server()
     servers = list(TRANSLATION_SERVERS)
-    if preferred:
-        servers.sort(key=lambda item: 0 if item[0] == preferred else 1)
+    now = time.monotonic()
+    servers.sort(key=lambda item: (
+        TRANSLATION_FAILED_UNTIL.get(item[0], 0) > now,
+        0 if item[0] == preferred else 1,
+    ))
     return servers
 
 
-def translate_prompt_to_english(source_text: str) -> str:
-    """Translate to English, remembering the last working server as first choice."""
+def translate_prompt_to_english(source_text: str, preferred: str = "") -> Dict[str, str]:
+    """Bound the entire translation, including multi-segment providers.
 
+    A slow provider may finish late, but cannot update the preference or reply
+    to another request. At most one translation worker runs at a time.
+    """
+    if not TRANSLATION_OPERATION_LOCK.acquire(blocking=False):
+        raise UserVisibleError("The previous translation is still finishing. Retry shortly.", "translation_busy")
+    completed = threading.Event()
+    result: Dict[str, Any] = {}
+    deadline = time.monotonic() + TRANSLATION_TOTAL_TIMEOUT_SECONDS
+
+    def worker() -> None:
+        TRANSLATION_CONTEXT.deadline = deadline
+        try:
+            result["value"] = _translate_prompt(source_text, preferred)
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            completed.set()
+            TRANSLATION_OPERATION_LOCK.release()
+
+    thread = threading.Thread(target=worker, name="TranslatePrompt", daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        TRANSLATION_OPERATION_LOCK.release()
+        raise
+    if not completed.wait(TRANSLATION_TOTAL_TIMEOUT_SECONDS):
+        raise UserVisibleError("Translation time limit exceeded. Retry or choose another translator.", "translation_timeout")
+    if "error" in result:
+        raise result["error"]
+    value = result["value"]
+    _save_translation_preferred_server(value["server"])
+    return value
+
+
+def _translate_prompt(source_text: str, preferred: str) -> Dict[str, str]:
     failures: List[str] = []
-    servers = _translation_server_order()
+    servers = _translation_server_order(preferred)
     LOGGER.info(
         "Prompt translation server order: %s",
         ", ".join(item[0] for item in servers),
     )
 
     for server_id, kind, endpoint in servers:
+        translation_request_timeout()
         host = urllib.parse.urlparse(endpoint).netloc or endpoint
         try:
             if kind == "google":
@@ -928,15 +1034,17 @@ def translate_prompt_to_english(source_text: str) -> str:
             else:
                 raise RuntimeError(f"unsupported translator kind: {kind}")
 
-            _save_translation_preferred_server(server_id)
+            translation_request_timeout()
+            TRANSLATION_FAILED_UNTIL.pop(server_id, None)
             LOGGER.info(
                 "Prompt translation succeeded: server=%s host=%s chars=%s",
                 server_id,
                 host,
                 len(source_text),
             )
-            return translated
+            return {"text": translated, "server": server_id}
         except urllib.error.HTTPError as exc:
+            TRANSLATION_FAILED_UNTIL[server_id] = time.monotonic() + 300
             failures.append(f"{server_id}: HTTP {exc.code}")
             LOGGER.warning(
                 "Prompt translation HTTP error: server=%s host=%s status=%s",
@@ -945,6 +1053,7 @@ def translate_prompt_to_english(source_text: str) -> str:
                 exc.code,
             )
         except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+            TRANSLATION_FAILED_UNTIL[server_id] = time.monotonic() + 300
             failures.append(f"{server_id}: {exc}")
             LOGGER.warning(
                 "Prompt translation request failed: server=%s host=%s error=%s",
@@ -975,6 +1084,189 @@ def _detect_image_suffix(content: bytes) -> str:
     if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
         return ".webp"
     return ".bin"
+
+
+def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    body = chunk_type + payload
+    return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+
+def _tag_png_srgb(content: bytes) -> Tuple[bytes, bool]:
+    """Add the standard PNG sRGB marker without touching pixel data.
+
+    Existing iCCP is authoritative and is never replaced. Existing sRGB is
+    already sufficient. The new chunk is inserted directly after IHDR.
+    """
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    if not content.startswith(signature):
+        return content, False
+    offset = len(signature)
+    chunks: List[Tuple[bytes, bytes]] = []
+    has_iccp = False
+    has_srgb = False
+    try:
+        while offset + 12 <= len(content):
+            length = struct.unpack(">I", content[offset:offset + 4])[0]
+            end = offset + 12 + length
+            if end > len(content):
+                return content, False
+            chunk_type = content[offset + 4:offset + 8]
+            raw = content[offset:end]
+            chunks.append((chunk_type, raw))
+            has_iccp = has_iccp or chunk_type == b"iCCP"
+            has_srgb = has_srgb or chunk_type == b"sRGB"
+            offset = end
+            if chunk_type == b"IEND":
+                break
+    except (ValueError, struct.error):
+        return content, False
+    if has_iccp or has_srgb or not chunks or chunks[0][0] != b"IHDR":
+        return content, False
+    tagged = bytearray(signature)
+    tagged.extend(chunks[0][1])
+    # Rendering intent 0 = Perceptual, the conventional sRGB PNG marker.
+    tagged.extend(_png_chunk(b"sRGB", b"\x00"))
+    for _, raw in chunks[1:]:
+        tagged.extend(raw)
+    if offset < len(content):
+        tagged.extend(content[offset:])
+    return bytes(tagged), True
+
+
+def _jpeg_segments(content: bytes):
+    """Yield JPEG metadata segments before SOS as (marker, payload)."""
+
+    if not content.startswith(b"\xff\xd8"):
+        return
+    offset = 2
+    while offset + 4 <= len(content):
+        if content[offset] != 0xFF:
+            return
+        while offset < len(content) and content[offset] == 0xFF:
+            offset += 1
+        if offset >= len(content):
+            return
+        marker = content[offset]
+        offset += 1
+        if marker in (0xD9, 0xDA):
+            return
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(content):
+            return
+        length = struct.unpack(">H", content[offset:offset + 2])[0]
+        if length < 2 or offset + length > len(content):
+            return
+        payload = content[offset + 2:offset + length]
+        yield marker, payload
+        offset += length
+
+
+def _minimal_srgb_exif_segment() -> bytes:
+    """Return APP1/EXIF containing only ExifIFD ColorSpace=1 (sRGB)."""
+
+    # TIFF offsets are relative to the TIFF header immediately after "Exif\0\0".
+    tiff = bytearray()
+    tiff.extend(b"II\x2a\x00")
+    tiff.extend(struct.pack("<I", 8))
+    # IFD0: ExifIFDPointer -> offset 26.
+    tiff.extend(struct.pack("<H", 1))
+    tiff.extend(struct.pack("<HHI", 0x8769, 4, 1))
+    tiff.extend(struct.pack("<I", 26))
+    tiff.extend(struct.pack("<I", 0))
+    # Exif IFD: ColorSpace (0xA001), SHORT, value 1 = sRGB.
+    tiff.extend(struct.pack("<H", 1))
+    tiff.extend(struct.pack("<HHI", 0xA001, 3, 1))
+    tiff.extend(struct.pack("<H", 1) + b"\x00\x00")
+    tiff.extend(struct.pack("<I", 0))
+    payload = b"Exif\x00\x00" + bytes(tiff)
+    return b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+
+
+def _tag_jpeg_srgb(content: bytes) -> Tuple[bytes, bool]:
+    """Add EXIF ColorSpace=sRGB without recompressing JPEG pixels.
+
+    Embedded ICC is preserved and wins. We also avoid creating a second EXIF
+    block because duplicate EXIF APP1 segments are interpreted inconsistently.
+    Generated Forge/Comfy JPEGs normally contain neither.
+    """
+
+    if not content.startswith(b"\xff\xd8"):
+        return content, False
+    has_icc = False
+    has_exif = False
+    for marker, payload in _jpeg_segments(content) or ():
+        if marker == 0xE2 and payload.startswith(b"ICC_PROFILE\x00"):
+            has_icc = True
+        elif marker == 0xE1 and payload.startswith(b"Exif\x00\x00"):
+            has_exif = True
+    if has_icc:
+        return content, False
+    if has_exif:
+        # Preserve existing EXIF byte-for-byte instead of creating duplicate APP1.
+        # If it already says sRGB, the requested lightweight tag is satisfied.
+        try:
+            image_module = PIL_IMAGE_MODULE
+            if image_module is not None:
+                with image_module.open(io.BytesIO(content)) as image:
+                    exif = image.getexif()
+                    if exif and exif.get_ifd(0x8769).get(0xA001) == 1:
+                        return content, False
+        except Exception:
+            pass
+        LOGGER.warning("JPEG contains existing EXIF; sRGB EXIF tag was not added to avoid replacing metadata.")
+        return content, False
+    insert_at = 2
+    # Keep a conventional JFIF APP0 first when it is present.
+    if len(content) >= 6 and content[2:4] == b"\xff\xe0":
+        app0_length = struct.unpack(">H", content[4:6])[0]
+        candidate = 4 + app0_length
+        if app0_length >= 2 and candidate <= len(content):
+            insert_at = candidate
+    return content[:insert_at] + _minimal_srgb_exif_segment() + content[insert_at:], True
+
+
+def _webp_has_icc(content: bytes) -> bool:
+    if len(content) < 12 or not content.startswith(b"RIFF") or content[8:12] != b"WEBP":
+        return False
+    offset = 12
+    while offset + 8 <= len(content):
+        chunk_type = content[offset:offset + 4]
+        size = struct.unpack("<I", content[offset + 4:offset + 8])[0]
+        if chunk_type == b"ICCP":
+            return True
+        offset += 8 + size + (size & 1)
+    return False
+
+
+def tag_image_as_srgb(path: Path) -> Path:
+    """Tag an unprofiled generated image as sRGB without RGB conversion."""
+
+    try:
+        content = path.read_bytes()
+        suffix = _detect_image_suffix(content)
+        if suffix == ".png":
+            tagged, changed = _tag_png_srgb(content)
+        elif suffix == ".jpg":
+            tagged, changed = _tag_jpeg_srgb(content)
+        else:
+            LOGGER.warning("sRGB tag was requested for unsupported result format: %s", path)
+            return path
+        if changed:
+            temp = path.with_name(f".{path.name}.{os.getpid()}.srgb.tmp")
+            try:
+                temp.write_bytes(tagged)
+                os.replace(temp, path)
+            finally:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            LOGGER.info("Tagged generated image as sRGB without pixel conversion: %s", path)
+    except OSError as exc:
+        raise UserVisibleError(f"Could not add the sRGB tag to generated image: {path}") from exc
+    return path
 
 
 def _save_image_content_for_photoshop(
@@ -1726,7 +2018,13 @@ class ComfyClient:
             raise UserVisibleError(f"Unexpected /upload/image response: {result!r}")
         return result
 
-    def queue_prompt(self, workflow: Dict[str, Any], client_id: str, prompt_id: str) -> Dict[str, Any]:
+    def queue_prompt(
+        self,
+        workflow: Dict[str, Any],
+        client_id: str,
+        prompt_id: str,
+        timeout: float = COMFY_PROMPT_SUBMIT_TIMEOUT_SECONDS,
+    ) -> Dict[str, Any]:
         result = self.post_json(
             "/prompt",
             {
@@ -1734,7 +2032,7 @@ class ComfyClient:
                 "client_id": client_id,
                 "prompt_id": prompt_id,
             },
-            timeout=60,
+            timeout=max(1.0, float(timeout)),
         )
         if not isinstance(result, dict):
             raise UserVisibleError("ComfyUI did not return queued task data.")
@@ -3908,7 +4206,11 @@ class SchemaCache:
         self,
         workflow_id: str,
         overrides: Optional[Dict[str, Any]] = None,
+        workflow_file: Optional[WorkflowFile] = None,
     ) -> Path:
+        if workflow_file is not None:
+            identity = json.dumps(analysis_cache_identity(workflow_file), sort_keys=True)
+            workflow_id += "." + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
         digest = self._override_digest(overrides)
         if digest:
             return WORKFLOW_CACHE_DIR / f"{workflow_id}.bindings.{digest}.json"
@@ -3919,11 +4221,16 @@ class SchemaCache:
         workflow_file: WorkflowFile,
         overrides: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        path = self.cache_path(workflow_file.workflow_id, overrides)
+        path = self.cache_path(workflow_file.workflow_id, overrides, workflow_file)
         try:
             if not path.exists():
                 return None
             data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("identity") != analysis_cache_identity(workflow_file):
+                return None
+            age = time.time() - float(data.get("created_at") or 0)
+            if not 0 <= age < ANALYSIS_CACHE_TTL:
+                return None
             if data.get("cache_version") != CACHE_VERSION:
                 return None
             if data.get("analyzer_uuid") != ANALYZER_UUID:
@@ -3970,8 +4277,10 @@ class SchemaCache:
         validation_schema: Dict[str, Any],
         overrides: Optional[Dict[str, Any]] = None,
     ) -> None:
-        path = self.cache_path(workflow_file.workflow_id, overrides)
+        path = self.cache_path(workflow_file.workflow_id, overrides, workflow_file)
         payload = {
+            "identity": analysis_cache_identity(workflow_file),
+            "created_at": time.time(),
             "cache_version": CACHE_VERSION,
             "analyzer_uuid": ANALYZER_UUID,
             "validation_schema_version": VALIDATION_SCHEMA_VERSION,
@@ -4004,7 +4313,7 @@ class SchemaCache:
     def _trim_override_variants(self, workflow_id: str) -> None:
         try:
             variants = sorted(
-                WORKFLOW_CACHE_DIR.glob(f"{workflow_id}.bindings.*.json"),
+                WORKFLOW_CACHE_DIR.glob(f"{workflow_id}*.bindings.*.json"),
                 key=lambda item: item.stat().st_mtime_ns,
                 reverse=True,
             )
@@ -4016,7 +4325,7 @@ class SchemaCache:
     def invalidate(self, workflow_id: str) -> None:
         try:
             self.cache_path(workflow_id).unlink(missing_ok=True)
-            for path in WORKFLOW_CACHE_DIR.glob(f"{workflow_id}.bindings.*.json"):
+            for path in WORKFLOW_CACHE_DIR.glob(f"{workflow_id}.*.json"):
                 path.unlink(missing_ok=True)
         except OSError:
             LOGGER.warning("Could not delete cache %s", workflow_id)
@@ -4031,7 +4340,7 @@ class WorkflowRuntimeCache:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._workflows: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
-        self._analyses: "OrderedDict[Tuple[Any, ...], Tuple[Dict[str, Any], Dict[str, Any]]]" = OrderedDict()
+        self._analyses: "OrderedDict[Tuple[Any, ...], Tuple[float, Tuple[Dict[str, Any], Dict[str, Any]]]]" = OrderedDict()
         self._sampler_nodes: "OrderedDict[Tuple[Any, ...], List[str]]" = OrderedDict()
 
     @staticmethod
@@ -4117,13 +4426,17 @@ class WorkflowRuntimeCache:
     def get_analysis(
         self, workflow_file: WorkflowFile, overrides: Optional[Dict[str, Any]]
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
-        key = (self._file_key(workflow_file), self._overrides_key(overrides))
+        key = (self._file_key(workflow_file), self._overrides_key(overrides), json.dumps(analysis_cache_identity(workflow_file), sort_keys=True))
         with self._lock:
             bundle = self._analyses.get(key)
             if bundle is None:
                 return None
+            created, value = bundle
+            if time.monotonic() - created >= ANALYSIS_CACHE_TTL:
+                self._analyses.pop(key, None)
+                return None
             self._analyses.move_to_end(key)
-            return copy.deepcopy(bundle)
+            return copy.deepcopy(value)
 
     def put_analysis(
         self,
@@ -4133,10 +4446,10 @@ class WorkflowRuntimeCache:
         validation_schema: Dict[str, Any],
     ) -> None:
         file_key = self._file_key(workflow_file)
-        key = (file_key, self._overrides_key(overrides))
+        key = (file_key, self._overrides_key(overrides), json.dumps(analysis_cache_identity(workflow_file), sort_keys=True))
         with self._lock:
             self._discard_stale_path_locked(file_key)
-            self._analyses[key] = copy.deepcopy((analysis, validation_schema))
+            self._analyses[key] = (time.monotonic(), copy.deepcopy((analysis, validation_schema)))
             self._analyses.move_to_end(key)
             while len(self._analyses) > self.MAX_ANALYSES:
                 self._analyses.popitem(last=False)
@@ -4735,7 +5048,7 @@ class ForgeClient:
 
 
 def current_forge_client() -> ForgeClient:
-    return ForgeClient(RUNTIME.backend_host, RUNTIME.forge_port, timeout=RUNTIME.generation_timeout)
+    return ForgeClient(runtime_config().backend_host, runtime_config().forge_port, timeout=runtime_config().generation_timeout)
 
 
 def _strip_checkpoint_hash(value: Any) -> str:
@@ -5225,7 +5538,7 @@ def clear_forge_catalog_cache() -> None:
 
 
 def _forge_catalog_server_key() -> Tuple[str, int]:
-    return normalize_comfy_host(RUNTIME.backend_host), int(RUNTIME.forge_port)
+    return normalize_comfy_host(runtime_config().backend_host), int(runtime_config().forge_port)
 
 
 def _update_forge_catalog_current(options: Dict[str, Any]) -> None:
@@ -5238,6 +5551,26 @@ def _update_forge_catalog_current(options: Dict[str, Any]) -> None:
                 str(item) for item in (options.get("forge_additional_modules") or [])
             ] if isinstance(options.get("forge_additional_modules"), list) else [],
         }
+
+
+def _update_forge_catalog_current_overrides(overrides: Dict[str, Any]) -> None:
+    """Reflect persistent model/module overrides in the local Forge catalog cache."""
+    if not isinstance(overrides, dict):
+        return
+    with FORGE_CATALOG_CACHE_LOCK:
+        current = FORGE_CATALOG_CACHE.get("current")
+        current = copy.deepcopy(current) if isinstance(current, dict) else {
+            "checkpoint": "",
+            "modules": [],
+        }
+        if "sd_model_checkpoint" in overrides:
+            current["checkpoint"] = _strip_checkpoint_hash(overrides.get("sd_model_checkpoint"))
+        if "forge_additional_modules" in overrides:
+            modules = overrides.get("forge_additional_modules")
+            current["modules"] = [
+                str(item) for item in modules if str(item)
+            ] if isinstance(modules, list) else []
+        FORGE_CATALOG_CACHE["current"] = current
 
 
 def forge_catalog(
@@ -5568,6 +5901,7 @@ def _apply_forge_options(
     values: Dict[str, Any],
     schema: Dict[str, Any],
     runtime_catalog: Optional[Dict[str, Any]] = None,
+    timeout: float = FORGE_OPTIONS_TIMEOUT_SECONDS,
 ) -> None:
     """Apply model, module, and schema-specific Forge options.
 
@@ -5593,7 +5927,15 @@ def _apply_forge_options(
     if checkpoint_control is None and modules_control is None and not option_controls:
         return
 
-    options = client.get_json("sdapi/v1/options", timeout=30)
+    deadline = time.monotonic() + max(1.0, float(timeout))
+
+    def remaining(cap: float) -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise UserVisibleError("Timed out while applying Forge options.")
+        return min(float(cap), max(1.0, left))
+
+    options = client.get_json("sdapi/v1/options", timeout=remaining(30))
     if not isinstance(options, dict):
         options = {}
     changed = False
@@ -5629,9 +5971,161 @@ def _apply_forge_options(
             changed = True
 
     if changed:
-        client.post_json("sdapi/v1/options", options, timeout=5 * 60)
+        client.post_json("sdapi/v1/options", options, timeout=remaining(FORGE_OPTIONS_TIMEOUT_SECONDS))
     _update_forge_catalog_current(options)
 
+
+
+def _forge_request_overrides(
+    values: Dict[str, Any],
+    schema: Dict[str, Any],
+    runtime_catalog: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build queue-safe Forge settings for a generation request.
+
+    Forge applies ``override_settings`` only after acquiring its shared generation
+    lock.  The helper deliberately keeps these settings afterwards so the model
+    selected by the last completed job remains loaded instead of being reloaded
+    back to the model that happened to be active before the request.  This also
+    matches the historical /options path used by non-standard Forge endpoints.
+    """
+
+    controls = schema.get("controls") if isinstance(schema.get("controls"), list) else []
+    checkpoint_control: Optional[Dict[str, Any]] = None
+    modules_control: Optional[Dict[str, Any]] = None
+    option_controls = _schema_option_controls(schema)
+    for control in controls:
+        if not isinstance(control, dict):
+            continue
+        control_id = str(control.get("id") or "")
+        source = str(control.get("source") or "")
+        if checkpoint_control is None and (source == "checkpoints" or control_id == "checkpoint"):
+            checkpoint_control = control
+        if modules_control is None and (source == "modules" or control_id == "modules"):
+            modules_control = control
+
+    runtime_catalog = runtime_catalog or {}
+    overrides: Dict[str, Any] = {}
+
+    if checkpoint_control is not None:
+        checkpoint = _strip_checkpoint_hash(
+            _forge_control_value(checkpoint_control, values, runtime_catalog)
+        )
+        if checkpoint:
+            overrides["sd_model_checkpoint"] = checkpoint
+
+    if modules_control is not None:
+        modules = _forge_control_value(modules_control, values, runtime_catalog)
+        overrides["forge_additional_modules"] = (
+            [str(item) for item in modules if str(item)]
+            if isinstance(modules, list)
+            else []
+        )
+
+    for control in option_controls:
+        control_id = str(control.get("id") or "")
+        option_key = str(control.get("option_key") or "").strip()
+        if control_id and option_key:
+            overrides[option_key] = _forge_control_value(control, values, runtime_catalog)
+
+    return overrides
+
+
+def _forge_uses_native_generation_queue(endpoint: str) -> bool:
+    normalized = str(endpoint or "").strip().lower().lstrip("/")
+    return normalized in {"sdapi/v1/img2img", "sdapi/v1/txt2img"}
+
+
+def _forge_task_id(request_id: str) -> str:
+    # Forge accepts caller-provided task IDs for img2img/txt2img.  Keep the
+    # helper request UUID in the ID so independent computers cannot collide.
+    return f"task(img2img-helper-{request_id})"
+
+
+def _forge_task_progress(
+    client: ForgeClient,
+    task_id: str,
+    timeout: float = 2.0,
+) -> Optional[Dict[str, Any]]:
+    """Return Forge's task-specific queue state when the endpoint is available.
+
+    Current Forge exposes /internal/progress for task IDs.  Older/api-only builds
+    may not expose it; HTTP 404/405 is treated as an unsupported capability so
+    the helper can fall back without breaking existing installations.
+    """
+
+    try:
+        result = client.post_json(
+            "internal/progress",
+            {"id_task": task_id, "live_preview": False, "id_live_preview": -1},
+            timeout=timeout,
+        )
+    except UserVisibleError as exc:
+        message = str(exc)
+        if "HTTP 404" in message or "HTTP 405" in message:
+            return None
+        raise
+    if not isinstance(result, dict) or not all(
+        key in result for key in ("active", "queued", "completed")
+    ):
+        raise UserVisibleError(
+            "Forge returned an invalid task-specific progress response.",
+            "forge_task_progress_invalid",
+        )
+    return result
+
+
+def _record_forge_task_progress(job: Any, status: Optional[Dict[str, Any]]) -> None:
+    with GENERATION_SUBMIT_LOCK:
+        if status is None:
+            if getattr(job, "forge_task_tracking", None) is None:
+                job.forge_task_tracking = False
+            return
+        job.forge_task_tracking = True
+        active = bool(status.get("active"))
+        queued = bool(status.get("queued"))
+        completed = bool(status.get("completed"))
+        job.forge_task_active = active
+        job.forge_task_queued = queued
+        job.forge_task_completed = completed
+        if active or queued or completed:
+            job.forge_task_seen = True
+
+
+def _wait_forge_idle_for_global_options(
+    client: ForgeClient,
+    request_id: str,
+    timeout: float,
+) -> None:
+    """Best-effort guard for legacy/custom Forge endpoints using global options.
+
+    Standard img2img/txt2img never uses this path; it uses request-local
+    override_settings instead.  For custom endpoints, require two consecutive
+    idle observations before touching global /options.
+    """
+
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    idle_samples = 0
+    while time.monotonic() < deadline:
+        raise_if_generation_cancelled(request_id)
+        progress = client.get_json("sdapi/v1/progress?skip_current_image=true", timeout=3)
+        state = progress.get("state") if isinstance(progress, dict) else None
+        if isinstance(state, dict):
+            try:
+                idle = int(state.get("job_count") or 0) == 0 and not str(state.get("job") or "").strip()
+            except (TypeError, ValueError):
+                idle = False
+        else:
+            idle = False
+        idle_samples = idle_samples + 1 if idle else 0
+        if idle_samples >= 2:
+            return
+        touch_activity()
+        time.sleep(0.2)
+    raise UserVisibleError(
+        "Forge is busy with another task; could not safely apply global options before this custom endpoint.",
+        "forge_busy_global_options",
+    )
 
 def _forge_bool(value: Any) -> bool:
     if isinstance(value, str):
@@ -6183,30 +6677,98 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     )
     raise_if_generation_cancelled(request_id)
 
-    # Только полностью проверенный payload получает право менять постоянные
-    # /options Forge. Ошибка Action/схемы больше не переключит модель перед
-    # предсказуемым отказом сборки запроса.
-    _apply_forge_options(client, values, schema, runtime_catalog)
-    raise_if_generation_cancelled(request_id)
+    request_timeout = generation_timeout_seconds(
+        message.get("timeout"), runtime_config().generation_timeout
+    )
+    generation_deadline = time.monotonic() + request_timeout
 
-    # POST идёт в потоке, пока worker ждёт sampling_step через /progress.
+    def generation_remaining() -> float:
+        remaining = generation_deadline - time.monotonic()
+        if remaining <= 0:
+            raise UserVisibleError("Timed out while waiting for Forge generation.")
+        return max(1.0, remaining)
+
+    job = GENERATION.job
+    queue_safe_endpoint = _forge_uses_native_generation_queue(endpoint)
+    desired_overrides = _forge_request_overrides(values, schema, runtime_catalog)
+
+    if queue_safe_endpoint:
+        # Current Forge applies override_settings only after its shared queue_lock
+        # has been acquired.  Keep them after the request: the last completed job
+        # becomes Forge's current model/options, avoiding an unnecessary second
+        # model reload back to stale pre-request settings.  Multi-client safety is
+        # preserved because every queued job applies its own overrides under the
+        # same Forge lock before it starts sampling.
+        existing_overrides = payload.get("override_settings")
+        merged_overrides = (
+            copy.deepcopy(existing_overrides)
+            if isinstance(existing_overrides, dict)
+            else {}
+        )
+        merged_overrides.update(desired_overrides)
+        if merged_overrides:
+            payload["override_settings"] = merged_overrides
+            payload["override_settings_restore_afterwards"] = False
+
+        task_id = _forge_task_id(request_id)
+        payload["force_task_id"] = task_id
+        with GENERATION_SUBMIT_LOCK:
+            job.forge_task_id = task_id
+            job.forge_task_tracking = None
+    else:
+        # Non-standard endpoints may not accept override_settings/force_task_id.
+        # If they need persistent Forge options, wait until the backend is idle
+        # before touching /options.  Standard img2img/txt2img never uses this path.
+        if desired_overrides:
+            _wait_forge_idle_for_global_options(
+                client,
+                request_id,
+                generation_remaining(),
+            )
+            _apply_forge_options(
+                client,
+                values,
+                schema,
+                runtime_catalog,
+                timeout=generation_remaining(),
+            )
+        raise_if_generation_cancelled(request_id)
+
+    # POST runs in its own thread while the main worker watches Forge's queue.
     post_done = threading.Event()
     post_result: Dict[str, Any] = {"value": None, "error": None}
 
     transport = GENERATION.transport
+    post_timeout = generation_remaining()
 
     def forge_post_worker() -> None:
         GENERATION_IO.transport = transport
+        REQUEST_CONTEXT.runtime = job.runtime
         try:
+            with GENERATION_SUBMIT_LOCK:
+                transport.check()
+                job.submitted = True
+                job.submission_done.clear()
             post_result["value"] = client.post_json(
                 endpoint,
                 payload,
-                timeout=int(message.get("timeout") or RUNTIME.generation_timeout),
+                timeout=post_timeout,
             )
-        except Exception as exc:  # исключение повторно поднимет основной worker
+            # Forge generation endpoints are synchronous: a successful response
+            # means this task has left the queue and finished backend execution.
+            with GENERATION_SUBMIT_LOCK:
+                job.backend_done = True
+                if job.forge_task_id:
+                    job.forge_task_completed = True
+                    job.forge_task_active = False
+                    job.forge_task_queued = False
+        except Exception as exc:  # re-raised by the main worker
             post_result["error"] = exc
         finally:
             GENERATION_IO.transport = None
+            with GENERATION_SUBMIT_LOCK:
+                job.forge_post_finished_at = time.monotonic()
+            job.submission_done.set()
             post_done.set()
             with FORGE_POST_THREADS_LOCK:
                 FORGE_POST_THREADS.pop(request_id, None)
@@ -6227,9 +6789,9 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
 
     progress_mode = str(generation.get("progress_mode") or "sampling").strip().lower()
     progress_stage_started = False
-    if progress_mode == "request_sent":
-        # Endpoints such as extra-single-image do not publish sampling_step.
-        # Their second progress segment starts as soon as the request is running.
+
+    # Utility endpoints have no task identity. Preserve their request_sent mode.
+    if not job.forge_task_id and progress_mode == "request_sent":
         notify_generation_progress_ready(request_id, "forge")
         progress_stage_started = True
 
@@ -6240,13 +6802,37 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         now = time.monotonic()
         if now >= next_progress_poll:
             next_progress_poll = now + 0.3
+
+            # Preferred path: task-specific queue tracking.  A task reported as
+            # queued belongs to this helper but is not yet executing; another
+            # computer's sampling must not advance our progress stage.
+            if job.forge_task_id and job.forge_task_tracking is not False:
+                try:
+                    task_status = _forge_task_progress(client, job.forge_task_id)
+                    _record_forge_task_progress(job, task_status)
+                    if task_status is not None:
+                        if bool(task_status.get("active")):
+                            notify_generation_progress_ready(request_id, "forge")
+                            progress_stage_started = True
+                            break
+                        # queued/completed/unknown are all handled without looking
+                        # at global sampling progress, which may belong to a peer.
+                        post_done.wait(timeout=0.05)
+                        continue
+                except UserVisibleError as exc:
+                    # Transient task-progress failures are safe: do not infer
+                    # ownership from global progress while task tracking exists.
+                    LOGGER.debug("Forge task progress polling failed: %s", exc)
+                    post_done.wait(timeout=0.05)
+                    continue
+
+            # Compatibility fallback for Forge builds without /internal/progress.
             try:
-                if forge_sampling_has_started(client):
+                if progress_mode == "request_sent" or forge_sampling_has_started(client):
                     notify_generation_progress_ready(request_id, "forge")
                     progress_stage_started = True
                     break
             except UserVisibleError as exc:
-                # Ошибка /progress не отменяет выполняющийся POST.
                 LOGGER.debug("Forge progress polling failed: %s", exc)
         post_done.wait(timeout=0.05)
 
@@ -6255,7 +6841,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
             touch_activity()
             raise_if_generation_cancelled(request_id)
     else:
-        # При быстром ответе переключаем сегмент после POST.
+        # A very fast request may finish between task-progress samples.
         if post_result.get("error") is not None:
             raise post_result["error"]
         raise_if_generation_cancelled(request_id)
@@ -6264,14 +6850,34 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     if post_result.get("error") is not None:
         raise post_result["error"]
     result = post_result.get("value")
+    if queue_safe_endpoint and desired_overrides:
+        _update_forge_catalog_current_overrides(desired_overrides)
+    with GENERATION_SUBMIT_LOCK:
+        job.backend_done = True
+        job.forge_task_completed = bool(job.forge_task_id) or job.forge_task_completed
+        job.forge_task_active = False
+        job.forge_task_queued = False
     raise_if_generation_cancelled(request_id)
     encoded_image = _forge_response_image(result, response_keys)
     if not encoded_image:
         raise UserVisibleError("Forge Neo did not return an image.")
-    destination = _decode_forge_image(
-        encoded_image,
-        output_dir / f"{now_timestamp()}-{safe_filename(schema.get('label') or schema_id)}",
-    )
+    destination_base = output_dir / f"{now_timestamp()}-{safe_filename(schema.get('label') or schema_id)}"
+    destination = _decode_forge_image(encoded_image, destination_base)
+    if message.get("tag_srgb"):
+        if destination.suffix.lower() == ".webp":
+            # Preserve an embedded WebP ICC profile. Untagged WebP has no equally
+            # portable lightweight sRGB marker, so only that case is converted
+            # to lossless PNG pixels and tagged there.
+            webp_content = destination.read_bytes()
+            if not _webp_has_icc(webp_content):
+                png_destination = _save_image_content_for_photoshop(webp_content, destination_base, "png")
+                if png_destination != destination:
+                    try:
+                        destination.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    destination = png_destination
+        destination = tag_image_as_srgb(destination)
     generated_seeds: Dict[str, Any] = {}
     info = result.get("info")
     if isinstance(info, str):
@@ -6297,13 +6903,14 @@ class RuntimeConfig:
     comfy_output_folder: Optional[Path] = None
     comfy_temp_folder: Optional[Path] = None
     workflows_folder: Path = Path.home() / "Documents" / "Comfy Workflows"
-    generation_timeout: int = 20 * 60
+    generation_timeout: int = DEFAULT_GENERATION_TIMEOUT_SECONDS
     idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS
     backend_monitor_interval_seconds: int = DEFAULT_BACKEND_MONITOR_INTERVAL_SECONDS
 
 
 @dataclass
 class GenerationState:
+    job: Optional[GenerationJob] = None
     request_id: Optional[str] = None
     queued_request_id: Optional[str] = None
     backend: str = "comfy"
@@ -6322,6 +6929,65 @@ class GenerationState:
 
 
 RUNTIME = RuntimeConfig()
+RUNTIME_LOCK = threading.RLock()
+REQUEST_CONTEXT = threading.local()
+
+
+def runtime_config() -> RuntimeConfig:
+    return getattr(REQUEST_CONTEXT, "runtime", RUNTIME)
+
+
+def runtime_snapshot() -> RuntimeConfig:
+    # Backend probes may refresh the detected Comfy input/output/temp folders.
+    # Handshake changes use RUNTIME_LOCK, while probe-side folder discovery uses
+    # BACKEND_PROBE_LOCK; taking both in the established lock order prevents a
+    # generation from receiving a mixed runtime snapshot between assignments.
+    with RUNTIME_LOCK:
+        with BACKEND_PROBE_LOCK:
+            return copy.copy(RUNTIME)
+
+
+def analysis_cache_identity(workflow_file: WorkflowFile) -> Dict[str, Any]:
+    runtime = runtime_config()
+    return {
+        "absolute_path": os.path.normcase(str(workflow_file.absolute_path.resolve())),
+        "host": normalize_comfy_host(runtime.backend_host).lower(),
+        "port": int(runtime.comfy_port),
+    }
+
+
+@dataclass
+class GenerationJob:
+    request_id: str
+    backend: str
+    runtime: RuntimeConfig
+    prompt_id: Optional[str] = None
+    submitted: bool = False
+    backend_done: bool = False
+    submission_done: threading.Event = field(default_factory=threading.Event)
+    cancel_done: threading.Event = field(default_factory=threading.Event)
+    cancel_started: bool = False
+    retry_after_submission: bool = False
+    backend_interrupt_requested: bool = False
+    backend_interrupt_sent: bool = False
+    forge_task_id: str = ""
+    forge_task_tracking: Optional[bool] = None
+    forge_task_seen: bool = False
+    forge_task_active: bool = False
+    forge_task_queued: bool = False
+    forge_task_completed: bool = False
+    forge_post_finished_at: float = 0.0
+    direct_inputs: List[Path] = field(default_factory=list)
+    confirmed: bool = False
+    error: str = ""
+
+    def endpoint(self) -> Tuple[str, str, int]:
+        port = self.runtime.forge_port if self.backend == "forge" else self.runtime.comfy_port
+        return self.backend, normalize_comfy_host(self.runtime.backend_host).lower(), int(port)
+
+
+PENDING_CANCELLATIONS: Dict[Tuple[str, str, int], GenerationJob] = {}
+
 GENERATION = GenerationState()
 LAST_ACTIVITY = time.monotonic()
 LAST_ACTIVITY_LOCK = threading.Lock()
@@ -6358,7 +7024,21 @@ def generation_context(task: Dict[str, Any], backend: str):
 
     request_id = str(task.get("request_id") or uuid.uuid4())
     task["request_id"] = request_id
+    REQUEST_CONTEXT.runtime = task.get("_runtime") or runtime_snapshot()
+    job = GenerationJob(request_id, backend, runtime_config())
+    source_message = task.get("message") or {}
+    if backend == "comfy" and job.runtime.comfy_input_folder:
+        base = (job.runtime.comfy_input_folder / UPLOAD_SUBFOLDER).resolve()
+        for key, name in (("input", f"IMG2IMG_{request_id}.jpg"), ("mask", f"INPAINT_MASK_{request_id}.png")):
+            try:
+                source = Path(str(source_message.get(key) or "")).resolve()
+                if source.parent == base and source.name == name:
+                    job.direct_inputs.append(source)
+            except (OSError, ValueError):
+                pass
+    job.submission_done.set()
     with GENERATION_SUBMIT_LOCK:
+        GENERATION.job = job
         GENERATION.transport = GenerationTransport()
         GENERATION_IO.transport = GENERATION.transport
         GENERATION.request_id = request_id
@@ -6383,15 +7063,26 @@ def generation_context(task: Dict[str, Any], backend: str):
         raise_if_generation_cancelled(request_id)
         raise
     finally:
+        # A failed request can leave a backend running too. Comfy can be
+        # cancelled by prompt ID; Forge automatic cleanup is read-only because
+        # its interrupt endpoint is global. Retain inputs while stop is uncertain.
+        if job.submitted and not job.backend_done and not job.cancel_started:
+            cancel_current_generation(request_id)
+        if job.cancel_started:
+            job.cancel_done.wait(CANCEL_WORKER_WAIT_SECONDS)
         try:
             if GENERATION.progress_watcher is not None:
                 GENERATION.progress_watcher.close()
-            cleanup_comfy_request_outputs(
-                GENERATION.output_folder,
-                request_id,
-                preserve_path=GENERATION.preserved_output_path,
-            )
-            cleanup_uploaded_images(GENERATION.input_folder, GENERATION.uploaded_images)
+            if not job.cancel_started or job.confirmed:
+                cleanup_comfy_request_outputs(
+                    GENERATION.output_folder,
+                    request_id,
+                    preserve_path=GENERATION.preserved_output_path,
+                )
+                cleanup_uploaded_images(GENERATION.input_folder, GENERATION.uploaded_images)
+                cleanup_job_direct_inputs(job)
+            else:
+                LOGGER.warning("Keeping temporary input files: cancellation unconfirmed, request=%s", request_id)
         finally:
             with GENERATION_SUBMIT_LOCK:
                 with CANCELLED_REQUESTS_LOCK:
@@ -6411,7 +7102,9 @@ def generation_context(task: Dict[str, Any], backend: str):
                 GENERATION.ack_event.clear()
                 touch_activity()
                 GENERATION.transport = None
+                GENERATION.job = None
                 GENERATION_IO.transport = None
+                del REQUEST_CONTEXT.runtime
 
 
 def touch_activity() -> None:
@@ -6546,14 +7239,11 @@ def forge_sampling_has_started(client: ForgeClient) -> bool:
 
 
 def answer(message: Any, request_id: Optional[str] = None) -> None:
-    send_data_to_jsx(
-        {
-            "protocol": API_PROTOCOL,
-            "request_id": request_id,
-            "type": "answer",
-            "message": message,
-        }
+    delivered = send_data_to_jsx(
+        {"protocol": API_PROTOCOL, "request_id": request_id, "type": "answer", "message": message}
     )
+    if not delivered:
+        LOGGER.error("Answer delivery failed: request=%s; Photoshop listener unavailable", request_id)
 
 
 def error_answer(message: Any, request_id: Optional[str] = None, retries: int = 20) -> None:
@@ -6587,20 +7277,20 @@ def invalidate_workflow_cache(workflow_id: str) -> None:
 
 
 def current_client() -> ComfyClient:
-    return ComfyClient(RUNTIME.backend_host, RUNTIME.comfy_port)
+    return ComfyClient(runtime_config().backend_host, runtime_config().comfy_port)
 
 
 def get_object_info(force: bool = False) -> Dict[str, Any]:
-    server_key = f"{RUNTIME.backend_host}:{RUNTIME.comfy_port}"
+    server_key = f"{runtime_config().backend_host}:{runtime_config().comfy_port}"
     with OBJECT_INFO_LOCK:
         cached = OBJECT_INFO_CACHE.get("value")
-        if cached is not None and OBJECT_INFO_CACHE.get("server") == server_key and not force:
+        if cached is not None and OBJECT_INFO_CACHE.get("server") == server_key and not force and time.monotonic() - OBJECT_INFO_CACHE.get("created", 0) < ANALYSIS_CACHE_TTL:
             LOGGER.info("/object_info: cache used for %s", server_key)
             return cached
         started = time.monotonic()
         LOGGER.info("/object_info: request to %s", server_key)
         value = current_client().get_object_info()
-        OBJECT_INFO_CACHE.update({"value": value, "server": server_key})
+        OBJECT_INFO_CACHE.update({"value": value, "server": server_key, "created": time.monotonic()})
         LOGGER.info(
             "/object_info: received %s classes in %.2f s",
             len(value),
@@ -6669,7 +7359,7 @@ def analyze_workflow(
         force,
         relative_path,
     )
-    repository = WorkflowRepository(RUNTIME.workflows_folder)
+    repository = WorkflowRepository(runtime_config().workflows_folder)
     workflow_file = repository.get(workflow_id, relative_path=relative_path)
     overrides = normalize_binding_overrides(overrides)
 
@@ -6740,7 +7430,7 @@ def save_workflow_values(
             "workflow_save_no_values",
         )
 
-    repository = WorkflowRepository(RUNTIME.workflows_folder)
+    repository = WorkflowRepository(runtime_config().workflows_folder)
     workflow_file = repository.get(workflow_id, relative_path=relative_path)
     workflow_data = WORKFLOW_RUNTIME_CACHE.load_json(workflow_file, repository)
     normalized_overrides = normalize_binding_overrides(overrides)
@@ -6972,7 +7662,6 @@ GENERATION_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
 GENERATION_SUBMIT_LOCK = threading.RLock()
 CANCELLED_REQUESTS: set[str] = set()
 CANCELLED_REQUESTS_LOCK = threading.Lock()
-CANCEL_FAILURES: "OrderedDict[str, str]" = OrderedDict()
 WORKER_STOP = threading.Event()
 
 
@@ -7171,85 +7860,282 @@ def raise_if_generation_cancelled(request_id: str) -> None:
         raise CancelledError("Generation was cancelled.")
 
 
-def cancel_current_generation(request_id: Optional[str] = None) -> None:
-    # Hold the slot until interrupt has finished. A delayed global Forge interrupt
-    # must never reach the next generation. Workers still own state cleanup.
+def cancel_current_generation(
+    request_id: Optional[str] = None,
+    *,
+    interrupt_backend: bool = False,
+) -> None:
+    """Cancel the current helper task.
+
+    ComfyUI supports prompt-specific deletion/interruption, so its automatic
+    cleanup is safe. Forge exposes only a global interrupt: it is requested only
+    by an explicit Photoshop cancel/timeout (or API shutdown), never merely
+    because the Python worker encountered an error.
+    """
+
     with GENERATION_SUBMIT_LOCK:
         normalized = mark_request_cancelled(request_id)
         if not normalized:
             return
         GENERATION.cancel_event.set()
-        transport = GENERATION.transport
-        if transport is not None:
-            transport.abort()
-        previous_transport = getattr(GENERATION_IO, "transport", None)
-        GENERATION_IO.transport = None  # control requests must survive cancellation
+        if GENERATION.transport is not None:
+            GENERATION.transport.abort()
+        job = GENERATION.job
+        if job is None:
+            return
+        if interrupt_backend:
+            job.backend_interrupt_requested = True
+        if job.cancel_started:
+            retry_after_submission = (
+                job.retry_after_submission
+                and job.submission_done.is_set()
+                and job.cancel_done.is_set()
+            )
+            retry_explicit_forge_interrupt = (
+                interrupt_backend
+                and job.backend == "forge"
+                and job.cancel_done.is_set()
+                and not job.confirmed
+                and not job.backend_interrupt_sent
+            )
+            if not (retry_after_submission or retry_explicit_forge_interrupt):
+                return
+            job.retry_after_submission = False
+            job.cancel_done.clear()
+        job.cancel_started = True
+        PENDING_CANCELLATIONS[job.endpoint()] = job
+        threading.Thread(target=_cancel_job, args=(job,), name="CancelGeneration", daemon=True).start()
+
+
+def _refresh_forge_task_status(job: GenerationJob) -> Optional[Dict[str, Any]]:
+    if not job.forge_task_id or job.forge_task_tracking is False:
+        return None
+    client = ForgeClient(job.runtime.backend_host, job.runtime.forge_port)
+    status = _forge_task_progress(client, job.forge_task_id, timeout=2)
+    _record_forge_task_progress(job, status)
+    return status
+
+
+def _job_is_stopped(job: GenerationJob) -> bool:
+    if job.backend == "comfy" and not job.submission_done.is_set():
+        return False
+    if not job.submitted or job.backend_done:
+        return True
+    if job.backend == "comfy":
+        client = ComfyClient(job.runtime.backend_host, job.runtime.comfy_port)
+        state = client.get_json("/queue", timeout=2)
+        if not isinstance(state, dict) or not all(isinstance(state.get(k), list) for k in ("queue_running", "queue_pending")):
+            raise UserVisibleError("ComfyUI returned an invalid queue state.")
+        return not any(comfy_queue_contains_prompt(state, k, job.prompt_id or "") for k in ("queue_running", "queue_pending"))
+
+    # Current Forge can identify an API job by force_task_id.  This is the only
+    # reliable way to distinguish our queued/running task from another computer.
+    if job.forge_task_id and job.forge_task_tracking is not False:
+        status = _refresh_forge_task_status(job)
+        if status is not None:
+            active = bool(status.get("active"))
+            queued = bool(status.get("queued"))
+            completed = bool(status.get("completed"))
+            if active or queued:
+                return False
+            if completed or job.forge_task_seen:
+                return True
+            # A disconnected client socket can unwind slightly before Forge's
+            # request handler registers force_task_id.  Require a short grace
+            # window before concluding that an unseen task never entered queue.
+            if (
+                job.submission_done.is_set()
+                and job.forge_post_finished_at > 0
+                and time.monotonic() - job.forge_post_finished_at >= 3.0
+            ):
+                return True
+            return False
+
+    # Compatibility fallback for older/api-only Forge builds.  Global idle can
+    # confirm completion but can never prove ownership, so it is read-only.
+    client = ForgeClient(job.runtime.backend_host, job.runtime.forge_port)
+    progress = client.get_json("sdapi/v1/progress?skip_current_image=true", timeout=2)
+    state = progress.get("state") if isinstance(progress, dict) else None
+    if not isinstance(state, dict) or "job_count" not in state:
+        raise UserVisibleError("Forge did not return a verifiable job state.")
+    return int(state["job_count"]) == 0 and not str(state.get("job") or "").strip()
+
+
+def _confirm_job_stopped(job: GenerationJob, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    idle_samples = 0
+    while time.monotonic() < deadline:
         try:
-            _interrupt_generation_backend()
+            stopped = _job_is_stopped(job)
+            idle_samples = idle_samples + 1 if stopped else 0
+            # Task-specific Forge completion is already scoped to our ID.  The
+            # legacy global-idle fallback still needs two samples for stability.
+            task_specific = job.backend == "forge" and job.forge_task_tracking is True
+            needed = 1 if job.backend != "forge" or task_specific or not job.submitted else 2
+            if idle_samples >= needed:
+                job.confirmed = True
+                job.error = ""
+                return True
         except Exception as exc:
-            CANCEL_FAILURES[normalized] = str(exc)
-            while len(CANCEL_FAILURES) > 32:
-                CANCEL_FAILURES.popitem(last=False)
-            raise
-        finally:
-            GENERATION_IO.transport = previous_transport
-            # A disconnected POST can finish late, but its token forbids any more
-            # I/O and its result is private. It must not keep the admission gate shut.
-            if transport is not None:
-                with FORGE_POST_THREADS_LOCK:
-                    FORGE_POST_THREADS.pop(normalized, None)
+            job.error = str(exc)
+            return False
+        time.sleep(0.2)
+    job.error = job.error or "The backend is still stopping."
+    return False
 
 
-def _interrupt_generation_backend() -> None:
-    prompt_id = GENERATION.prompt_id
-    if GENERATION.backend == "forge":
-        current_forge_client().interrupt()
-        return
-    if not prompt_id:
-        # Отмена могла прийти во время анализа workflow или загрузки файлов,
-        # до POST /prompt. Worker увидит CANCELLED_REQUESTS на следующей точке.
-        return
+def _claim_forge_interrupt(job: GenerationJob) -> bool:
+    """Claim one global Forge interrupt only while our tracked task is active.
 
-    client = current_client()
+    Forge's interrupt endpoint has no task ID.  Never use it for an untracked or
+    merely queued request: that would risk interrupting another computer.
+    """
 
-    # Не посылаем глобальный interrupt вслепую: в общей очереди ComfyUI перед
-    # нашим prompt может выполняться чужая задача. Сначала определяем состояние
-    # конкретного prompt, затем удаляем pending или прерываем running.
-    queue_known = False
-    is_running = False
-    is_pending = False
+    with GENERATION_SUBMIT_LOCK:
+        if (
+            job.backend != "forge"
+            or not job.backend_interrupt_requested
+            or job.backend_interrupt_sent
+            or job.backend_done
+            or job.forge_task_tracking is not True
+            or not job.forge_task_id
+            or not job.forge_task_active
+        ):
+            return False
+        job.backend_interrupt_sent = True
+        return True
+
+
+def _cancel_tracked_forge_job(job: GenerationJob) -> None:
+    """Wait for this exact Forge task and interrupt it only when it becomes active.
+
+    A cancelled task may be queued behind a request from another computer.  Forge
+    has no API for deleting a pending task, so the safe strategy is to leave the
+    peer untouched, watch our force_task_id, and issue the global interrupt only
+    after Forge reports that exact ID as active.
+    """
+
+    client = ForgeClient(job.runtime.backend_host, job.runtime.forge_port)
+    consecutive_errors = 0
+    while not job.backend_done:
+        try:
+            status = _forge_task_progress(client, job.forge_task_id, timeout=2)
+            _record_forge_task_progress(job, status)
+            if status is None:
+                job.error = (
+                    "Forge task-specific progress is unavailable; global interrupt was suppressed "
+                    "to avoid stopping another client's job."
+                )
+                return
+
+            consecutive_errors = 0
+            active = bool(status.get("active"))
+            queued = bool(status.get("queued"))
+            completed = bool(status.get("completed"))
+
+            if completed or (job.forge_task_seen and not active and not queued):
+                job.confirmed = True
+                job.error = ""
+                return
+
+            if active:
+                # Refresh immediately before claiming the global interrupt. This
+                # narrows the unavoidable race of Forge's non-addressable API.
+                verify = _forge_task_progress(client, job.forge_task_id, timeout=2)
+                _record_forge_task_progress(job, verify)
+                if verify is not None and bool(verify.get("active")) and _claim_forge_interrupt(job):
+                    client.post_json("sdapi/v1/interrupt", {}, timeout=3)
+                if _confirm_job_stopped(job, seconds=5.0):
+                    return
+
+            # queued=True means another client currently owns Forge.  Do not
+            # interrupt it; our task will become active later and be cancelled then.
+            if not active:
+                # If the task has not been seen yet, _job_is_stopped applies a
+                # registration grace window before treating the aborted POST as
+                # never accepted by Forge.
+                if job.submission_done.is_set() and not job.forge_task_seen:
+                    if _confirm_job_stopped(job, seconds=0.5):
+                        return
+                time.sleep(0.2)
+        except Exception as exc:
+            job.error = str(exc)
+            consecutive_errors += 1
+            # Keep watching a known queued task across temporary network errors;
+            # the daemon worker is safer than falling back to a global interrupt.
+            time.sleep(min(2.0, 0.2 * consecutive_errors))
+
+
+def _cancel_job(job: GenerationJob) -> None:
+    # Control I/O runs without the cancelled generation transport. A Comfy POST
+    # may return a different prompt ID: wait for its response before interrupt.
     try:
-        queue_state = client.get_queue()
-        running_items = queue_state.get("queue_running", [])
-        pending_items = queue_state.get("queue_pending", [])
-        is_running = any(
-            isinstance(item, (list, tuple)) and len(item) > 1 and str(item[1]) == prompt_id
-            for item in running_items
-        )
-        is_pending = any(
-            isinstance(item, (list, tuple)) and len(item) > 1 and str(item[1]) == prompt_id
-            for item in pending_items
-        )
-        queue_known = True
-    except Exception:
-        LOGGER.warning("Could not read the ComfyUI queue before cancellation")
+        if job.backend == "comfy":
+            if not job.submission_done.wait(COMFY_PROMPT_SUBMIT_TIMEOUT_SECONDS + CANCEL_SUBMISSION_GRACE_SECONDS):
+                job.retry_after_submission = True
+                raise UserVisibleError("The generation request has not finished disconnecting.")
 
-    if is_pending or not queue_known:
+            if job.submitted and not job.backend_done:
+                client = ComfyClient(job.runtime.backend_host, job.runtime.comfy_port)
+                state = client.get_json("/queue", timeout=2)
+                if not isinstance(state, dict) or not all(isinstance(state.get(k), list) for k in ("queue_running", "queue_pending")):
+                    raise UserVisibleError("ComfyUI returned an invalid queue state.")
+                if comfy_queue_contains_prompt(state, "queue_pending", job.prompt_id or ""):
+                    client.post_json("/queue", {"delete": [job.prompt_id]}, timeout=3)
+                    state = client.get_json("/queue", timeout=2)
+                if comfy_queue_contains_prompt(state, "queue_running", job.prompt_id or ""):
+                    client.post_json("/interrupt", {"prompt_id": job.prompt_id}, timeout=3)
+            _confirm_job_stopped(job)
+            return
+
+        # Forge: let the POST unwind briefly after the local socket is aborted.
+        job.submission_done.wait(0.5)
+
+        # Explicit Photoshop cancellation gets a long-lived task-specific watcher.
+        # Automatic cleanup after an internal error remains read-only.
+        if job.backend_interrupt_requested and job.forge_task_id:
+            _cancel_tracked_forge_job(job)
+        else:
+            _confirm_job_stopped(job)
+    except Exception as exc:
+        job.error = str(exc)
+        _confirm_job_stopped(job, seconds=1.0)
+    finally:
+        if not job.confirmed:
+            LOGGER.warning("Cancellation unconfirmed: request=%s error=%s", job.request_id, job.error)
+        if job.confirmed and job.backend == "forge":
+            with FORGE_POST_THREADS_LOCK:
+                FORGE_POST_THREADS.pop(job.request_id, None)
+        job.cancel_done.set()
+
+
+def cleanup_job_direct_inputs(job: GenerationJob) -> None:
+    for path in job.direct_inputs:
         try:
-            client.delete_queued_prompt(prompt_id)
-        except Exception as exc:
-            raise UserVisibleError("Could not remove the prompt from the ComfyUI queue.") from exc
+            path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("Could not remove cancelled direct input: %s", path)
+    job.direct_inputs.clear()
 
-    if is_pending:
-        # A pending prompt can start between GET /queue and POST /queue delete.
-        queue_state = client.get_queue()
-        is_running = comfy_queue_contains_prompt(queue_state, "queue_running", prompt_id)
 
-    if is_running or not queue_known:
-        try:
-            client.interrupt(prompt_id)
-        except Exception as exc:
-            raise UserVisibleError("Could not send interrupt to ComfyUI.") from exc
+def ensure_backend_released(backend: str, runtime: RuntimeConfig) -> None:
+    key = GenerationJob("", backend, runtime).endpoint()
+    job = PENDING_CANCELLATIONS.get(key)
+    if job is None:
+        return
+    # Read-only rechecks never send a late interrupt to a subsequent generation.
+    if not job.cancel_done.wait(0.5):
+        raise UserVisibleError("Cancellation is still finishing. Retry shortly.", "cancellation_pending")
+    if not job.confirmed and not _confirm_job_stopped(job, seconds=1.0):
+        raise UserVisibleError(
+            "Could not confirm that the previous generation stopped. Check the backend and retry. " + job.error,
+            "cancellation_unconfirmed", [job.error],
+        )
+    if job.backend == "forge":
+        with FORGE_POST_THREADS_LOCK:
+            FORGE_POST_THREADS.pop(job.request_id, None)
+    cleanup_job_direct_inputs(job)
+    PENDING_CANCELLATIONS.pop(key, None)
 
 
 def read_image_dimensions(path: Path) -> Tuple[int, int]:
@@ -7491,7 +8377,7 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     if inpaint_mode and (mask_path is None or not mask_path.is_file()):
         raise UserVisibleError(f"Photoshop temporary mask was not found: {mask_path}")
 
-    repository = WorkflowRepository(RUNTIME.workflows_folder)
+    repository = WorkflowRepository(runtime_config().workflows_folder)
     workflow_file = repository.get(workflow_id, relative_path=relative_path)
     workflow_data = WORKFLOW_RUNTIME_CACHE.load_json(workflow_file, repository)
     raise_if_generation_cancelled(request_id)
@@ -7577,8 +8463,8 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         raise UserVisibleError("The workflow requires width/height, but the input JPEG size could not be determined.")
 
     client = current_client()
-    input_folder = _existing_directory(RUNTIME.comfy_input_folder)
-    output_folder = _existing_directory(RUNTIME.comfy_output_folder)
+    input_folder = _existing_directory(runtime_config().comfy_input_folder)
+    output_folder = _existing_directory(runtime_config().comfy_output_folder)
     direct_input_verified = bool(
         input_folder and verify_local_comfy_input_folder(client, input_folder)
     )
@@ -7586,7 +8472,8 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         LOGGER.warning(
             "Detected ComfyUI input folder is no longer served; using HTTP upload"
         )
-        invalidate_detected_comfy_input_folder()
+        if COMFY_INPUT_FOLDER_ENDPOINT == (client.host, client.port):
+            invalidate_detected_comfy_input_folder()
         input_folder = None
     GENERATION.input_folder = input_folder
     GENERATION.output_folder = output_folder
@@ -7743,18 +8630,38 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
     progress_watcher.connect()
     GENERATION.progress_watcher = progress_watcher
 
-    GENERATION.prompt_id = prompt_id
-    GENERATION.queued = True
+    request_timeout = generation_timeout_seconds(
+        message.get("timeout"), runtime_config().generation_timeout
+    )
+    generation_deadline = time.monotonic() + request_timeout
 
-    queue_result = client.queue_prompt(patched, client_id, prompt_id)
-    actual_prompt_id = str(queue_result.get("prompt_id") or prompt_id)
-    GENERATION.prompt_id = actual_prompt_id
+    job = GENERATION.job
+    with GENERATION_SUBMIT_LOCK:
+        raise_if_generation_cancelled(request_id)
+        GENERATION.prompt_id = job.prompt_id = prompt_id
+        GENERATION.queued = True
+        job.submitted = True
+        job.submission_done.clear()
+    try:
+        submit_timeout = min(
+            COMFY_PROMPT_SUBMIT_TIMEOUT_SECONDS,
+            max(1.0, generation_deadline - time.monotonic()),
+        )
+        queue_result = client.queue_prompt(
+            patched, client_id, prompt_id, timeout=submit_timeout
+        )
+        actual_prompt_id = str(queue_result.get("prompt_id") or prompt_id)
+        GENERATION.prompt_id = job.prompt_id = actual_prompt_id
+    finally:
+        job.submission_done.set()
     if request_is_cancelled(request_id):
         cancel_current_generation(request_id)
         raise CancelledError("Generation was cancelled.")
 
     # WebSocket задаёт границу инициализации; /history подтверждает результат.
-    deadline = time.monotonic() + int(message.get("timeout") or RUNTIME.generation_timeout)
+    # Тот же deadline включает постановку prompt в очередь, поэтому пользовательский
+    # generation timeout имеет одинаковый смысл для Comfy и Forge.
+    deadline = generation_deadline
     history_entry: Optional[Dict[str, Any]] = None
     progress_stage_started = False
 
@@ -7778,6 +8685,8 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         if history_entry:
             GENERATION.queued = False
             completed, history_error = history_status(history_entry)
+            if completed:
+                job.backend_done = True
             if history_error:
                 raise UserVisibleError(history_error)
             if completed:
@@ -7829,12 +8738,14 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         local_output_folder=output_folder,
         request_id=request_id,
     )
+    if message.get("tag_srgb"):
+        destination = tag_image_as_srgb(destination)
     if _comfy_request_output_path(destination, output_folder, request_id) is not None:
         GENERATION.preserved_output_path = destination
 
     # PreviewImage может оставить type=temp в общей ComfyUI\temp. Запоминаем
     # только точные файлы этого prompt; удаление произойдёт после Place в JSX.
-    defer_comfy_temp_cleanup(request_id, RUNTIME.comfy_temp_folder, history_entry)
+    defer_comfy_temp_cleanup(request_id, runtime_config().comfy_temp_folder, history_entry)
 
     # Итоговый путь всегда отправляется после init/ACK.
     answer(
@@ -7913,7 +8824,7 @@ def _probe_comfy_full(host: str, port: int, *, update_runtime: bool) -> Dict[str
             input_folder = detect_comfy_input_folder(stats, host, int(port))
             output_folder = detect_comfy_output_folder(stats, host, int(port))
             temp_folder = detect_comfy_temp_folder(stats, host, int(port))
-        if update_runtime:
+        if update_runtime and endpoint == (normalize_comfy_host(RUNTIME.backend_host), int(RUNTIME.comfy_port)):
             RUNTIME.comfy_input_folder = input_folder
             RUNTIME.comfy_output_folder = output_folder
             RUNTIME.comfy_temp_folder = temp_folder
@@ -7927,7 +8838,7 @@ def _probe_comfy_full(host: str, port: int, *, update_runtime: bool) -> Dict[str
         }
         return _backend_probe_result(available=True, details=details)
     except Exception:
-        if update_runtime:
+        if update_runtime and endpoint == (normalize_comfy_host(RUNTIME.backend_host), int(RUNTIME.comfy_port)):
             RUNTIME.comfy_input_folder = None
             RUNTIME.comfy_output_folder = None
             RUNTIME.comfy_temp_folder = None
@@ -7954,7 +8865,7 @@ def _probe_comfy_regular(host: str, port: int, previous: Dict[str, Any], *,
     )
     light = _probe_comfy_light(host, port, previous)
     if validated or not light.get("available"):
-        if update_runtime and not light.get("available"):
+        if update_runtime and not light.get("available") and (normalize_comfy_host(host), int(port)) == (normalize_comfy_host(RUNTIME.backend_host), int(RUNTIME.comfy_port)):
             invalidate_detected_comfy_input_folder()
             RUNTIME.comfy_output_folder = None
             RUNTIME.comfy_temp_folder = None
@@ -8272,6 +9183,11 @@ def _unchecked_backend_status() -> Dict[str, Any]:
 
 
 def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
+    with RUNTIME_LOCK:
+        return _apply_handshake_locked(message)
+
+
+def _apply_handshake_locked(message: Dict[str, Any]) -> Dict[str, Any]:
     previous_endpoints = _backend_endpoints(
         RUNTIME.backend_host, RUNTIME.comfy_port, RUNTIME.forge_port
     )
@@ -8286,15 +9202,23 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     workflows_folder = message.get("workflowsFolder")
     if workflows_folder:
         RUNTIME.workflows_folder = Path(str(workflows_folder))
-    if message.get("generationTimeout"):
-        RUNTIME.generation_timeout = max(30, int(message["generationTimeout"]))
+    if "generationTimeout" in message:
+        RUNTIME.generation_timeout = generation_timeout_seconds(
+            message.get("generationTimeout"), RUNTIME.generation_timeout
+        )
     if "pythonIdleTimeout" in message:
-        RUNTIME.idle_timeout_seconds = max(
-            0, min(7 * 24 * 60 * 60, int(message["pythonIdleTimeout"]))
+        RUNTIME.idle_timeout_seconds = bounded_int(
+            message.get("pythonIdleTimeout"),
+            RUNTIME.idle_timeout_seconds,
+            0,
+            MAX_IDLE_TIMEOUT_SECONDS,
         )
     if "backendMonitorInterval" in message:
-        RUNTIME.backend_monitor_interval_seconds = max(
-            2, min(300, int(message["backendMonitorInterval"]))
+        RUNTIME.backend_monitor_interval_seconds = bounded_int(
+            message.get("backendMonitorInterval"),
+            RUNTIME.backend_monitor_interval_seconds,
+            MIN_BACKEND_MONITOR_INTERVAL_SECONDS,
+            MAX_BACKEND_MONITOR_INTERVAL_SECONDS,
         )
 
     endpoints = _backend_endpoints(
@@ -8337,7 +9261,9 @@ def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
         "backend_monitor_interval_seconds": RUNTIME.backend_monitor_interval_seconds,
     }
     try:
-        RUNTIME_FILE.write_text(json.dumps(runtime_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp = RUNTIME_FILE.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(runtime_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, RUNTIME_FILE)
     except OSError:
         LOGGER.warning("Could not write runtime.json")
     return {
@@ -8415,6 +9341,8 @@ def handle_command(command: Dict[str, Any]) -> None:
             answer(apply_handshake(message), request_id)
             return
 
+        REQUEST_CONTEXT.runtime = runtime_snapshot()
+
         if command_type == "probe_backends":
             # Ручная проверка сбрасывает Forge-каталог для нового endpoint.
             clear_forge_catalog_cache()
@@ -8431,9 +9359,9 @@ def handle_command(command: Dict[str, Any]) -> None:
             return
 
         if command_type == "workflow_list":
-            repository = WorkflowRepository(RUNTIME.workflows_folder)
+            repository = WorkflowRepository(runtime_config().workflows_folder)
             workflows = [item.public_dict() for item in repository.list_workflows()]
-            answer({"items": workflows, "folder": str(RUNTIME.workflows_folder)}, request_id)
+            answer({"items": workflows, "folder": str(runtime_config().workflows_folder)}, request_id)
             return
 
         if command_type in {"workflow_get", "workflow_reinitialize"}:
@@ -8510,13 +9438,21 @@ def handle_command(command: Dict[str, Any]) -> None:
             ), request_id)
             return
 
+        if command_type == "translation_settings":
+            preferred = str(message.get("preferred_server") or "")
+            if preferred:
+                _save_translation_preferred_server(preferred)
+                TRANSLATION_FAILED_UNTIL.pop(preferred, None)
+            answer({"preferred_server": _load_translation_preferred_server()}, request_id)
+            return
+
         if command_type == "translate":
             source_text = str(message.get("text") or "").strip()
             if not source_text:
                 answer("", request_id)
                 return
             try:
-                translated = translate_prompt_to_english(source_text)
+                translated = translate_prompt_to_english(source_text, str(message.get("preferred_server") or ""))
             except UserVisibleError:
                 raise
             except Exception as exc:
@@ -8530,20 +9466,31 @@ def handle_command(command: Dict[str, Any]) -> None:
             return
 
         if command_type in {"generate", "forge_generate"}:
+            # A quick restart after Esc normally waits only for the cancellation
+            # worker to release the slot; do not hold its lock while waiting.
+            release_deadline = time.monotonic() + 3.0
+            while (GENERATION.active or GENERATION.queued) and GENERATION.cancel_event.is_set() and time.monotonic() < release_deadline:
+                time.sleep(0.05)
             # Проверка и постановка должны быть атомарными: handle_client работает
             # в отдельных потоках, и два почти одновременных запроса не должны
             # пройти проверку GENERATION_QUEUE.empty() одновременно.
             with GENERATION_SUBMIT_LOCK:
+                snapshot = runtime_snapshot()
+                if not GENERATION.active and not GENERATION.queued:
+                    ensure_backend_released("forge" if command_type == "forge_generate" else "comfy", snapshot)
                 if (
                     GENERATION.active
                     or GENERATION.queued
                     or not GENERATION_QUEUE.empty()
                     or forge_post_in_progress()
                 ):
+                    if GENERATION.cancel_event.is_set():
+                        raise UserVisibleError("Cancellation is still finishing. Retry shortly.", "cancellation_pending")
                     raise UserVisibleError(
                         "The previous generation has not finished yet.",
                         "generation_already_running",
                     )
+                command["_runtime"] = snapshot
                 # Резервируем единственный слот до queue.put(). Worker сначала
                 # выставляет active=True и только затем снимает queued, поэтому
                 # между приёмом команды и началом run_generation больше нет окна.
@@ -8573,24 +9520,13 @@ def handle_command(command: Dict[str, Any]) -> None:
             target_id = str(message.get("request_id") or "")
             if not target_id:
                 raise UserVisibleError("Cancellation requires a generation request ID.")
-            cancel_current_generation(target_id)
-            deadline = time.monotonic() + 70.0
-            while time.monotonic() < deadline:
-                with GENERATION_SUBMIT_LOCK:
-                    current = GENERATION.request_id or GENERATION.queued_request_id
-                    released = current != target_id
-                if released:
-                    failure = CANCEL_FAILURES.get(target_id)
-                    if failure:
-                        raise UserVisibleError("Python released the task, but backend cancellation could not be confirmed: " + failure, "cancellation_failed", [failure])
-                    answer({"cancelled": True, "released": True}, request_id)
-                    return
-                time.sleep(0.05)
-            raise UserVisibleError("Cancellation is still finishing. Please retry shortly.", "cancellation_pending")
+            cancel_current_generation(target_id, interrupt_backend=True)
+            answer({"accepted": True, "state": "cancelling"}, request_id)
+            return
 
         if command_type == "interrupt":
             interrupt_request_id = str(message.get("request_id") or request_id or "")
-            cancel_current_generation(interrupt_request_id)
+            cancel_current_generation(interrupt_request_id, interrupt_backend=True)
             # interrupt отправляется без listener: ответ не требуется.
             return
 
@@ -8723,6 +9659,7 @@ def idle_watcher() -> None:
             and GENERATION_QUEUE.empty()
             and not forge_post_in_progress()
             and not OPTIONAL_MODULES_ACTIVE.is_set()
+            and not any(not job.confirmed for job in list(PENDING_CANCELLATIONS.values()))
         ):
             LOGGER.info("Shutting down after %.0f seconds of inactivity", idle)
             WORKER_STOP.set()
@@ -8753,25 +9690,20 @@ def load_runtime_file() -> None:
         folder = data.get("workflows_folder")
         if folder:
             RUNTIME.workflows_folder = Path(str(folder))
-        RUNTIME.generation_timeout = int(data.get("generation_timeout") or RUNTIME.generation_timeout)
-        RUNTIME.idle_timeout_seconds = max(
-            0,
-            min(
-                7 * 24 * 60 * 60,
-                int(data.get("idle_timeout_seconds", RUNTIME.idle_timeout_seconds)),
-            ),
+        RUNTIME.generation_timeout = generation_timeout_seconds(
+            data.get("generation_timeout"), RUNTIME.generation_timeout
         )
-        RUNTIME.backend_monitor_interval_seconds = max(
-            2,
-            min(
-                300,
-                int(
-                    data.get(
-                        "backend_monitor_interval_seconds",
-                        RUNTIME.backend_monitor_interval_seconds,
-                    )
-                ),
-            ),
+        RUNTIME.idle_timeout_seconds = bounded_int(
+            data.get("idle_timeout_seconds"),
+            RUNTIME.idle_timeout_seconds,
+            0,
+            MAX_IDLE_TIMEOUT_SECONDS,
+        )
+        RUNTIME.backend_monitor_interval_seconds = bounded_int(
+            data.get("backend_monitor_interval_seconds"),
+            RUNTIME.backend_monitor_interval_seconds,
+            MIN_BACKEND_MONITOR_INTERVAL_SECONDS,
+            MAX_BACKEND_MONITOR_INTERVAL_SECONDS,
         )
     except Exception:
         LOGGER.warning("Could not read runtime.json")
@@ -8869,7 +9801,10 @@ def start_local_server() -> None:
     finally:
         WORKER_STOP.set()
         BACKEND_MONITOR_WAKE.set()
-        cancel_current_generation()
+        cancel_current_generation(interrupt_backend=True)
+        stopping_job = GENERATION.job
+        if stopping_job is not None and stopping_job.cancel_started:
+            stopping_job.cancel_done.wait(CANCEL_WORKER_WAIT_SECONDS)
         try:
             server.close()
         except OSError:
