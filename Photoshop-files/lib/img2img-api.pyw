@@ -47,8 +47,8 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6380   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.233"
-API_BUILD_ID = "0.233-dead-code-cleanup"
+VERSION = "0.234"
+API_BUILD_ID = "0.234-probe-catalog-reliability"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -1762,6 +1762,14 @@ class UserVisibleError(RuntimeError):
         self.code = str(code or "")
         self.params = [str(value) for value in params] if params else []
         self.details = list(details) if details else []
+
+
+class BackendHTTPError(UserVisibleError):
+    """Expected backend HTTP error with a machine-readable status code."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
 
 
 class CancelledError(UserVisibleError):
@@ -5011,7 +5019,10 @@ class ForgeClient:
                 body = str(exc)
             details = format_http_error_body(body)
             suffix = f"\n\n{details}" if details else ""
-            raise UserVisibleError(f"Forge Neo HTTP {exc.code}{suffix}") from exc
+            raise BackendHTTPError(
+                f"Forge Neo HTTP {exc.code}{suffix}",
+                exc.code,
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise UserVisibleError(f"Forge Neo is unavailable at {self.host}:{self.port}: {exc}") from exc
         if not raw:
@@ -5509,6 +5520,21 @@ FORGE_CATALOG_SOURCES = {
 FORGE_CATALOG_CACHE: Dict[str, Any] = {}
 FORGE_CATALOG_CACHE_SERVER: Optional[Tuple[str, int]] = None
 FORGE_CATALOG_CACHE_LOCK = threading.RLock()
+FORGE_TASK_PROGRESS_CAPABILITIES: Dict[Tuple[str, int], bool] = {}
+FORGE_TASK_PROGRESS_CAPABILITIES_LOCK = threading.Lock()
+
+
+def clear_forge_task_progress_capabilities(
+    endpoint: Optional[Tuple[str, int]] = None,
+) -> None:
+    """Forget cached /internal/progress support globally or for one Forge endpoint."""
+
+    with FORGE_TASK_PROGRESS_CAPABILITIES_LOCK:
+        if endpoint is None:
+            FORGE_TASK_PROGRESS_CAPABILITIES.clear()
+            return
+        key = (normalize_comfy_host(endpoint[0]).lower(), int(endpoint[1]))
+        FORGE_TASK_PROGRESS_CAPABILITIES.pop(key, None)
 
 
 def clear_forge_catalog_cache() -> None:
@@ -5522,16 +5548,21 @@ def _forge_catalog_server_key() -> Tuple[str, int]:
     return normalize_comfy_host(runtime_config().backend_host), int(runtime_config().forge_port)
 
 
+def _forge_catalog_current_from_options(options: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "checkpoint": _strip_checkpoint_hash(options.get("sd_model_checkpoint")),
+        "modules": [
+            str(item) for item in (options.get("forge_additional_modules") or [])
+        ] if isinstance(options.get("forge_additional_modules"), list) else [],
+    }
+
+
 def _update_forge_catalog_current(options: Dict[str, Any]) -> None:
     if not isinstance(options, dict):
         return
+    current = _forge_catalog_current_from_options(options)
     with FORGE_CATALOG_CACHE_LOCK:
-        FORGE_CATALOG_CACHE["current"] = {
-            "checkpoint": _strip_checkpoint_hash(options.get("sd_model_checkpoint")),
-            "modules": [
-                str(item) for item in (options.get("forge_additional_modules") or [])
-            ] if isinstance(options.get("forge_additional_modules"), list) else [],
-        }
+        FORGE_CATALOG_CACHE["current"] = current
 
 
 def _update_forge_catalog_current_overrides(overrides: Dict[str, Any]) -> None:
@@ -5554,14 +5585,135 @@ def _update_forge_catalog_current_overrides(overrides: Dict[str, Any]) -> None:
         FORGE_CATALOG_CACHE["current"] = current
 
 
+def _fetch_forge_catalog_source(client: ForgeClient, source: str) -> Any:
+    endpoints = {
+        "checkpoints": ("sdapi/v1/sd-models", 60),
+        "modules": ("sdapi/v1/sd-modules", 60),
+        "samplers": ("sdapi/v1/samplers", 30),
+        "schedulers": ("sdapi/v1/schedulers", 30),
+        "upscalers": ("sdapi/v1/upscalers", 30),
+        "loras": ("sdapi/v1/loras", 60),
+    }
+    path, timeout = endpoints[source]
+    try:
+        return client.get_json(path, timeout=timeout)
+    except UserVisibleError:
+        if source == "upscalers":
+            LOGGER.warning(
+                "Forge Neo did not return the upscaler list; the Upscaler schema will remain unavailable"
+            )
+            return []
+        if source == "loras":
+            LOGGER.warning(
+                "Forge Neo did not return the LoRA list; the LoRA button will be disabled"
+            )
+            return []
+        raise
+
+
+def _normalize_forge_catalog_source(source: str, raw: Any) -> Any:
+    if source == "checkpoints":
+        items: List[Dict[str, Any]] = []
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            title = _strip_checkpoint_hash(
+                item.get("title") or item.get("model_name") or item.get("filename")
+            )
+            if not title:
+                continue
+            hint_source = (
+                item.get("filename")
+                or item.get("model_name")
+                or item.get("title")
+                or title
+            )
+            items.append({
+                "label": title,
+                "value": title,
+                "_hint_source": str(hint_source or title),
+            })
+        items.sort(key=lambda item: item["label"].lower())
+        return items
+
+    if source == "modules":
+        items: List[Dict[str, str]] = []
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            label = str(
+                item.get("model_name")
+                or Path(str(item.get("filename") or "")).name
+                or ""
+            ).strip()
+            value = str(item.get("filename") or item.get("model_name") or "")
+            if label and value:
+                items.append({"label": label, "value": value})
+        items.sort(key=lambda item: item["label"].lower())
+        return items
+
+    if source == "samplers":
+        rows = raw if isinstance(raw, list) else []
+        return sorted({
+            str(item.get("name"))
+            for item in rows
+            if isinstance(item, dict) and item.get("name")
+        })
+
+    if source == "schedulers":
+        rows = raw if isinstance(raw, list) else []
+        return [
+            str(item.get("label") or item.get("name"))
+            for item in rows
+            if isinstance(item, dict) and (item.get("label") or item.get("name"))
+        ]
+
+    if source == "upscalers":
+        items: List[Dict[str, str]] = []
+        names: Set[str] = set()
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name or name in names:
+                continue
+            names.add(name)
+            items.append({"label": name, "value": name})
+        return items
+
+    if source == "loras":
+        names: Set[str] = set()
+        for item in raw if isinstance(raw, list) else []:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                name = str(
+                    item.get("name")
+                    or item.get("alias")
+                    or item.get("model_name")
+                    or item.get("title")
+                    or item.get("filename")
+                    or item.get("path")
+                    or ""
+                ).strip()
+            else:
+                name = ""
+            if name:
+                names.add(name)
+        return sorted(names, key=str.lower)
+
+    return []
+
+
 def forge_catalog(
     sources: Optional[Sequence[str]] = None, *, force: bool = False,
     schema_folder: Any = "",
 ) -> Dict[str, Any]:
     """Load only catalog sources required by the selected Forge schema.
 
-    The process-level cache accumulates already loaded sources. A manual schema
-    refresh forces only the requested sources. A backend probe clears the cache.
+    Independent Forge endpoints are fetched in parallel. Network I/O never holds
+    the catalog lock; results are committed atomically after all required calls
+    finish, so the UI never observes a partially refreshed catalog.
     """
     global FORGE_CATALOG_CACHE_SERVER
 
@@ -5578,7 +5730,8 @@ def forge_catalog(
             FORGE_CATALOG_CACHE_SERVER = server_key
 
         if not requested:
-            return _forge_catalog_with_model_hints(FORGE_CATALOG_CACHE, schema_folder)
+            snapshot = copy.deepcopy(FORGE_CATALOG_CACHE)
+            return _forge_catalog_with_model_hints(snapshot, schema_folder)
 
         refresh_sources = set(requested) if force else {
             source for source in requested if source not in FORGE_CATALOG_CACHE
@@ -5586,122 +5739,45 @@ def forge_catalog(
         needs_options = bool(requested.intersection({"checkpoints", "modules"})) and (
             force or "current" not in FORGE_CATALOG_CACHE
         )
-        client = current_forge_client()
+        base_snapshot = copy.deepcopy(FORGE_CATALOG_CACHE)
 
-        if needs_options:
-            options = client.get_json("sdapi/v1/options", timeout=30)
-            if not isinstance(options, dict):
-                options = {}
-            _update_forge_catalog_current(options)
+    client = current_forge_client()
+    updates: Dict[str, Any] = {}
 
-        if "checkpoints" in refresh_sources:
-            models = client.get_json("sdapi/v1/sd-models", timeout=60)
-            model_items: List[Dict[str, Any]] = []
-            for item in models if isinstance(models, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                title = _strip_checkpoint_hash(
-                    item.get("title") or item.get("model_name") or item.get("filename")
-                )
-                if title:
-                    # Keep only a private matching source in the process cache. It
-                    # is removed before the catalog is returned to JSX.
-                    hint_source = (
-                        item.get("filename")
-                        or item.get("model_name")
-                        or item.get("title")
-                        or title
-                    )
-                    model_items.append({
-                        "label": title,
-                        "value": title,
-                        "_hint_source": str(hint_source or title),
-                    })
-            model_items.sort(key=lambda item: item["label"].lower())
-            FORGE_CATALOG_CACHE["checkpoints"] = model_items
+    if needs_options:
+        options = client.get_json("sdapi/v1/options", timeout=30)
+        if not isinstance(options, dict):
+            options = {}
+        updates["current"] = _forge_catalog_current_from_options(options)
 
-        if "modules" in refresh_sources:
-            modules = client.get_json("sdapi/v1/sd-modules", timeout=60)
-            module_items: List[Dict[str, str]] = []
-            for item in modules if isinstance(modules, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                label = str(
-                    item.get("model_name")
-                    or Path(str(item.get("filename") or "")).name
-                    or ""
-                ).strip()
-                value = str(item.get("filename") or item.get("model_name") or "")
-                if label and value:
-                    module_items.append({"label": label, "value": value})
-            module_items.sort(key=lambda item: item["label"].lower())
-            FORGE_CATALOG_CACHE["modules"] = module_items
+    if refresh_sources:
+        workers = min(len(refresh_sources), len(FORGE_CATALOG_SOURCES))
+        raw_results: Dict[str, Any] = {}
+        with ThreadPoolExecutor(
+            max_workers=max(1, workers),
+            thread_name_prefix="ForgeCatalog",
+        ) as executor:
+            futures = {
+                source: executor.submit(_fetch_forge_catalog_source, client, source)
+                for source in refresh_sources
+            }
+            for source, future in futures.items():
+                raw_results[source] = future.result()
+        for source, raw in raw_results.items():
+            updates[source] = _normalize_forge_catalog_source(source, raw)
 
-        if "samplers" in refresh_sources:
-            samplers = client.get_json("sdapi/v1/samplers", timeout=30)
-            sampler_rows = samplers if isinstance(samplers, list) else []
-            FORGE_CATALOG_CACHE["samplers"] = sorted({
-                str(item.get("name"))
-                for item in sampler_rows
-                if isinstance(item, dict) and item.get("name")
-            })
+    with FORGE_CATALOG_CACHE_LOCK:
+        if FORGE_CATALOG_CACHE_SERVER == server_key:
+            FORGE_CATALOG_CACHE.update(updates)
+            snapshot = copy.deepcopy(FORGE_CATALOG_CACHE)
+        else:
+            # Runtime changed while the old endpoint was answering. Return a
+            # coherent result to the in-flight request without contaminating the
+            # cache belonging to the new endpoint.
+            base_snapshot.update(updates)
+            snapshot = base_snapshot
 
-        if "schedulers" in refresh_sources:
-            schedulers = client.get_json("sdapi/v1/schedulers", timeout=30)
-            scheduler_rows = schedulers if isinstance(schedulers, list) else []
-            FORGE_CATALOG_CACHE["schedulers"] = [
-                str(item.get("label") or item.get("name"))
-                for item in scheduler_rows
-                if isinstance(item, dict) and (item.get("label") or item.get("name"))
-            ]
-
-        if "upscalers" in refresh_sources:
-            try:
-                upscalers = client.get_json("sdapi/v1/upscalers", timeout=30)
-            except UserVisibleError:
-                LOGGER.warning(
-                    "Forge Neo did not return the upscaler list; the Upscaler schema will remain unavailable"
-                )
-                upscalers = []
-            upscaler_items: List[Dict[str, str]] = []
-            upscaler_names: Set[str] = set()
-            for item in upscalers if isinstance(upscalers, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name") or "").strip()
-                if not name or name in upscaler_names:
-                    continue
-                upscaler_names.add(name)
-                upscaler_items.append({"label": name, "value": name})
-            FORGE_CATALOG_CACHE["upscalers"] = upscaler_items
-
-        if "loras" in refresh_sources:
-            try:
-                loras = client.get_json("sdapi/v1/loras", timeout=60)
-            except UserVisibleError:
-                LOGGER.warning("Forge Neo did not return the LoRA list; the LoRA button will be disabled")
-                loras = []
-            lora_names: Set[str] = set()
-            for item in loras if isinstance(loras, list) else []:
-                if isinstance(item, str):
-                    name = item.strip()
-                elif isinstance(item, dict):
-                    name = str(
-                        item.get("name")
-                        or item.get("alias")
-                        or item.get("model_name")
-                        or item.get("title")
-                        or item.get("filename")
-                        or item.get("path")
-                        or ""
-                    ).strip()
-                else:
-                    name = ""
-                if name:
-                    lora_names.add(name)
-            FORGE_CATALOG_CACHE["loras"] = sorted(lora_names, key=str.lower)
-
-        return _forge_catalog_with_model_hints(FORGE_CATALOG_CACHE, schema_folder)
+    return _forge_catalog_with_model_hints(snapshot, schema_folder)
 
 # ============================================================================
 # FORGE: IMAGESTITCH, НОРМАЛИЗАЦИЯ И ПРОВЕРКА ЗНАЧЕНИЙ UI
@@ -6015,12 +6091,18 @@ def _forge_task_progress(
     task_id: str,
     timeout: float = 2.0,
 ) -> Optional[Dict[str, Any]]:
-    """Return Forge's task-specific queue state when the endpoint is available.
+    """Return task-specific Forge queue state when /internal/progress exists.
 
-    Current Forge exposes /internal/progress for task IDs.  Older/api-only builds
-    may not expose it; HTTP 404/405 is treated as an unsupported capability so
-    the helper can fall back without breaking existing installations.
+    Support is cached per host:port. Older/api-only Forge builds return 404/405;
+    after the first structured HTTP response the helper skips this endpoint for
+    subsequent jobs until capabilities are explicitly reset.
     """
+
+    endpoint = (normalize_comfy_host(client.host).lower(), int(client.port))
+    with FORGE_TASK_PROGRESS_CAPABILITIES_LOCK:
+        capability = FORGE_TASK_PROGRESS_CAPABILITIES.get(endpoint)
+    if capability is False:
+        return None
 
     try:
         result = client.post_json(
@@ -6028,11 +6110,19 @@ def _forge_task_progress(
             {"id_task": task_id, "live_preview": False, "id_live_preview": -1},
             timeout=timeout,
         )
-    except UserVisibleError as exc:
-        message = str(exc)
-        if "HTTP 404" in message or "HTTP 405" in message:
+    except BackendHTTPError as exc:
+        if exc.status_code in (404, 405):
+            with FORGE_TASK_PROGRESS_CAPABILITIES_LOCK:
+                first_negative = FORGE_TASK_PROGRESS_CAPABILITIES.get(endpoint) is not False
+                FORGE_TASK_PROGRESS_CAPABILITIES[endpoint] = False
+            if first_negative:
+                LOGGER.info(
+                    "Forge task-specific progress is unavailable at %s:%s (HTTP %s); using compatibility fallback",
+                    endpoint[0], endpoint[1], exc.status_code,
+                )
             return None
         raise
+
     if not isinstance(result, dict) or not all(
         key in result for key in ("active", "queued", "completed")
     ):
@@ -6040,8 +6130,9 @@ def _forge_task_progress(
             "Forge returned an invalid task-specific progress response.",
             "forge_task_progress_invalid",
         )
+    with FORGE_TASK_PROGRESS_CAPABILITIES_LOCK:
+        FORGE_TASK_PROGRESS_CAPABILITIES[endpoint] = True
     return result
-
 
 def _record_forge_task_progress(job: Any, status: Optional[Dict[str, Any]]) -> None:
     with GENERATION_SUBMIT_LOCK:
@@ -8071,9 +8162,15 @@ def _cancel_job(job: GenerationJob) -> None:
     finally:
         if not job.confirmed:
             LOGGER.warning("Cancellation unconfirmed: request=%s error=%s", job.request_id, job.error)
-        if job.confirmed and job.backend == "forge":
-            with FORGE_POST_THREADS_LOCK:
-                FORGE_POST_THREADS.pop(job.request_id, None)
+        if job.confirmed:
+            if job.backend == "forge":
+                with FORGE_POST_THREADS_LOCK:
+                    FORGE_POST_THREADS.pop(job.request_id, None)
+            cleanup_job_direct_inputs(job)
+            key = job.endpoint()
+            with GENERATION_SUBMIT_LOCK:
+                if PENDING_CANCELLATIONS.get(key) is job:
+                    PENDING_CANCELLATIONS.pop(key, None)
         job.cancel_done.set()
 
 
@@ -8805,7 +8902,18 @@ def _probe_comfy_full(host: str, port: int, *, update_runtime: bool) -> Dict[str
             "temp_folder": str(temp_folder or ""),
         }
         return _backend_probe_result(available=True, details=details)
+    except UserVisibleError:
+        if update_runtime and endpoint == (normalize_comfy_host(RUNTIME.backend_host), int(RUNTIME.comfy_port)):
+            RUNTIME.comfy_input_folder = None
+            RUNTIME.comfy_output_folder = None
+            RUNTIME.comfy_temp_folder = None
+            COMFY_INPUT_FOLDER_ENDPOINT = None
+        return _backend_probe_result(available=False)
     except Exception:
+        LOGGER.exception(
+            "Unexpected ComfyUI full probe error at %s:%s",
+            normalize_comfy_host(host), int(port),
+        )
         if update_runtime and endpoint == (normalize_comfy_host(RUNTIME.backend_host), int(RUNTIME.comfy_port)):
             RUNTIME.comfy_input_folder = None
             RUNTIME.comfy_output_folder = None
@@ -8821,7 +8929,13 @@ def _probe_comfy_light(host: str, port: int, previous: Dict[str, Any]) -> Dict[s
             raise UserVisibleError("ComfyUI health response is invalid.")
         details = copy.deepcopy(previous.get("details") or {})
         return _backend_probe_result(available=True, details=details)
+    except UserVisibleError:
+        return _backend_probe_result(available=False)
     except Exception:
+        LOGGER.exception(
+            "Unexpected ComfyUI light probe error at %s:%s",
+            normalize_comfy_host(host), int(port),
+        )
         return _backend_probe_result(available=False)
 
 
@@ -8860,7 +8974,13 @@ def _probe_forge_full(host: str, port: int) -> Dict[str, Any]:
                     FORGE_CATALOG_CACHE_SERVER = server_key
             _update_forge_catalog_current(options)
         return _backend_probe_result(available=is_forge_neo, details=details)
+    except UserVisibleError:
+        return _backend_probe_result(available=False)
     except Exception:
+        LOGGER.exception(
+            "Unexpected Forge full probe error at %s:%s",
+            normalize_comfy_host(host), int(port),
+        )
         return _backend_probe_result(available=False)
 
 
@@ -8874,7 +8994,13 @@ def _probe_forge_light(host: str, port: int, previous: Dict[str, Any]) -> Dict[s
             raise UserVisibleError("Forge Neo health response is invalid.")
         details = copy.deepcopy(previous.get("details") or {})
         return _backend_probe_result(available=True, details=details)
+    except UserVisibleError:
+        return _backend_probe_result(available=False)
     except Exception:
+        LOGGER.exception(
+            "Unexpected Forge light probe error at %s:%s",
+            normalize_comfy_host(host), int(port),
+        )
         return _backend_probe_result(available=False)
 
 
@@ -9306,8 +9432,10 @@ def handle_command(command: Dict[str, Any]) -> None:
         REQUEST_CONTEXT.runtime = runtime_snapshot()
 
         if command_type == "probe_backends":
-            # Ручная проверка сбрасывает Forge-каталог для нового endpoint.
+            # Ручная проверка сбрасывает Forge-каталог и capability cache, чтобы
+            # обновлённый Forge на том же host:port был определён заново.
             clear_forge_catalog_cache()
+            clear_forge_task_progress_capabilities()
             endpoints = _backend_endpoints(
                 str(message.get("host") or RUNTIME.backend_host),
                 int(message.get("comfyPort") or RUNTIME.comfy_port),

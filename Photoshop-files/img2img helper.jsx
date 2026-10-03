@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.249",
+	VER = "0.250",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.233-dead-code-cleanup",
+	API_BUILD_ID = "0.234-probe-catalog-reliability",
 	// Пользовательские runtime-таймауты имеют те же default/границы в JSX и Python.
 	GENERATION_TIMEOUT_DEFAULT = 20 * 60,
 	GENERATION_TIMEOUT_MIN = 30,
@@ -58,9 +58,8 @@ var APP = {
 	STARTUP_PROGRESS_DELAY = 1000,
 	// Python ограничивает перевод 45 с; 10 с остаются на возврат ответа через bridge.
 	TRANSLATE_TIMEOUT = 55 * 1000,
-	// Forge catalog может последовательно опросить несколько endpoint по 30–60 с.
-	// Шесть минут покрывают его максимальный сетевой бюджет и не оставляют Python
-	// продолжать анализ после преждевременного таймаута JSX.
+	// Forge catalog загружает независимые endpoint параллельно. Шесть минут остаются
+	// общим защитным пределом анализа для медленных/удалённых серверов.
 	ANALYZE_TIMEOUT = 6 * 60 * 1000,
 	// За 7,5 с подготовка проходит половину пути к пределу 20%.
 	GENERATION_PREPARE_EXPECTED_MS = 7500,
