@@ -47,8 +47,8 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6380   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.234"
-API_BUILD_ID = "0.234-probe-catalog-reliability"
+VERSION = "0.236"
+API_BUILD_ID = "0.236-forge-light-progress"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -6854,34 +6854,60 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         notify_generation_progress_ready(request_id, "forge")
         progress_stage_started = True
 
+    # Keep ownership polling responsive while the task is queued, but once
+    # Forge confirms that this helper's own task is active, stop hammering
+    # /internal/progress.  Sampling detection is much less time-critical than
+    # queue ownership and /sdapi/v1/progress can contend with a busy local Forge,
+    # so poll it only once per second.
     next_progress_poll = 0.0
+    next_sampling_poll = 0.0
+    owned_task_active = False
     while not post_done.is_set() and not progress_stage_started:
         touch_activity()
         raise_if_generation_cancelled(request_id)
         now = time.monotonic()
+
+        if owned_task_active:
+            if progress_mode == "request_sent":
+                notify_generation_progress_ready(request_id, "forge")
+                progress_stage_started = True
+                break
+            if now >= next_sampling_poll:
+                next_sampling_poll = now + 1.0
+                try:
+                    if forge_sampling_has_started(client):
+                        notify_generation_progress_ready(request_id, "forge")
+                        progress_stage_started = True
+                        break
+                except UserVisibleError as exc:
+                    LOGGER.debug("Forge sampling progress polling failed: %s", exc)
+            post_done.wait(timeout=0.05)
+            continue
+
         if now >= next_progress_poll:
             next_progress_poll = now + 0.3
 
-            # Preferred path: task-specific queue tracking.  A task reported as
-            # queued belongs to this helper but is not yet executing; another
-            # computer's sampling must not advance our progress stage.
+            # Task-specific tracking is used only to establish ownership.  "active"
+            # still means preparation may be in progress; it is not itself the
+            # boundary between Initializing and Generating.
             if job.forge_task_id and job.forge_task_tracking is not False:
                 try:
                     task_status = _forge_task_progress(client, job.forge_task_id)
                     _record_forge_task_progress(job, task_status)
-                    if task_status is not None:
-                        if bool(task_status.get("active")):
-                            notify_generation_progress_ready(request_id, "forge")
-                            progress_stage_started = True
-                            break
-                        # queued/completed/unknown are all handled without looking
-                        # at global sampling progress, which may belong to a peer.
-                        post_done.wait(timeout=0.05)
-                        continue
                 except UserVisibleError as exc:
                     # Transient task-progress failures are safe: do not infer
                     # ownership from global progress while task tracking exists.
                     LOGGER.debug("Forge task progress polling failed: %s", exc)
+                    post_done.wait(timeout=0.05)
+                    continue
+
+                if task_status is not None:
+                    if bool(task_status.get("active")):
+                        owned_task_active = True
+                        next_sampling_poll = 0.0
+                    # queued/active-before-sampling/completed/unknown stay in the
+                    # preparation segment.  Do not inspect another client's global
+                    # progress until ownership of this task is established.
                     post_done.wait(timeout=0.05)
                     continue
 

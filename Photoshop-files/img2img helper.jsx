@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.250",
+	VER = "0.257",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.234-probe-catalog-reliability",
+	API_BUILD_ID = "0.236-forge-light-progress",
 	// Пользовательские runtime-таймауты имеют те же default/границы в JSX и Python.
 	GENERATION_TIMEOUT_DEFAULT = 20 * 60,
 	GENERATION_TIMEOUT_MIN = 30,
@@ -71,6 +71,11 @@ var APP = {
 	PROGRESS_STAGE_TARGET = 0.95,
 	API_POLL_INTERVAL = 25,
 	API_POLL_SLEEP = 5,
+	// Во время локальной генерации socket и Photoshop UI имеют независимый ритм.
+	// TCP listener проверяется часто, чтобы ответ Python/ACK замечался практически
+	// сразу; Photoshop progress API обновляется только 8 раз/с, чтобы не нагружать UI.
+	GENERATION_UI_UPDATE_INTERVAL = 125,
+	GENERATION_SOCKET_POLL_SLEEP = 5,
 	// Вертикальный ритм главного окна. Эти значения можно менять независимо:
 	// обычные динамические блоки, верхняя строка Selection/Settings, Backend и Workflow/Schema.
 	MAIN_UI_BLOCK_SPACING = 5,
@@ -5176,6 +5181,26 @@ function UI() {
 	this.createStartupProgress = function (msg, timeout) { return new StartupProgress(msg, timeout, 0); };
 	this.createDelayedStartupProgress = function (msg, timeout, delay) { return new StartupProgress(msg, timeout, delay); };
 }
+// Global callback used both directly and by Photoshop string-evaluated progress tasks.
+// It must remain in global scope: app.doProgressTask() evaluates callback strings
+// outside BridgeApi()/GenerationProgress() local function scopes.
+function generationProgressWorkChunk(text) {
+	app.changeProgressText(text);
+	$.sleep(0);
+}
+// One real Photoshop progress task is required to make the first stage paint.
+// changeProgressText() alone may be deferred until the next Photoshop UI cycle,
+// allowing a very fast Python init reply to make Generating appear first.
+function generationProgressPrime(text) {
+	var safe = String(text)
+		.replace(/\\/g, "\\\\")
+		.replace(/'/g, "\\'")
+		.replace(/[\r\n]+/g, " ");
+	// A microscopic task length forces one UI cycle without meaningfully moving
+	// the segment or delaying the backend. All later updates stay throttled.
+	return app.doProgressTask(0.000001, "generationProgressWorkChunk('" + safe + "');");
+}
+
 // ---
 // ДВУХЭТАПНЫЙ PROGRESS ГЕНЕРАЦИИ
 // Первый сегмент ждёт подготовки/начала sampling, второй — завершения backend.
@@ -5236,13 +5261,18 @@ function GenerationProgress() {
 		return false;
 	}
 	this.stageOne = function () {
+		// Photoshop may defer a plain changeProgressText() until a later UI cycle.
+		// Prime the first stage through one real progress task before sending the
+		// generation command, so a warm backend cannot visually skip Initializing.
+		var prepareLabel = prepareTitle || str.progressPrepare;
+		if (!generationProgressPrime(prepareLabel + "\t 0.0 s. ")) return false;
 		// Первый сегмент использует общий пользовательский тайм-аут генерации:
 		// загрузка крупной модели может занимать значительную часть этого времени.
 		var prepareTimeout = cfg.generationTimeout * 1000,
 			answer = api.startGeneration({
 				command: payload,
 				timeout: prepareTimeout,
-				title: prepareTitle || str.progressPrepare,
+				title: prepareLabel,
 				max: GENERATION_PREPARE_EXPECTED_MS,
 				progressCurve: "hyperbolic"
 			});
@@ -5251,9 +5281,13 @@ function GenerationProgress() {
 		return true;
 	};
 	this.stageTwo = function () {
+		// Do not overwrite Initializing immediately. The normal throttled progress
+		// update will publish Generating shortly after ACK, while the backend keeps
+		// running without any artificial delay.
+		var generateLabel = generateTitle || str.progressGenerate;
 		var answer = api.finishGeneration({
 			timeout: cfg.generationTimeout * 1000,
-			title: generateTitle || str.progressGenerate,
+			title: generateLabel,
 			max: delayMax,
 			delayKey: delayKey,
 			requestId: requestId
@@ -5578,6 +5612,8 @@ function BridgeApi() {
 			progressCurve: options.progressCurve,
 			trackDelay: true,
 			delayKey: options.delayKey,
+			uiUpdateInterval: GENERATION_UI_UPDATE_INTERVAL,
+			socketPollSleep: GENERATION_SOCKET_POLL_SLEEP,
 			interruptOnTimeout: true
 		});
 	};
@@ -5590,6 +5626,8 @@ function BridgeApi() {
 			trackDelay: true,
 			delayKey: options.delayKey,
 			requestId: options.requestId,
+			uiUpdateInterval: GENERATION_UI_UPDATE_INTERVAL,
+			socketPollSleep: GENERATION_SOCKET_POLL_SLEEP,
 			interruptOnTimeout: true
 		});
 	};
@@ -5640,9 +5678,13 @@ function BridgeApi() {
 			delayKey = options.delayKey,
 			expectedRequestId = options.expectedRequestId,
 			interruptOnTimeout = !!options.interruptOnTimeout,
+			// UI cadence and socket cadence are intentionally independent. Legacy
+			// option names remain accepted for ordinary bridge calls.
+			uiUpdateInterval = Math.max(10, Number(options.uiUpdateInterval || options.pollInterval) || API_POLL_INTERVAL),
+			socketPollSleep = Math.max(1, Number(options.socketPollSleep || options.pollSleep) || API_POLL_SLEEP),
 			t1 = (new Date()).getTime(),
 			t2 = t1,
-			t3 = t1,
+			lastUiUpdate = t1,
 			slice = 0;
 		if (title) {
 			max = Number(max) || timeout || 7500;
@@ -5657,30 +5699,9 @@ function BridgeApi() {
 				}
 				throw new Error(str.errApiTimeout);
 			}
-			if (t2 - t3 >= API_POLL_INTERVAL) {
-				if (progress) progress.pulse();
-				if (title) {
-					// taskLength — доля оставшейся части текущего segment. Для
-					// подготовки гипербола t/(t+max) медленно и без скачков стремится
-					// к границе 20%. Генерация сохраняет адаптивную экспоненту, которая
-					// за ожидаемое время проходит PROGRESS_STAGE_TARGET сегмента.
-					var progressDelta = t2 - t3;
-					if (progressDelta > 0 && progressCurve == "hyperbolic")
-						slice = progressDelta / (max + t2 - t1);
-					else slice = progressDelta > 0
-						? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / max)
-						: 0;
-					var text = trackDelay
-						? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
-						: title;
-					if (!app.doProgressTask(slice, "workChunk('" + escapeProgressText(text) + "');")) {
-						// GenerationProgress.cancelProgress() отправит единственный interrupt.
-						listener.close();
-						return false;
-					}
-				}
-				t3 = t2;
-			}
+
+			// Socket has priority over visual progress. If Python has already answered,
+			// consume it immediately instead of making another Photoshop UI call first.
 			var connection = listener.poll();
 			if (connection != null) {
 				var answer = null,
@@ -5706,12 +5727,35 @@ function BridgeApi() {
 				}
 				return answer;
 			}
-			$.sleep(API_POLL_SLEEP);
+
+			// Photoshop UI is intentionally slower than socket polling. ESC is still
+			// checked by doProgressTask at this cadence (8 Hz for generation).
+			if (t2 - lastUiUpdate >= uiUpdateInterval) {
+				if (progress) progress.pulse();
+				if (title) {
+					// taskLength — доля оставшейся части текущего segment. Для
+					// подготовки гипербола t/(t+max) медленно и без скачков стремится
+					// к границе 20%. Генерация сохраняет адаптивную экспоненту, которая
+					// за ожидаемое время проходит PROGRESS_STAGE_TARGET сегмента.
+					var progressDelta = t2 - lastUiUpdate;
+					if (progressDelta > 0 && progressCurve == "hyperbolic")
+						slice = progressDelta / (max + t2 - t1);
+					else slice = progressDelta > 0
+						? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / max)
+						: 0;
+					var text = trackDelay
+						? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
+						: title;
+					if (!app.doProgressTask(slice, "generationProgressWorkChunk('" + escapeProgressText(text) + "');")) {
+						// GenerationProgress.cancelProgress() отправит единственный interrupt.
+						listener.close();
+						return false;
+					}
+				}
+				lastUiUpdate = t2;
+			}
+			$.sleep(socketPollSleep);
 		}
-	}
-	function workChunk(text) {
-		app.changeProgressText(text);
-		$.sleep(0);
 	}
 	function escapeProgressText(text) {
 		return String(text)
