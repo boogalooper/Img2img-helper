@@ -47,8 +47,8 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6380   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.236"
-API_BUILD_ID = "0.236-forge-light-progress"
+VERSION = "0.237"
+API_BUILD_ID = "0.237-translation-system-progress"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -596,9 +596,59 @@ TRANSLATION_TOTAL_TIMEOUT_SECONDS = 45
 TRANSLATION_OPERATION_LOCK = threading.Lock()
 TRANSLATION_CONTEXT = threading.local()
 TRANSLATION_FAILED_UNTIL: Dict[str, float] = {}
+TRANSLATION_ACTIVE_LOCK = threading.Lock()
+TRANSLATION_ACTIVE_REQUEST_ID = ""
+TRANSLATION_ACTIVE_CANCEL_EVENT: Optional[threading.Event] = None
+TRANSLATION_CANCELLED_REQUESTS: set[str] = set()
+
+
+def _set_active_translation(request_id: str, cancel_event: Optional[threading.Event]) -> None:
+    global TRANSLATION_ACTIVE_REQUEST_ID, TRANSLATION_ACTIVE_CANCEL_EVENT
+    normalized = str(request_id or "")
+    with TRANSLATION_ACTIVE_LOCK:
+        TRANSLATION_ACTIVE_REQUEST_ID = normalized if cancel_event is not None else ""
+        TRANSLATION_ACTIVE_CANCEL_EVENT = cancel_event
+        if cancel_event is not None and normalized in TRANSLATION_CANCELLED_REQUESTS:
+            cancel_event.set()
+
+
+def _clear_active_translation(request_id: str, cancel_event: threading.Event) -> None:
+    global TRANSLATION_ACTIVE_REQUEST_ID, TRANSLATION_ACTIVE_CANCEL_EVENT
+    with TRANSLATION_ACTIVE_LOCK:
+        normalized = str(request_id or "")
+        if (
+            TRANSLATION_ACTIVE_REQUEST_ID == normalized
+            and TRANSLATION_ACTIVE_CANCEL_EVENT is cancel_event
+        ):
+            TRANSLATION_ACTIVE_REQUEST_ID = ""
+            TRANSLATION_ACTIVE_CANCEL_EVENT = None
+        TRANSLATION_CANCELLED_REQUESTS.discard(normalized)
+
+
+def cancel_translation_request(request_id: str) -> bool:
+    normalized = str(request_id or "")
+    if not normalized:
+        return False
+    with TRANSLATION_ACTIVE_LOCK:
+        # Remember an early ESC even if the translate command has not reached
+        # _set_active_translation() yet; handle_client commands run concurrently.
+        TRANSLATION_CANCELLED_REQUESTS.add(normalized)
+        if (
+            TRANSLATION_ACTIVE_REQUEST_ID == normalized
+            and TRANSLATION_ACTIVE_CANCEL_EVENT is not None
+        ):
+            TRANSLATION_ACTIVE_CANCEL_EVENT.set()
+        return True
+
+
+def raise_if_translation_cancelled() -> None:
+    cancel_event = getattr(TRANSLATION_CONTEXT, "cancel_event", None)
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError("Translation was cancelled.", "translation_cancelled")
 
 
 def translation_request_timeout() -> float:
+    raise_if_translation_cancelled()
     remaining = getattr(TRANSLATION_CONTEXT, "deadline", time.monotonic() + 6) - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("Translation time limit exceeded")
@@ -972,36 +1022,56 @@ def _translation_server_order(preferred: str = "") -> List[Tuple[str, str, str]]
     return servers
 
 
-def translate_prompt_to_english(source_text: str, preferred: str = "") -> Dict[str, str]:
-    """Bound the entire translation, including multi-segment providers.
+def translate_prompt_to_english(
+    source_text: str, preferred: str = "", request_id: str = ""
+) -> Dict[str, str]:
+    """Bound the entire translation and make Photoshop cancellation immediate.
 
-    A slow provider may finish late, but cannot update the preference or reply
-    to another request. At most one translation worker runs at a time.
+    The network call itself may still need its short socket timeout to unwind,
+    but after cancellation its result is discarded and cannot update preferences.
+    At most one translation worker runs at a time.
     """
     if not TRANSLATION_OPERATION_LOCK.acquire(blocking=False):
         raise UserVisibleError("The previous translation is still finishing. Retry shortly.", "translation_busy")
     completed = threading.Event()
+    cancel_event = threading.Event()
     result: Dict[str, Any] = {}
     deadline = time.monotonic() + TRANSLATION_TOTAL_TIMEOUT_SECONDS
+    normalized_request_id = str(request_id or "")
+    _set_active_translation(normalized_request_id, cancel_event)
 
     def worker() -> None:
         TRANSLATION_CONTEXT.deadline = deadline
+        TRANSLATION_CONTEXT.cancel_event = cancel_event
         try:
             result["value"] = _translate_prompt(source_text, preferred)
         except Exception as exc:
             result["error"] = exc
         finally:
             completed.set()
+            _clear_active_translation(normalized_request_id, cancel_event)
             TRANSLATION_OPERATION_LOCK.release()
 
     thread = threading.Thread(target=worker, name="TranslatePrompt", daemon=True)
     try:
         thread.start()
     except Exception:
+        _clear_active_translation(normalized_request_id, cancel_event)
         TRANSLATION_OPERATION_LOCK.release()
         raise
-    if not completed.wait(TRANSLATION_TOTAL_TIMEOUT_SECONDS):
-        raise UserVisibleError("Translation time limit exceeded. Retry or choose another translator.", "translation_timeout")
+
+    while not completed.wait(0.05):
+        if cancel_event.is_set():
+            raise CancelledError("Translation was cancelled.", "translation_cancelled")
+        if time.monotonic() >= deadline:
+            cancel_event.set()
+            raise UserVisibleError(
+                "Translation time limit exceeded. Retry or choose another translator.",
+                "translation_timeout",
+            )
+
+    if cancel_event.is_set():
+        raise CancelledError("Translation was cancelled.", "translation_cancelled")
     if "error" in result:
         raise result["error"]
     value = result["value"]
@@ -9568,7 +9638,11 @@ def handle_command(command: Dict[str, Any]) -> None:
                 answer("", request_id)
                 return
             try:
-                translated = translate_prompt_to_english(source_text, str(message.get("preferred_server") or ""))
+                translated = translate_prompt_to_english(
+                    source_text,
+                    str(message.get("preferred_server") or ""),
+                    str(request_id or ""),
+                )
             except UserVisibleError:
                 raise
             except Exception as exc:
@@ -9579,6 +9653,14 @@ def handle_command(command: Dict[str, Any]) -> None:
                     [exc],
                 ) from exc
             answer(translated, request_id)
+            return
+
+        if command_type == "cancel_translation":
+            target_id = str(message.get("request_id") or "")
+            if not target_id:
+                raise UserVisibleError("Translation cancellation requires a request ID.")
+            accepted = cancel_translation_request(target_id)
+            answer({"accepted": accepted, "state": "cancelling" if accepted else "idle"}, request_id)
             return
 
         if command_type in {"generate", "forge_generate"}:

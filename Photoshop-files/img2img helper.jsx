@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.257",
+	VER = "0.258",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.236-forge-light-progress",
+	API_BUILD_ID = "0.237-translation-system-progress",
 	// Пользовательские runtime-таймауты имеют те же default/границы в JSX и Python.
 	GENERATION_TIMEOUT_DEFAULT = 20 * 60,
 	GENERATION_TIMEOUT_MIN = 30,
@@ -58,6 +58,11 @@ var APP = {
 	STARTUP_PROGRESS_DELAY = 1000,
 	// Python ограничивает перевод 45 с; 10 с остаются на возврат ответа через bridge.
 	TRANSLATE_TIMEOUT = 55 * 1000,
+	// Перевод использует системный progress Photoshop. Socket проверяется часто,
+	// а UI обновляется редко, чтобы ESC был отзывчивым без лишней нагрузки.
+	TRANSLATE_EXPECTED_MS = 6000,
+	TRANSLATE_UI_UPDATE_INTERVAL = 125,
+	TRANSLATE_SOCKET_POLL_SLEEP = 5,
 	// Forge catalog загружает независимые endpoint параллельно. Шесть минут остаются
 	// общим защитным пределом анализа для медленных/удалённых серверов.
 	ANALYZE_TIMEOUT = 6 * 60 * 1000,
@@ -99,6 +104,7 @@ var APP = {
 	cfg = new Config(),
 	api = new BridgeApi(),
 	generationProgress = new GenerationProgress(),
+	translationProgress = new TranslationProgress(),
 	generation = new GenerationRuntime(),
 	action = new ActionRuntime(),
 	backend = new BackendRuntime(),
@@ -4790,17 +4796,29 @@ function UI() {
 		} catch (_) { }
 		translate.onClick = function () {
 			if (!edit.text.length) return;
+			var progressCompleted = false, translated = null;
+			translationProgress.begin(String(edit.text).replace(/\r?\n/g, " "));
 			try {
-				var translated = self.runWithPaletteProgress(str.progressTranslate, function (progress) {
-					return api.translate(String(edit.text).replace(/\r?\n/g, " "), progress);
-				});
+				try {
+					progressCompleted = app.doProgress(localize(str.progressTranslate), "runTranslationProgress()");
+				} catch (progressError) {
+					if (!isUserCancellation(progressError)) throw progressError;
+					progressCompleted = false;
+				}
+				if (progressCompleted === false || translationProgress.wasCancelled()) {
+					translationProgress.cancel();
+					return;
+				}
+				translated = translationProgress.getResult();
 				if (translated && String(translated).length) {
 					setPromptText(translated);
 				} else {
 					messages.error(str.errTranslate);
 				}
 			} catch (e) {
-				messages.error((e && e.message ? e.message : str.errTranslate));
+				if (!isUserCancellation(e)) messages.error((e && e.message ? e.message : str.errTranslate));
+			} finally {
+				translationProgress.clear();
 			}
 		};
 		return { getValue: function () { return edit.text; }, control: edit, container: group };
@@ -5201,6 +5219,41 @@ function generationProgressPrime(text) {
 	return app.doProgressTask(0.000001, "generationProgressWorkChunk('" + safe + "');");
 }
 
+function TranslationProgress() {
+	var sourceText = "", requestId = null, result = null, cancellationRequested = false;
+	this.begin = function (text) {
+		sourceText = String(text || "");
+		requestId = createRequestId();
+		result = null;
+		cancellationRequested = false;
+	};
+	this.run = function () {
+		try {
+			var answer = api.translate(sourceText, requestId);
+			if (answer === false) return cancelTranslation();
+			result = answer;
+			return true;
+		} catch (e) {
+			if (isUserCancellation(e)) return cancelTranslation();
+			throw e;
+		}
+	};
+	function cancelTranslation() {
+		if (!cancellationRequested) {
+			cancellationRequested = true;
+			try { api.cancelTranslation(requestId); } catch (_) { }
+		}
+		return false;
+	}
+	this.cancel = cancelTranslation;
+	this.wasCancelled = function () { return cancellationRequested; };
+	this.getResult = function () { return result; };
+	this.clear = function () {
+		sourceText = ""; requestId = null; result = null; cancellationRequested = false;
+	};
+}
+function runTranslationProgress() { return translationProgress.run(); }
+
 // ---
 // ДВУХЭТАПНЫЙ PROGRESS ГЕНЕРАЦИИ
 // Первый сегмент ждёт подготовки/начала sampling, второй — завершения backend.
@@ -5518,10 +5571,31 @@ function BridgeApi() {
 		return true;
 	};
 	this.ping = function (progress, timeout) { return call("ping", null, timeout || SHORT_TIMEOUT, progress); };
-	this.translate = function (text, progress) {
-        var result = call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress);
-        return result && typeof result == "object" ? result.text : result;
-    };
+	this.translate = function (text, requestId) {
+		var response = requestWithOptions(makeCommand("translate", { text: text || "" }, requestId), {
+			timeout: TRANSLATE_TIMEOUT,
+			title: localize(str.progressTranslate),
+			max: TRANSLATE_EXPECTED_MS,
+			progressCurve: "hyperbolic",
+			uiUpdateInterval: TRANSLATE_UI_UPDATE_INTERVAL,
+			socketPollSleep: TRANSLATE_SOCKET_POLL_SLEEP,
+			cancelOnTimeout: function (id) { try { self.cancelTranslation(id); } catch (_) { } }
+		});
+		if (response === false) return false;
+		if (response && response.type == "error" && response.code == "translation_cancelled") return false;
+		var result = unwrapAnswer(response);
+		return result && typeof result == "object" ? result.text : result;
+	};
+	this.cancelTranslation = function (requestId) {
+		if (!requestId) return;
+		try {
+			return call("cancel_translation", { request_id: requestId }, SHORT_TIMEOUT);
+		} catch (_) {
+			// Cancellation must never trap Photoshop in the progress callback. The
+			// original translation is already detached from the UI at this point.
+			try { fire(makeCommand("cancel_translation", { request_id: requestId })); } catch (_) { }
+		}
+	};
     this.translationSettings = function (preferred) {
         return call("translation_settings", { preferred_server: preferred || "" }, SHORT_TIMEOUT);
     };
@@ -5678,6 +5752,7 @@ function BridgeApi() {
 			delayKey = options.delayKey,
 			expectedRequestId = options.expectedRequestId,
 			interruptOnTimeout = !!options.interruptOnTimeout,
+			cancelOnTimeout = options.cancelOnTimeout,
 			// UI cadence and socket cadence are intentionally independent. Legacy
 			// option names remain accepted for ordinary bridge calls.
 			uiUpdateInterval = Math.max(10, Number(options.uiUpdateInterval || options.pollInterval) || API_POLL_INTERVAL),
@@ -5694,7 +5769,9 @@ function BridgeApi() {
 			t2 = (new Date()).getTime();
 			if (t2 - t1 > timeout) {
 				listener.close();
-				if (interruptOnTimeout && expectedRequestId) {
+				if (typeof cancelOnTimeout == "function" && expectedRequestId) {
+					try { cancelOnTimeout(expectedRequestId); } catch (_) { }
+				} else if (interruptOnTimeout && expectedRequestId) {
 					self.cancelGeneration(expectedRequestId);
 				}
 				throw new Error(str.errApiTimeout);
