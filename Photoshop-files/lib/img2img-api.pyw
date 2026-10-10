@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Локальный API-сервис img2img helper для Photoshop.
 
 Сервис сохраняет существующий backend ComfyUI и добавляет независимый backend
@@ -48,7 +48,7 @@ API_RECEIVE_PORT = 6380   # На этом порту Python принимает �
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
 VERSION = "0.239"
-API_BUILD_ID = "0.239-forge-dtype-sync"
+API_BUILD_ID = "0.239-forge-dtype-sync3"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -6110,6 +6110,74 @@ def _validate_forge_runtime_requirements(
             )
 
 
+def _forge_name_tail(value: Any) -> str:
+    """Normalize a Forge model/module value for tolerant state comparison."""
+    text = _strip_checkpoint_hash(value).replace("\\", "/").strip().lower()
+    return text.rsplit("/", 1)[-1] if text else ""
+
+
+def _forge_target_model_will_refresh(
+    options: Dict[str, Any],
+    values: Dict[str, Any],
+    schema: Dict[str, Any],
+    runtime_catalog: Optional[Dict[str, Any]],
+) -> bool:
+    """Return True when Forge's normal set_config path will refresh model state.
+
+    Current Forge Neo batches checkpoint/modules changes and calls
+    refresh_model_loading_parameters() once after all override settings have been
+    applied.  That refresh also reads forge_unet_storage_dtype, so a separate
+    dtype_change callback would only refresh the *old* active model first and
+    produce a duplicate "Model Selected" transition.
+    """
+    checkpoint_control, modules_control, _ = _forge_option_controls(schema)
+    runtime_catalog = runtime_catalog or {}
+
+    if checkpoint_control is not None:
+        desired_checkpoint = _forge_control_value(
+            checkpoint_control, values, runtime_catalog
+        )
+        current_checkpoint = options.get("sd_model_checkpoint")
+        desired_text = _strip_checkpoint_hash(desired_checkpoint).replace("\\", "/").strip().lower()
+        current_text = _strip_checkpoint_hash(current_checkpoint).replace("\\", "/").strip().lower()
+        if desired_text and desired_text != current_text:
+            # Forge may expose an absolute/relative path in one place and only
+            # the basename in another.  Basename equality is sufficient here:
+            # the generation override itself remains authoritative.
+            if _forge_name_tail(desired_checkpoint) != _forge_name_tail(current_checkpoint):
+                return True
+
+    if modules_control is not None:
+        desired_modules = _forge_control_value(
+            modules_control, values, runtime_catalog
+        )
+        desired_keys = sorted(
+            _forge_name_tail(item)
+            for item in (desired_modules if isinstance(desired_modules, list) else [])
+            if _forge_name_tail(item)
+        )
+        current_raw = options.get("forge_additional_modules")
+        current_keys = sorted(
+            _forge_name_tail(item)
+            for item in (current_raw if isinstance(current_raw, list) else [])
+            if _forge_name_tail(item)
+        )
+        if desired_keys != current_keys:
+            return True
+
+    return False
+
+
+def _forge_mark_dtype_sync(
+    token: Optional[Tuple[Tuple[str, int], Tuple[str, str]]]
+) -> None:
+    if not token:
+        return
+    server_key, requested_state = token
+    with FORGE_DTYPE_SYNC_LOCK:
+        FORGE_DTYPE_SYNC_CACHE[server_key] = requested_state
+
+
 def _forge_sync_unet_storage_dtype(
     client: ForgeClient,
     values: Dict[str, Any],
@@ -6117,20 +6185,27 @@ def _forge_sync_unet_storage_dtype(
     runtime_catalog: Optional[Dict[str, Any]],
     request_id: str,
     timeout: float,
-) -> None:
-    """Apply Diffusion in Low Bits through Forge Neo's real UI callback.
+) -> Optional[Tuple[Tuple[str, int], Tuple[str, str]]]:
+    """Synchronize Forge Neo's Diffusion in Low Bits state when needed.
 
-    ``forge_unet_storage_dtype`` is special in Forge Neo: changing the option value
-    alone is not enough.  ``modules_forge.main_entry.dtype_change()`` also calls
-    ``refresh_model_loading_parameters()``, which updates
-    ``dynamic_args.online_lora``.  A normal A1111 ``override_settings`` request
-    skips that refresh when checkpoint/modules are already unchanged, leaving an
-    int8 LoRA merged into the quantized UNet (``on_the_fly=False``).
+    ``forge_unet_storage_dtype`` is special because changing that option alone
+    does not update ``dynamic_args.online_lora`` when generation overrides run
+    callbacks disabled.
 
-    Gradio exposes the callback as the named ``dtype_change`` API.  Invoke it only
-    when this schema declares the option.  The first use per Forge process is also
-    synchronized even when /options already contains the desired string, repairing
-    state left stale by an older helper version.
+    There are two safe paths:
+
+    * If checkpoint or modules are about to change, current Forge Neo's
+      ``set_config`` batches those changes, applies all overrides (including
+      dtype), and then calls ``refresh_model_loading_parameters()`` once.  In
+      that case we deliberately *defer* synchronization to the generation
+      request.  Calling ``dtype_change`` first would refresh/log the old active
+      model and then refresh/log the requested model a second time.
+    * If checkpoint/modules are already the requested ones, no model refresh is
+      guaranteed.  Then call the same ``dtype_change`` callback used by the
+      Forge UI so ``online_lora`` is updated.
+
+    The returned token is marked as synchronized only after a deferred request
+    completes successfully.
     """
 
     _, _, option_controls = _forge_option_controls(schema)
@@ -6139,12 +6214,12 @@ def _forge_sync_unet_storage_dtype(
         if str(control.get("option_key") or "").strip() == "forge_unet_storage_dtype"
     ), None)
     if dtype_control is None:
-        return
+        return None
 
     runtime_catalog = runtime_catalog or {}
     desired = str(_forge_control_value(dtype_control, values, runtime_catalog) or "").strip()
     if not desired:
-        return
+        return None
 
     deadline = time.monotonic() + max(1.0, float(timeout))
 
@@ -6164,8 +6239,21 @@ def _forge_sync_unet_storage_dtype(
 
     with FORGE_DTYPE_SYNC_LOCK:
         already_synced = FORGE_DTYPE_SYNC_CACHE.get(server_key) == requested_state
+
     if current == desired and already_synced:
-        return
+        return None
+
+    # A checkpoint/modules change already guarantees one refresh *after* all
+    # request overrides are installed. Let that refresh set online_lora too.
+    if _forge_target_model_will_refresh(
+        options, values, schema, runtime_catalog
+    ):
+        LOGGER.debug(
+            "Forge Diffusion in Low Bits synchronization deferred to model switch: %s (preset=%s)",
+            desired,
+            preset or "<current>",
+        )
+        return (server_key, requested_state)
 
     # dtype_change mutates Forge-wide model-loading state, so never run it while
     # another generation owns the backend.
@@ -6208,14 +6296,13 @@ def _forge_sync_unet_storage_dtype(
             [desired, verified_value],
         )
 
-    with FORGE_DTYPE_SYNC_LOCK:
-        FORGE_DTYPE_SYNC_CACHE[server_key] = requested_state
+    _forge_mark_dtype_sync((server_key, requested_state))
     LOGGER.info(
         "Forge Diffusion in Low Bits synchronized through dtype_change: %s (preset=%s)",
         desired,
         preset or "<current>",
     )
-
+    return None
 
 def _apply_forge_options(
     client: ForgeClient,
@@ -7005,7 +7092,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
             raise UserVisibleError("Timed out while waiting for Forge generation.")
         return max(1.0, remaining)
 
-    _forge_sync_unet_storage_dtype(
+    deferred_dtype_sync = _forge_sync_unet_storage_dtype(
         client,
         values,
         schema,
@@ -7203,6 +7290,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     if post_result.get("error") is not None:
         raise post_result["error"]
     result = post_result.get("value")
+    _forge_mark_dtype_sync(deferred_dtype_sync)
     if queue_safe_endpoint and desired_overrides:
         _update_forge_catalog_current_overrides(desired_overrides)
     with GENERATION_SUBMIT_LOCK:

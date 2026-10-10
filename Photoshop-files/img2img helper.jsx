@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.239-forge-dtype-sync",
+	API_BUILD_ID = "0.239-forge-dtype-sync3",
 	// Пользовательские runtime-таймауты имеют те же default/границы в JSX и Python.
 	GENERATION_TIMEOUT_DEFAULT = 20 * 60,
 	GENERATION_TIMEOUT_MIN = 30,
@@ -5368,9 +5368,9 @@ function placeResultHistory() { return generation.placeResultHistory(); }
 function runGenerationProgress() { return generationProgress.run(); }
 function generationStageOne() { return generationProgress.stageOne(); }
 function generationStageTwo() { return generationProgress.stageTwo(); }
-// Внутри документа выделение уменьшается до ближайшей меньшей кратности.
-// У его границ исходные пиксели сохраняются: exportGeometry описывает поле,
-// временный canvas и crop, существующие только во время экспорта изображения.
+// По умолчанию выделение уменьшается до ближайшей меньшей кратности.
+// Схема может выбрать режим pad: тогда исходное выделение сохраняется, а
+// exportGeometry расширяет только временную область экспорта до кратности.
 function fitSelectionBounds(res, multiple) {
 	multiple = clamp(parseInt(multiple, 10) || 1, 1, 256);
 	if (!res.sourceBounds) res.sourceBounds = cloneObj(res.bounds);
