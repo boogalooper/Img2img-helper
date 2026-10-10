@@ -6,7 +6,7 @@
   "label": "Upscaler",
   "ui_family": "upscaler",
   "order": 10010,
-  "size_multiple": 16,
+  "size_multiple": 1,
   "generation": {
     "endpoint": "sdapi/v1/extra-single-image",
     "input_mode": "single_image",
