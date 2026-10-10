@@ -378,6 +378,21 @@
         "cfg": "4"
       },
       "note": "Model family is recognized by filename, but native Forge Neo support should not be assumed."
+    },
+    "qwen21_base": {
+      "family": "Qwen-Image-2.1",
+      "task": "image_generation / image_edit",
+      "forge_support": "native",
+      "settings": {
+        "text_encoder": "qwen3vl_8b: int8_convrot or w4a8",
+        "vae": "qwen_image_2.1_vae",
+        "sampler": "Euler",
+        "scheduler": "Simple",
+        "steps": "32",
+        "cfg": "2.5",
+        "denoise": "1.0 for reference/edit"
+      },
+      "note": "For Viggle Turbo LoRA use the QWEN 2.1 Viggle 6-step preset (Euler / Viggle Turbo / 6 steps / CFG 1). The Viggle Turbo scheduler requires https://github.com/eduardoabreu81/qwen2.1-forge-neo. On an int8 checkpoint use Automatic (fp16 LoRA); the dedicated preset sets this automatically."
     }
   },
   "rules": [
@@ -425,6 +440,17 @@
         ]
       },
       "profile": "joyai_edit"
+    },
+    {
+      "id": "qwen21_base",
+      "match": {
+        "all": [
+          "qwen",
+          "image",
+          "21"
+        ]
+      },
+      "profile": "qwen21_base"
     },
     {
       "id": "qwen_edit_lightning",

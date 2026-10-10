@@ -2,14 +2,14 @@
   "kind": "photoshop-helper-forge-schema",
   "backend": "forge",
   "schema_version": 1,
-  "id": "sd",
-  "label": "SD",
+  "id": "qwen21",
+  "label": "QWEN 2.1",
   "ui_family": "standard",
-  "order": 10,
-  "size_multiple": 16,
+  "order": 51,
+  "size_multiple": 64,
   "capabilities": {
-    "image_stitch": false,
-    "max_image_inputs": 0
+    "image_stitch": true,
+    "max_image_inputs": 3
   },
   "image_stitch_default": false,
   "controls": [
@@ -20,7 +20,8 @@
       "source": "checkpoints",
       "value": "",
       "visible": true,
-      "required_visible": true
+      "required_visible": true,
+      "help": "Qwen-Image-2.1 checkpoint. Forge Neo supports BF16 and int8_convrot."
     },
     {
       "id": "modules",
@@ -29,20 +30,8 @@
       "source": "modules",
       "value": [],
       "visible": true,
-      "required_visible": true
-    },
-    {
-      "id": "low_bits",
-      "label": "Diffusion in Low Bits",
-      "type": "dropdown",
-      "items": [
-        "Automatic",
-        "Automatic (fp16 LoRA)"
-      ],
-      "value": "Automatic",
-      "visible": false,
-      "option_key": "forge_unet_storage_dtype",
-      "help": "Forge model-loading mode. Automatic is the normal default. For a LoRA on a quantized checkpoint, Automatic (fp16 LoRA) can be enabled by making this control visible in preset settings."
+      "required_visible": true,
+      "help": "Select Qwen3VL-8B text encoder and Qwen-Image-2.1 VAE."
     },
     {
       "id": "positive_prompt",
@@ -58,14 +47,15 @@
       "type": "multiline",
       "value": "",
       "visible": true,
-      "payload_key": "negative_prompt"
+      "payload_key": "negative_prompt",
+      "help": "Used when CFG is above 1. At CFG 1 Forge skips the negative prompt."
     },
     {
       "id": "sampler",
       "label": "Sampling method",
       "type": "dropdown",
       "source": "samplers",
-      "value": "Euler a",
+      "value": "Euler",
       "visible": true,
       "payload_key": "sampler_name"
     },
@@ -74,7 +64,7 @@
       "label": "Schedule type",
       "type": "dropdown",
       "source": "schedulers",
-      "value": "Automatic",
+      "value": "Simple",
       "visible": true,
       "payload_key": "scheduler"
     },
@@ -93,7 +83,7 @@
       "id": "cfg",
       "label": "CFG Scale",
       "type": "float",
-      "value": 6.0,
+      "value": 2.5,
       "min": 0,
       "max": 24,
       "step": 0.5,
@@ -104,12 +94,26 @@
       "id": "denoise",
       "label": "Denoising strength",
       "type": "float",
-      "value": 0.35,
+      "value": 1.0,
       "min": 0,
       "max": 1,
       "step": 0.01,
       "visible": true,
-      "payload_key": "denoising_strength"
+      "payload_key": "denoising_strength",
+      "help": "Use 1.0 for Qwen-Image-2.1 reference/edit mode. Forge Neo switches regular img2img/reference mode in Settings > Stable Diffusion."
+    },
+    {
+      "id": "low_bits",
+      "label": "Diffusion in Low Bits",
+      "type": "dropdown",
+      "items": [
+        "Automatic",
+        "Automatic (fp16 LoRA)"
+      ],
+      "value": "Automatic",
+      "visible": false,
+      "option_key": "forge_unet_storage_dtype",
+      "help": "Managed by this preset. Automatic is used by the base preset; the Viggle LoRA preset uses Automatic (fp16 LoRA) for quantized checkpoints."
     },
     {
       "id": "seed",
@@ -124,7 +128,7 @@
     }
   ],
   "image_stitch": {
-    "visible": false
+    "visible": true
   },
-  "forge_preset": "sd"
+  "forge_preset": "qwen21"
 }

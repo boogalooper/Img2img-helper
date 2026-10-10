@@ -2,11 +2,11 @@
   "kind": "photoshop-helper-forge-schema",
   "backend": "forge",
   "schema_version": 1,
-  "id": "flux",
-  "label": "FLUX",
-  "ui_family": "flux",
-  "order": 30,
-  "size_multiple": 16,
+  "id": "qwen21",
+  "label": "QWEN 2.1 · Viggle 6-step",
+  "ui_family": "standard",
+  "order": 52,
+  "size_multiple": 64,
   "capabilities": {
     "image_stitch": true,
     "max_image_inputs": 3
@@ -20,7 +20,8 @@
       "source": "checkpoints",
       "value": "",
       "visible": true,
-      "required_visible": true
+      "required_visible": true,
+      "help": "Qwen-Image-2.1 checkpoint. Forge Neo supports BF16 and int8_convrot."
     },
     {
       "id": "modules",
@@ -29,20 +30,8 @@
       "source": "modules",
       "value": [],
       "visible": true,
-      "required_visible": true
-    },
-    {
-      "id": "low_bits",
-      "label": "Diffusion in Low Bits",
-      "type": "dropdown",
-      "items": [
-        "Automatic",
-        "Automatic (fp16 LoRA)"
-      ],
-      "value": "Automatic",
-      "visible": false,
-      "option_key": "forge_unet_storage_dtype",
-      "help": "Forge model-loading mode. Automatic is the normal default. For a LoRA on a quantized checkpoint, Automatic (fp16 LoRA) can be enabled by making this control visible in preset settings."
+      "required_visible": true,
+      "help": "Select Qwen3VL-8B text encoder and Qwen-Image-2.1 VAE."
     },
     {
       "id": "positive_prompt",
@@ -58,7 +47,8 @@
       "type": "multiline",
       "value": "",
       "visible": true,
-      "payload_key": "negative_prompt"
+      "payload_key": "negative_prompt",
+      "help": "Used when CFG is above 1. At CFG 1 Forge skips the negative prompt."
     },
     {
       "id": "sampler",
@@ -74,20 +64,22 @@
       "label": "Schedule type",
       "type": "dropdown",
       "source": "schedulers",
-      "value": "Beta",
+      "value": "Viggle Turbo",
       "visible": true,
-      "payload_key": "scheduler"
+      "payload_key": "scheduler",
+      "help": "Requires the qwen2.1-forge-neo extension; native Forge Neo does not provide the Viggle Turbo schedule."
     },
     {
       "id": "steps",
       "label": "Sampling steps",
       "type": "integer",
-      "value": 20,
+      "value": 6,
       "min": 1,
       "max": 100,
       "step": 1,
       "visible": true,
-      "payload_key": "steps"
+      "payload_key": "steps",
+      "help": "Viggle v0.3 is distilled for 6 steps; 6 is the recommended fast setting."
     },
     {
       "id": "cfg",
@@ -98,18 +90,33 @@
       "max": 24,
       "step": 0.5,
       "visible": true,
-      "payload_key": "cfg_scale"
+      "payload_key": "cfg_scale",
+      "help": "Use CFG 1 with Viggle Turbo."
     },
     {
       "id": "denoise",
       "label": "Denoising strength",
       "type": "float",
-      "value": 0.35,
+      "value": 1.0,
       "min": 0,
       "max": 1,
       "step": 0.01,
       "visible": true,
-      "payload_key": "denoising_strength"
+      "payload_key": "denoising_strength",
+      "help": "Use 1.0 for Qwen-Image-2.1 reference/edit mode. Forge Neo switches regular img2img/reference mode in Settings > Stable Diffusion."
+    },
+    {
+      "id": "low_bits",
+      "label": "Diffusion in Low Bits",
+      "type": "dropdown",
+      "items": [
+        "Automatic",
+        "Automatic (fp16 LoRA)"
+      ],
+      "value": "Automatic (fp16 LoRA)",
+      "visible": false,
+      "option_key": "forge_unet_storage_dtype",
+      "help": "Managed by this preset. Automatic is used by the base preset; the Viggle LoRA preset uses Automatic (fp16 LoRA) for quantized checkpoints."
     },
     {
       "id": "seed",
@@ -121,21 +128,25 @@
       "step": 1,
       "visible": false,
       "payload_key": "seed"
-    },
-    {
-      "id": "distilled_cfg_scale",
-      "label": "Distilled CFG Scale",
-      "type": "float",
-      "value": 3.0,
-      "min": 1,
-      "max": 24,
-      "step": 0.5,
-      "visible": true,
-      "payload_key": "distilled_cfg_scale"
     }
   ],
   "image_stitch": {
     "visible": true
   },
-  "forge_preset": "flux"
+  "loras": [
+    {
+      "name": "Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r256",
+      "weight": 1.0
+    }
+  ],
+  "forge_preset": "qwen21",
+  "requirements": {
+    "schedulers": [
+      "Viggle Turbo"
+    ]
+  },
+  "generation": {
+    "require_lora": true,
+    "require_lora_error": "QWEN 2.1 Viggle 6-step requires a Viggle Turbo LoRA. Install/select the LoRA or use the regular QWEN 2.1 preset."
+  }
 }

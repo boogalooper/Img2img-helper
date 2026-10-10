@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Локальный API-сервис img2img helper для Photoshop.
 
 Сервис сохраняет существующий backend ComfyUI и добавляет независимый backend
@@ -47,8 +47,8 @@ DEFAULT_COMFY_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6380   # На этом порту Python принимает команды JSX.
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
-VERSION = "0.237"
-API_BUILD_ID = "0.237-translation-system-progress"
+VERSION = "0.239"
+API_BUILD_ID = "0.239-forge-dtype-sync"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -5593,6 +5593,13 @@ FORGE_CATALOG_CACHE_LOCK = threading.RLock()
 FORGE_TASK_PROGRESS_CAPABILITIES: Dict[Tuple[str, int], bool] = {}
 FORGE_TASK_PROGRESS_CAPABILITIES_LOCK = threading.Lock()
 
+# Forge Neo does not refresh dynamic_args.online_lora when forge_unet_storage_dtype
+# is changed only through /sdapi/v1/options or request override_settings.  The GUI
+# dtype_change callback does.  Cache successful callback synchronizations so the
+# helper pays the model-refresh cost only when the requested mode actually changes.
+FORGE_DTYPE_SYNC_CACHE: Dict[Tuple[str, int], Tuple[str, str]] = {}
+FORGE_DTYPE_SYNC_LOCK = threading.RLock()
+
 
 def clear_forge_task_progress_capabilities(
     endpoint: Optional[Tuple[str, int]] = None,
@@ -5612,6 +5619,8 @@ def clear_forge_catalog_cache() -> None:
     with FORGE_CATALOG_CACHE_LOCK:
         FORGE_CATALOG_CACHE.clear()
         FORGE_CATALOG_CACHE_SERVER = None
+    with FORGE_DTYPE_SYNC_LOCK:
+        FORGE_DTYPE_SYNC_CACHE.clear()
 
 
 def _forge_catalog_server_key() -> Tuple[str, int]:
@@ -6032,6 +6041,180 @@ def _forge_option_controls(
         if str(control.get("option_key") or "").strip():
             option_controls.append(control)
     return checkpoint_control, modules_control, option_controls
+
+
+
+def _validate_forge_runtime_requirements(
+    schema: Dict[str, Any],
+    runtime_catalog: Optional[Dict[str, Any]],
+    selected_loras: Optional[Sequence[Any]] = None,
+) -> None:
+    """Validate optional Forge capabilities required by a schema.
+
+    This is intentionally small and data-driven.  A preset such as Qwen 2.1
+    Viggle must not silently fall back to another scheduler when its extension
+    is missing.  Ordinary schemas do not need a ``requirements`` section.
+    """
+
+    requirements = (
+        schema.get("requirements")
+        if isinstance(schema.get("requirements"), dict)
+        else {}
+    )
+    runtime_catalog = runtime_catalog or {}
+
+    for source, required_values in requirements.items():
+        source = str(source or "").strip()
+        if source not in FORGE_CATALOG_SOURCES:
+            continue
+        if not isinstance(required_values, list):
+            continue
+
+        available_raw = runtime_catalog.get(source)
+        available = _forge_control_choices(
+            {"source": source, "items": available_raw if isinstance(available_raw, list) else []},
+            runtime_catalog,
+        )
+        available_keys = {str(value).strip().lower() for value in available if str(value).strip()}
+
+        for required in required_values:
+            required_text = str(required or "").strip()
+            if not required_text:
+                continue
+            if required_text.lower() not in available_keys:
+                raise UserVisibleError(
+                    f"Required Forge {source.rstrip('s')} is unavailable: {required_text}.",
+                    "forge_schema_runtime_requirement_missing",
+                    [source, required_text],
+                )
+
+    generation = (
+        schema.get("generation")
+        if isinstance(schema.get("generation"), dict)
+        else {}
+    )
+    if _forge_bool(generation.get("require_lora")):
+        normalized = _normalize_forge_loras(
+            selected_loras or [],
+            runtime_catalog.get("loras")
+            if isinstance(runtime_catalog.get("loras"), list)
+            else None,
+        )
+        if not normalized:
+            raise UserVisibleError(
+                str(
+                    generation.get("require_lora_error")
+                    or "This Forge preset requires a LoRA."
+                ),
+                "forge_lora_required",
+            )
+
+
+def _forge_sync_unet_storage_dtype(
+    client: ForgeClient,
+    values: Dict[str, Any],
+    schema: Dict[str, Any],
+    runtime_catalog: Optional[Dict[str, Any]],
+    request_id: str,
+    timeout: float,
+) -> None:
+    """Apply Diffusion in Low Bits through Forge Neo's real UI callback.
+
+    ``forge_unet_storage_dtype`` is special in Forge Neo: changing the option value
+    alone is not enough.  ``modules_forge.main_entry.dtype_change()`` also calls
+    ``refresh_model_loading_parameters()``, which updates
+    ``dynamic_args.online_lora``.  A normal A1111 ``override_settings`` request
+    skips that refresh when checkpoint/modules are already unchanged, leaving an
+    int8 LoRA merged into the quantized UNet (``on_the_fly=False``).
+
+    Gradio exposes the callback as the named ``dtype_change`` API.  Invoke it only
+    when this schema declares the option.  The first use per Forge process is also
+    synchronized even when /options already contains the desired string, repairing
+    state left stale by an older helper version.
+    """
+
+    _, _, option_controls = _forge_option_controls(schema)
+    dtype_control = next((
+        control for control in option_controls
+        if str(control.get("option_key") or "").strip() == "forge_unet_storage_dtype"
+    ), None)
+    if dtype_control is None:
+        return
+
+    runtime_catalog = runtime_catalog or {}
+    desired = str(_forge_control_value(dtype_control, values, runtime_catalog) or "").strip()
+    if not desired:
+        return
+
+    deadline = time.monotonic() + max(1.0, float(timeout))
+
+    def remaining(cap: float) -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise UserVisibleError("Timed out while applying Forge Diffusion in Low Bits.")
+        return min(float(cap), max(1.0, left))
+
+    options = client.get_json("sdapi/v1/options", timeout=remaining(30))
+    if not isinstance(options, dict):
+        options = {}
+    preset = str(schema.get("forge_preset") or options.get("forge_preset") or "").strip()
+    server_key = (normalize_comfy_host(client.host).lower(), int(client.port))
+    requested_state = (desired, preset)
+    current = str(options.get("forge_unet_storage_dtype") or "").strip()
+
+    with FORGE_DTYPE_SYNC_LOCK:
+        already_synced = FORGE_DTYPE_SYNC_CACHE.get(server_key) == requested_state
+    if current == desired and already_synced:
+        return
+
+    # dtype_change mutates Forge-wide model-loading state, so never run it while
+    # another generation owns the backend.
+    _wait_forge_idle_for_global_options(
+        client,
+        request_id,
+        remaining(FORGE_OPTIONS_TIMEOUT_SECONDS),
+    )
+
+    payload = {"data": [desired, preset]}
+    errors: List[str] = []
+    applied = False
+    # Gradio 4 exposes named callbacks through /api/<api_name>; /run is retained
+    # as a compatibility alias by older 4.x builds.
+    for path in ("api/dtype_change", "run/dtype_change"):
+        try:
+            client.post_json(path, payload, timeout=remaining(60))
+            applied = True
+            break
+        except BackendHTTPError as exc:
+            errors.append(f"{path}: HTTP {exc.status_code}")
+        except UserVisibleError as exc:
+            errors.append(f"{path}: {exc}")
+
+    if not applied:
+        detail = "; ".join(errors)
+        raise UserVisibleError(
+            "Forge Neo could not apply Diffusion in Low Bits through its dtype_change callback. "
+            "Set it manually in Forge or update Forge Neo."
+            + (f" ({detail})" if detail else ""),
+            "forge_dtype_callback_unavailable",
+        )
+
+    verified = client.get_json("sdapi/v1/options", timeout=remaining(30))
+    verified_value = str(verified.get("forge_unet_storage_dtype") or "").strip() if isinstance(verified, dict) else ""
+    if verified_value != desired:
+        raise UserVisibleError(
+            f"Forge Neo did not keep Diffusion in Low Bits = {desired!r} after dtype_change.",
+            "forge_dtype_apply_failed",
+            [desired, verified_value],
+        )
+
+    with FORGE_DTYPE_SYNC_LOCK:
+        FORGE_DTYPE_SYNC_CACHE[server_key] = requested_state
+    LOGGER.info(
+        "Forge Diffusion in Low Bits synchronized through dtype_change: %s (preset=%s)",
+        desired,
+        preset or "<current>",
+    )
 
 
 def _apply_forge_options(
@@ -6768,6 +6951,11 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     runtime_catalog = _forge_runtime_control_catalog(
         schema, ["loras"] if selected_loras else None
     )
+    _validate_forge_runtime_requirements(
+        schema,
+        runtime_catalog,
+        selected_loras,
+    )
 
     generation = schema.get("generation") if isinstance(schema.get("generation"), dict) else {}
     endpoint = str(generation.get("endpoint") or "sdapi/v1/img2img").lstrip("/")
@@ -6816,6 +7004,16 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
         if remaining <= 0:
             raise UserVisibleError("Timed out while waiting for Forge generation.")
         return max(1.0, remaining)
+
+    _forge_sync_unet_storage_dtype(
+        client,
+        values,
+        schema,
+        runtime_catalog,
+        request_id,
+        generation_remaining(),
+    )
+    raise_if_generation_cancelled(request_id)
 
     job = GENERATION.job
     queue_safe_endpoint = _forge_uses_native_generation_queue(endpoint)

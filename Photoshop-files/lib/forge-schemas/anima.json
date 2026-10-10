@@ -32,6 +32,19 @@
       "required_visible": true
     },
     {
+      "id": "low_bits",
+      "label": "Diffusion in Low Bits",
+      "type": "dropdown",
+      "items": [
+        "Automatic",
+        "Automatic (fp16 LoRA)"
+      ],
+      "value": "Automatic",
+      "visible": false,
+      "option_key": "forge_unet_storage_dtype",
+      "help": "Forge model-loading mode. Automatic is the normal default. For a LoRA on a quantized checkpoint, Automatic (fp16 LoRA) can be enabled by making this control visible in preset settings."
+    },
+    {
       "id": "positive_prompt",
       "label": "Prompt",
       "type": "multiline",
@@ -123,5 +136,6 @@
   ],
   "image_stitch": {
     "visible": false
-  }
+  },
+  "forge_preset": "anima"
 }

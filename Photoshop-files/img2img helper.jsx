@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.258",
+	VER = "0.259",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.237-translation-system-progress",
+	API_BUILD_ID = "0.239-forge-dtype-sync",
 	// Пользовательские runtime-таймауты имеют те же default/границы в JSX и Python.
 	GENERATION_TIMEOUT_DEFAULT = 20 * 60,
 	GENERATION_TIMEOUT_MIN = 30,
