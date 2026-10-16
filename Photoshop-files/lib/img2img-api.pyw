@@ -48,7 +48,7 @@ API_RECEIVE_PORT = 6380   # На этом порту Python принимает �
 API_REPLY_PORT = 6381     # На этот порт Python отправляет ответы JSX.
 API_PROTOCOL = 3
 VERSION = "0.239"
-API_BUILD_ID = "0.239-forge-dtype-sync3"
+API_BUILD_ID = "0.261-background-release-check"
 
 # Общая идентичность приложения и служебных путей.
 APP = {
@@ -9658,12 +9658,183 @@ def _unchecked_backend_status() -> Dict[str, Any]:
     return status
 
 
+# ============================================================================
+# ПРОВЕРКА РЕЛИЗОВ: ТОЛЬКО ЛОКАЛЬНЫЕ ФАЙЛЫ APP_DIR / updates
+# Сетевой запрос выполняет отдельный worker; команды JSX читают только кэш.
+# ============================================================================
+RELEASE_REPOSITORY = "boogalooper/Img2img-helper"
+UPDATE_CHECK_INTERVAL = 24 * 60 * 60
+UPDATE_IDLE_SECONDS = 15
+UPDATE_MAX_RESPONSE = 1024 * 1024
+
+
+def release_version(value: Any) -> Optional[Tuple[int, ...]]:
+    match = re.fullmatch(r"[vV]?(\d+(?:\.\d+)*)", str(value or ""))
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+class ReleaseUpdates:
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.lock = threading.Lock()
+        self.allowed = False  # Каждый новый процесс ждёт обычного запуска JSX.
+        self.active_requests = 0
+        self.last_completed = time.monotonic()
+        self.last_attempt = 0.0
+        self.started = False
+
+    def _read(self, name: str) -> Dict[str, Any]:
+        path = self.directory / name
+        if not path.exists():
+            return {}
+        if path.stat().st_size > UPDATE_MAX_RESPONSE:
+            raise ValueError("Update state is too large")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid update state")
+        return data
+
+    def _write(self, name: str, data: Dict[str, Any]) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(self.directory / name, data, "update state")
+
+    def _enabled(self) -> bool:
+        try:
+            return self._read("settings.json").get("enabled", True) is True
+        except (OSError, ValueError, TypeError):
+            # Повреждённые настройки не должны самовольно включать сеть.
+            return False
+
+    def configure_launch(self, allowed: bool) -> None:
+        with self.lock:
+            self.allowed = allowed is True
+
+    def request_started(self) -> None:
+        with self.lock:
+            self.active_requests += 1
+
+    def request_finished(self) -> None:
+        with self.lock:
+            self.active_requests = max(0, self.active_requests - 1)
+            self.last_completed = time.monotonic()
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            result: Dict[str, Any] = {"enabled": self._enabled(), "release": {}, "seen_version": ""}
+            try:
+                result["release"] = self._read("release.json")
+                result["seen_version"] = str(self._read("seen.json").get("version") or "")
+            except (OSError, ValueError, TypeError):
+                pass
+            return result
+
+    def set_enabled(self, enabled: bool) -> Dict[str, Any]:
+        if not isinstance(enabled, bool):
+            raise UserVisibleError("Update setting must be a boolean.")
+        with self.lock:
+            self._write("settings.json", {"enabled": enabled})
+        return self.snapshot()
+
+    def acknowledge(self, version: str) -> Dict[str, Any]:
+        with self.lock:
+            # Не помечаем более новый релиз, который мог прийти во время диалога.
+            if release_version(version) is not None:
+                self._write("seen.json", {"version": version})
+        return {"acknowledged": True}
+
+    def _idle(self) -> bool:
+        with self.lock:
+            ready = (self.allowed and not self.active_requests
+                     and time.monotonic() - self.last_completed >= UPDATE_IDLE_SECONDS)
+        with LAST_ACTIVITY_LOCK:
+            idle_for = time.monotonic() - LAST_ACTIVITY
+        return bool(
+            ready and idle_for >= UPDATE_IDLE_SECONDS and self._enabled()
+            and not GENERATION.active and not GENERATION.queued
+            and GENERATION_QUEUE.empty() and not forge_post_in_progress()
+            and not OPTIONAL_MODULES_ACTIVE.is_set()
+            and not any(not job.confirmed for job in list(PENDING_CANCELLATIONS.values()))
+        )
+
+    def check_once(self) -> None:
+        if not self._idle():
+            return
+        now = time.time()
+        with self.lock:
+            if (not self.allowed or self.active_requests or not self._enabled()
+                    or time.monotonic() - self.last_completed < UPDATE_IDLE_SECONDS):
+                return
+            try:
+                checked = self._read("checked.json")
+                attempted = float(checked.get("attempted_at") or 0)
+            except (OSError, ValueError, TypeError):
+                attempted = 0.0
+            attempted = max(attempted, self.last_attempt)
+            if 0 <= now - attempted < UPDATE_CHECK_INTERVAL:
+                return
+            # Даже неудачные запросы ограничены по частоте, в том числе после рестарта.
+            self.last_attempt = now
+            self._write("checked.json", {"attempted_at": now, "status": "checking"})
+        try:
+            request = urllib.request.Request(
+                f"https://api.github.com/repos/{RELEASE_REPOSITORY}/releases/latest",
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "img2img-helper-update-check"},
+            )
+            with urllib.request.urlopen(request, timeout=8) as response:
+                payload = response.read(UPDATE_MAX_RESPONSE + 1)
+            if len(payload) > UPDATE_MAX_RESPONSE:
+                raise ValueError("Release response is too large")
+            data = json.loads(payload.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Invalid release response")
+            version = str(data.get("tag_name") or "")
+            if data.get("draft") or data.get("prerelease") or release_version(version) is None:
+                raise ValueError("Not a stable numeric release")
+            release = {
+                "version": version,
+                "name": str(data.get("name") or version)[:300],
+                "notes": str(data.get("body") or "")[:30000],
+                "url": f"https://github.com/{RELEASE_REPOSITORY}/releases/tag/" + urllib.parse.quote(version, safe=""),
+                "checked_at": now,
+            }
+            with self.lock:
+                # Выключение проверки во время запроса имеет приоритет.
+                if self.allowed and self._enabled():
+                    self._write("release.json", release)
+                self._write("checked.json", {"attempted_at": now, "status": "ok"})
+        except Exception as exc:
+            with self.lock:
+                self._write("checked.json", {"attempted_at": now, "status": "error", "error": str(exc)[:1000]})
+            LOGGER.info("Background release check failed: %s", exc)
+
+    def watch(self) -> None:
+        while not WORKER_STOP.wait(1.0):
+            try:
+                self.check_once()
+            except Exception as exc:
+                # Проверка обновлений никогда не ломает API и генерацию.
+                LOGGER.info("Background release checker: %s", exc)
+
+    def start(self) -> None:
+        with self.lock:
+            if self.started:
+                return
+            self.started = True
+        threading.Thread(target=self.watch, name="ReleaseUpdates", daemon=True).start()
+
+
+UPDATES = ReleaseUpdates(APP_DIR / "updates")
+
+
 def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
     with RUNTIME_LOCK:
         return _apply_handshake_locked(message)
 
 
 def _apply_handshake_locked(message: Dict[str, Any]) -> Dict[str, Any]:
+    UPDATES.configure_launch(message.get("allowUpdateChecks") is True)
     previous_endpoints = _backend_endpoints(
         RUNTIME.backend_host, RUNTIME.comfy_port, RUNTIME.forge_port
     )
@@ -9746,6 +9917,7 @@ def _apply_handshake_locked(message: Dict[str, Any]) -> Dict[str, Any]:
         "comfy_input_folder": str(RUNTIME.comfy_input_folder or ""),
         "mode": status.get("mode", "none"),
         "backends": status.get("backends", {}),
+        "updates": UPDATES.snapshot(),
     }
 
 
@@ -9809,6 +9981,15 @@ def handle_command(command: Dict[str, Any]) -> None:
 
         if command_type == "handshake":
             answer(apply_handshake(message), request_id)
+            return
+
+        if command_type == "update_settings":
+            result = UPDATES.set_enabled(message["enabled"]) if "enabled" in message else UPDATES.snapshot()
+            answer(result, request_id)
+            return
+
+        if command_type == "update_seen":
+            answer(UPDATES.acknowledge(str(message.get("version") or "")), request_id)
             return
 
         REQUEST_CONTEXT.runtime = runtime_snapshot()
@@ -10050,6 +10231,7 @@ def receive_json_message(client_socket: socket.socket) -> Dict[str, Any]:
 
 
 def handle_client(client_socket: socket.socket) -> None:
+    update_request_started = False
     try:
         command = receive_json_message(client_socket)
         # JSX проверяет, открыт ли порт, коротким TCP connect/disconnect без
@@ -10057,6 +10239,8 @@ def handle_client(client_socket: socket.socket) -> None:
         # accept(). На пустое соединение нельзя отправлять ответ: listener JSX
         # ещё не открыт, и поток зря потратит время на повторные подключения.
         if command:
+            UPDATES.request_started()
+            update_request_started = True
             handle_command(command)
     except UserVisibleError as exc:
         error_answer(exc)
@@ -10064,6 +10248,8 @@ def handle_client(client_socket: socket.socket) -> None:
         log_exception("TCP client handling error")
         error_answer("Photoshop local connection to Python failed.")
     finally:
+        if update_request_started:
+            UPDATES.request_finished()
         try:
             client_socket.close()
         except OSError:
@@ -10205,6 +10391,7 @@ def initialize_server_runtime() -> None:
         return
     write_startup_status("ready", "Python API is ready")
     start_backend_monitor()
+    UPDATES.start()
     optional_modules_thread = threading.Thread(
         target=prepare_optional_modules,
         name="OptionalModules",

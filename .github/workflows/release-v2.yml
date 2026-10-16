@@ -68,6 +68,7 @@ jobs:
           cp "install_runtime.bat" "${PACKAGE_DIR}/"
           cp -R "Photoshop-files" "${PACKAGE_DIR}/"
           cp "README.md" "${PACKAGE_DIR}/"
+          cp -R "assets" "${PACKAGE_DIR}/"
 
           cp "LICENSE" "${PACKAGE_DIR}/"
           cp -R "advanced" "${PACKAGE_DIR}/"

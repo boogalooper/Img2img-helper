@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.260",
+	VER = "0.261",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -40,7 +40,7 @@ var APP = {
 	API_PORT_SEND = 6380,
 	API_PORT_LISTEN = 6381,
 	API_PROTOCOL = 3,
-	API_BUILD_ID = "0.239-forge-dtype-sync3",
+	API_BUILD_ID = "0.261-background-release-check",
 	// Пользовательские runtime-таймауты имеют те же default/границы в JSX и Python.
 	GENERATION_TIMEOUT_DEFAULT = 20 * 60,
 	GENERATION_TIMEOUT_MIN = 30,
@@ -110,6 +110,7 @@ var APP = {
 	backend = new BackendRuntime(),
 	ui = new UI(),
 	messages = new MessageCenter(),
+	releaseUpdates = new ReleaseUpdateRuntime(),
 	generationTimings = new Delay(),
 	str = new Locale(),
 	apl = new AM("application"),
@@ -346,6 +347,8 @@ function init() {
 		if (startupProgress) {
 			startupProgress.complete(); startupProgress.close(); startupProgress = null;
 		}
+		// Только локальный снимок из handshake; сетевой проверки здесь нет.
+		try { releaseUpdates.notify(); } catch (_) { }
 		// Файл и тихий Action завершаются здесь: до mainDialog и UI-retry.
 		if (isStrictPlayback()) {
 			if (!initial.schema || !initial.schema.valid) throw new Error(initialActionErrorText(initial));
@@ -1978,6 +1981,9 @@ function showGlobalSettings(connectionRecovery) {
 		timeout = pythonRows.timeout.control,
 		pythonIdleTimeout = pythonRows.idleTimeout.control,
 		backendMonitorInterval = pythonRows.monitorInterval.control;
+	var checkUpdates = connection.add("checkbox", undefined, str.checkUpdates);
+	checkUpdates.value = releaseUpdates.enabled();
+	checkUpdates.helpTip = str.checkUpdatesHelp;
     var translatorRow = connection.add("group{orientation:'row',alignChildren:['left','center']}");
     translatorRow.add("statictext", undefined, str.preferredTranslator);
     var translator = translatorRow.add("dropdownlist"), translatorOriginal = "";
@@ -2210,6 +2216,10 @@ function showGlobalSettings(connectionRecovery) {
             try { api.translationSettings(translator.selection.serverId); }
             catch (translatorError) { messages.error(translatorError); return; }
         }
+		if (checkUpdates.value !== releaseUpdates.enabled()) {
+			try { releaseUpdates.setEnabled(checkUpdates.value); }
+			catch (updateError) { messages.error(updateError); return; }
+		}
 		cfg.data = temp; cfg.bindProperties(); accepted = true; w.close(1);
 	});
 	ui.showDialog(w);
@@ -3010,6 +3020,7 @@ function BackendRuntime() {
 	}
 	function applyStatus(response) {
 		if (!response || typeof response != "object") return;
+		if (response.updates) releaseUpdates.setStatus(response.updates);
 		if (response.hasOwnProperty("comfy_input_folder"))
 			localComfyInputFolder = String(response.comfy_input_folder || "");
 		var source = response.backends ? response : { mode: "none", backends: {} };
@@ -3564,6 +3575,62 @@ function BackendRuntime() {
 // Ошибки, предупреждения, информация, подтверждения и ввод текста используют
 // только кастомные ScriptUI-окна. Звук Photoshop подаётся только для ошибок.
 // ---
+// РЕЛИЗЫ: JSX показывает только готовый локальный кэш из Python.
+// Настройка не входит в DESC/Action; все файлы принадлежат APP_DIR/updates.
+function ReleaseUpdateRuntime() {
+	var status = { enabled: true, release: {}, seen_version: "" };
+	function versionParts(value) {
+		value = String(value || "");
+		if (!/^v?\d+(?:\.\d+)*$/i.test(value)) return null;
+		return value.replace(/^v/i, "").split(".");
+	}
+	function compareVersions(left, right) {
+		var a = versionParts(left), b = versionParts(right);
+		if (!a || !b) return null;
+		for (var i = 0; i < Math.max(a.length, b.length); i++) {
+			var x = Number(a[i] || 0), y = Number(b[i] || 0);
+			if (x != y) return x > y ? 1 : -1;
+		}
+		return 0;
+	}
+	this.setStatus = function (value) { if (value && typeof value == "object") status = value; };
+	this.enabled = function () { return status.enabled === true; };
+	this.setEnabled = function (value) { this.setStatus(api.updateSettings(!!value)); };
+	function openRelease(version) {
+		var local = $.getenv("LOCALAPPDATA");
+		if (!local) throw new Error(str.errUpdateOpen);
+		// InternetShortcut открывается штатным браузером Windows без shell-команд.
+		// URL строится из фиксированного репозитория и проверенного номера версии.
+		var link = new File(local + "/JazzyScripts/" + APP.tempFolder + "/updates/release.url");
+		link.encoding = "UTF8";
+		if (!link.open("w")) throw new Error(str.errUpdateOpen);
+		try {
+			if (link.write("[InternetShortcut]\r\nURL=https://github.com/boogalooper/Img2img-helper/releases/tag/" + encodeURIComponent(version) + "\r\n") === false)
+				throw new Error(str.errUpdateOpen);
+		} finally { link.close(); }
+		if (!link.execute()) throw new Error(str.errUpdateOpen);
+	}
+	this.notify = function () {
+		if (actionPlaybackMode || filePlaybackMode || !this.enabled()) return;
+		var release = status.release || {}, version = String(release.version || ""),
+			comparison = compareVersions(version, VER), seen = compareVersions(version, status.seen_version);
+		if (comparison !== 1 || seen !== null && seen <= 0) return;
+		var result = messages.show({
+			title: APP.name,
+			heading: str.updateAvailable,
+			information: [String(str.updateVersions).replace("%1", VER).replace("%2", version) +
+				"\n\n" + String(release.notes || str.updateNoNotes)],
+			openRelease: true, dismissText: str.updateLater
+		});
+		// И закрытие окна, и открытие релиза подавляют повтор этого номера версии.
+		status.seen_version = version;
+		try { api.acknowledgeUpdate(version); } catch (_) { }
+		if (result == "openRelease") {
+			try { openRelease(version); } catch (e) { messages.error(e); }
+		}
+	};
+}
+
 function MessageCenter() {
 	function stripAppHeader(text) {
 		var normalized = String(text || "").replace(/\r\n?/g, "\n"),
@@ -3598,11 +3665,15 @@ function MessageCenter() {
 		if (warnings.length) sections.push(str.diagnosticsWarnings + "\n• " + warnings.join("\n• "));
 		if (information.length) sections.push(str.diagnosticsInformation + ":\n• " + information.join("\n• "));
 		var dialog = ui.createDialog({ title: options.title || APP.name, spacing: 10, margins: 15 }),
-			heading = dialog.add("statictext", undefined, errors.length ? str.diagnosticsNeedAttention : str.diagnosticsInformation),
+			heading = dialog.add("statictext", undefined, options.heading || (errors.length ? str.diagnosticsNeedAttention : str.diagnosticsInformation)),
 			details = dialog.add("edittext", undefined, sections.join("\n\n"), { multiline: true, scrollable: true, readonly: true }),
 			buttons = dialog.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,5,0,0]}");
 		var result = true;
-		buttons.add("button", undefined, str.dialogOk, { name: "ok" });
+		buttons.add("button", undefined, options.dismissText || str.dialogOk, { name: "ok" });
+		if (options.openRelease === true) {
+			var releaseButton = buttons.add("button", undefined, str.updateOpenPage);
+			releaseButton.onClick = function () { result = "openRelease"; dialog.close(1); };
+		}
 		if (errors.length && options.allowSettings === true) {
 			var settingsButton = buttons.add("button", undefined, str.openSettings);
 			settingsButton.onClick = function () { result = "openSettings"; dialog.close(1); };
@@ -5605,6 +5676,12 @@ function BridgeApi() {
 			try { fire(makeCommand("cancel_translation", { request_id: requestId })); } catch (_) { }
 		}
 	};
+	this.updateSettings = function (enabled) {
+		return call("update_settings", enabled === undefined ? {} : { enabled: enabled }, SHORT_TIMEOUT);
+	};
+	this.acknowledgeUpdate = function (version) {
+		return call("update_seen", { version: version }, SHORT_TIMEOUT);
+	};
     this.translationSettings = function (preferred) {
         return call("translation_settings", { preferred_server: preferred || "" }, SHORT_TIMEOUT);
     };
@@ -5618,6 +5695,7 @@ function BridgeApi() {
 			generationTimeout: source.generationTimeout,
 			pythonIdleTimeout: source.pythonIdleTimeout,
 			backendMonitorInterval: source.backendMonitorInterval,
+			allowUpdateChecks: !actionPlaybackMode && !filePlaybackMode,
 			backendStatusMode: backendStatusMode || "cached",
 			verifyBackend: verifyBackend || "",
 			backendProbeToken: backendProbeToken || ""
@@ -6986,6 +7064,14 @@ function Locale() {
 		selectionMissingFallback: ["ранее выбранный вариант не найден; используется ", "previously selected item was not found; using "],
 		autoResize: ["Автомасштаб", "Auto resize"], brushSettings: ["Настройки кисти", "Brush settings"], browse: ["Обзор…", "Browse…"],
 		globalSettings: ["Глобальные настройки", "Global settings"],
+		checkUpdates: ["Проверять обновления скрипта", "Check for script updates"],
+		checkUpdatesHelp: ["Python проверяет GitHub в фоне после 15 секунд простоя, не чаще раза в сутки. Уведомление появится при следующем обычном запуске.", "Python checks GitHub in the background after 15 seconds of idle time, at most once a day. The notification appears on the next normal launch."],
+		updateAvailable: ["Доступно обновление", "Update available"],
+		updateVersions: ["Установлена версия %1. Доступна версия %2.", "Installed version: %1. Available version: %2."],
+		updateNoNotes: ["Описание изменений отсутствует.", "No release notes provided."],
+		updateOpenPage: ["Открыть страницу релиза", "Open release page"],
+		updateLater: ["Позже", "Later"],
+		errUpdateOpen: ["Не удалось открыть страницу релиза в браузере.", "Could not open the release page in the browser."],
 		pythonIdleTimeout: ["Остановка после простоя, мин (0 — выкл.):", "Stop after idle, min (0 = off):"],
         preferredTranslator: ["Переводчик:", "Translator:"],
         preferredTranslatorHelp: ["При ошибке используется другой сервис. Успешный сервис автоматически становится предпочитаемым.", "On failure another service is tried. The successful service becomes preferred automatically."],
