@@ -32,7 +32,7 @@ var APP = {
 		property: "generationSettings"
 	}
 },
-	VER = "0.259",
+	VER = "0.260",
 	// true всегда открывает окно и отключает распознавание Actions.
 	DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
 	API_FILE = "img2img-api",
@@ -141,8 +141,17 @@ catch (e) {
 	if (isUserCancellation(e)) {
 		isCancelled = true;
 	} else if (isStrictPlayback()) {
-		// Передаём ошибку Photoshop для тихого Action и запуска из файла.
 		isCancelled = false;
+		if (filePlaybackMode) {
+			// Внешний запускатель может перехватить исключение Photoshop без UI.
+			// Показываем диагностику сами, сохраняя строгий режим параметров.
+			// finally гарантирует передачу исходной ошибки даже при сбое окна.
+			try {
+				messages.error(errorMessageText(e) +
+					(e.line ? "\n\n" + str.jsxLine + e.line : ""), APP.name);
+			} finally { throw e; }
+		}
+		// Тихий Action передаёт ошибку Photoshop для остановки цепочки.
 		throw e;
 	} else {
 		// После placeResult не повторяем сохранение при ошибке финализации.
