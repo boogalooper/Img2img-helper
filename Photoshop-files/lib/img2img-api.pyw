@@ -1161,47 +1161,48 @@ def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
 
 
-def _tag_png_srgb(content: bytes) -> Tuple[bytes, bool]:
-    """Add the standard PNG sRGB marker without touching pixel data.
+def _srgb_icc_profile() -> bytes:
+    """Build the RGB sRGB profile with Pillow's Little CMS module."""
 
-    Existing iCCP is authoritative and is never replaced. Existing sRGB is
-    already sufficient. The new chunk is inserted directly after IHDR.
-    """
-
-    signature = b"\x89PNG\r\n\x1a\n"
-    if not content.startswith(signature):
-        return content, False
-    offset = len(signature)
-    chunks: List[Tuple[bytes, bytes]] = []
-    has_iccp = False
-    has_srgb = False
     try:
-        while offset + 12 <= len(content):
-            length = struct.unpack(">I", content[offset:offset + 4])[0]
-            end = offset + 12 + length
-            if end > len(content):
-                return content, False
-            chunk_type = content[offset + 4:offset + 8]
-            raw = content[offset:end]
-            chunks.append((chunk_type, raw))
-            has_iccp = has_iccp or chunk_type == b"iCCP"
-            has_srgb = has_srgb or chunk_type == b"sRGB"
-            offset = end
-            if chunk_type == b"IEND":
-                break
-    except (ValueError, struct.error):
-        return content, False
-    if has_iccp or has_srgb or not chunks or chunks[0][0] != b"IHDR":
-        return content, False
-    tagged = bytearray(signature)
-    tagged.extend(chunks[0][1])
-    # Rendering intent 0 = Perceptual, the conventional sRGB PNG marker.
-    tagged.extend(_png_chunk(b"sRGB", b"\x00"))
-    for _, raw in chunks[1:]:
-        tagged.extend(raw)
-    if offset < len(content):
-        tagged.extend(content[offset:])
-    return bytes(tagged), True
+        image_cms = importlib.import_module("PIL.ImageCms")
+        return image_cms.ImageCmsProfile(image_cms.createProfile("sRGB")).tobytes()
+    except Exception as exc:
+        raise UserVisibleError(
+            "Could not create the sRGB ICC profile. Check that Pillow includes Little CMS."
+        ) from exc
+
+
+def _embed_png_srgb(content: bytes) -> bytes:
+    """Insert iCCP before palette and image data, without rewriting pixels."""
+
+    offset = 8
+    chunks: List[Tuple[bytes, bytes]] = []
+    while offset + 12 <= len(content):
+        length = struct.unpack_from(">I", content, offset)[0]
+        end = offset + 12 + length
+        if end > len(content):
+            return content
+        chunk_type = content[offset + 4:offset + 8]
+        if chunk_type == b"iCCP":
+            return content
+        chunks.append((chunk_type, content[offset:end]))
+        offset = end
+        if chunk_type == b"IEND":
+            break
+    if not chunks or chunks[0][0] != b"IHDR" or chunks[-1][0] != b"IEND":
+        return content
+
+    header = chunks[0][1]
+    # RGB profiles are valid for RGB, indexed and RGBA PNGs.
+    if len(header) != 25 or header[17] not in (2, 3, 6):
+        LOGGER.warning("Cannot embed an RGB sRGB ICC profile in a non-RGB PNG.")
+        return content
+
+    profile = _png_chunk(b"iCCP", b"sRGB\x00\x00" + zlib.compress(_srgb_icc_profile()))
+    # PNG uses either iCCP or the legacy sRGB chunk.
+    remaining_chunks = (raw for kind, raw in chunks[1:] if kind != b"sRGB")
+    return content[:8] + header + profile + b"".join(remaining_chunks) + content[offset:]
 
 
 def _jpeg_segments(content: bytes):
@@ -1233,68 +1234,29 @@ def _jpeg_segments(content: bytes):
         offset += length
 
 
-def _minimal_srgb_exif_segment() -> bytes:
-    """Return APP1/EXIF containing only ExifIFD ColorSpace=1 (sRGB)."""
+def _embed_jpeg_srgb(content: bytes) -> bytes:
+    """Insert an ICC APP2 segment without recompressing the JPEG."""
 
-    # TIFF offsets are relative to the TIFF header immediately after "Exif\0\0".
-    tiff = bytearray()
-    tiff.extend(b"II\x2a\x00")
-    tiff.extend(struct.pack("<I", 8))
-    # IFD0: ExifIFDPointer -> offset 26.
-    tiff.extend(struct.pack("<H", 1))
-    tiff.extend(struct.pack("<HHI", 0x8769, 4, 1))
-    tiff.extend(struct.pack("<I", 26))
-    tiff.extend(struct.pack("<I", 0))
-    # Exif IFD: ColorSpace (0xA001), SHORT, value 1 = sRGB.
-    tiff.extend(struct.pack("<H", 1))
-    tiff.extend(struct.pack("<HHI", 0xA001, 3, 1))
-    tiff.extend(struct.pack("<H", 1) + b"\x00\x00")
-    tiff.extend(struct.pack("<I", 0))
-    payload = b"Exif\x00\x00" + bytes(tiff)
-    return b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
-
-
-def _tag_jpeg_srgb(content: bytes) -> Tuple[bytes, bool]:
-    """Add EXIF ColorSpace=sRGB without recompressing JPEG pixels.
-
-    Embedded ICC is preserved and wins. We also avoid creating a second EXIF
-    block because duplicate EXIF APP1 segments are interpreted inconsistently.
-    Generated Forge/Comfy JPEGs normally contain neither.
-    """
-
-    if not content.startswith(b"\xff\xd8"):
-        return content, False
-    has_icc = False
-    has_exif = False
-    for marker, payload in _jpeg_segments(content) or ():
+    component_count = None
+    for marker, payload in _jpeg_segments(content):
         if marker == 0xE2 and payload.startswith(b"ICC_PROFILE\x00"):
-            has_icc = True
-        elif marker == 0xE1 and payload.startswith(b"Exif\x00\x00"):
-            has_exif = True
-    if has_icc:
-        return content, False
-    if has_exif:
-        # Preserve existing EXIF byte-for-byte instead of creating duplicate APP1.
-        # If it already says sRGB, the requested lightweight tag is satisfied.
-        try:
-            image_module = PIL_IMAGE_MODULE
-            if image_module is not None:
-                with image_module.open(io.BytesIO(content)) as image:
-                    exif = image.getexif()
-                    if exif and exif.get_ifd(0x8769).get(0xA001) == 1:
-                        return content, False
-        except Exception:
-            pass
-        LOGGER.warning("JPEG contains existing EXIF; sRGB EXIF tag was not added to avoid replacing metadata.")
-        return content, False
+            return content
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC) and len(payload) >= 6:
+            component_count = payload[5]
+    if component_count != 3:
+        LOGGER.warning("Cannot embed an RGB sRGB ICC profile in a non-RGB JPEG.")
+        return content
+
     insert_at = 2
     # Keep a conventional JFIF APP0 first when it is present.
     if len(content) >= 6 and content[2:4] == b"\xff\xe0":
-        app0_length = struct.unpack(">H", content[4:6])[0]
+        app0_length = struct.unpack_from(">H", content, 4)[0]
         candidate = 4 + app0_length
         if app0_length >= 2 and candidate <= len(content):
             insert_at = candidate
-    return content[:insert_at] + _minimal_srgb_exif_segment() + content[insert_at:], True
+    payload = b"ICC_PROFILE\x00\x01\x01" + _srgb_icc_profile()
+    segment = b"\xff\xe2" + struct.pack(">H", len(payload) + 2) + payload
+    return content[:insert_at] + segment + content[insert_at:]
 
 
 def _webp_has_icc(content: bytes) -> bool:
@@ -1310,32 +1272,32 @@ def _webp_has_icc(content: bytes) -> bool:
     return False
 
 
-def tag_image_as_srgb(path: Path) -> Path:
-    """Tag an unprofiled generated image as sRGB without RGB conversion."""
+def embed_srgb_icc_profile(path: Path) -> Path:
+    """Embed sRGB ICC in an unprofiled generated image without RGB conversion."""
 
     try:
         content = path.read_bytes()
         suffix = _detect_image_suffix(content)
         if suffix == ".png":
-            tagged, changed = _tag_png_srgb(content)
+            updated = _embed_png_srgb(content)
         elif suffix == ".jpg":
-            tagged, changed = _tag_jpeg_srgb(content)
+            updated = _embed_jpeg_srgb(content)
         else:
-            LOGGER.warning("sRGB tag was requested for unsupported result format: %s", path)
+            LOGGER.warning("sRGB ICC embedding was requested for unsupported result format: %s", path)
             return path
-        if changed:
+        if updated is not content:
             temp = path.with_name(f".{path.name}.{os.getpid()}.srgb.tmp")
             try:
-                temp.write_bytes(tagged)
+                temp.write_bytes(updated)
                 os.replace(temp, path)
             finally:
                 try:
                     temp.unlink(missing_ok=True)
                 except OSError:
                     pass
-            LOGGER.info("Tagged generated image as sRGB without pixel conversion: %s", path)
+            LOGGER.info("Embedded sRGB ICC profile without pixel conversion: %s", path)
     except OSError as exc:
-        raise UserVisibleError(f"Could not add the sRGB tag to generated image: {path}") from exc
+        raise UserVisibleError(f"Could not embed the sRGB ICC profile in generated image: {path}") from exc
     return path
 
 
@@ -1363,17 +1325,22 @@ def _save_image_content_for_photoshop(
         with image_module.open(io.BytesIO(content)) as source:
             source.load()
             image = image_ops_module.exif_transpose(source)
+            icc_profile = image.info.get("icc_profile")
             if requested == "png":
                 bands = image.getbands()
                 if "A" in bands or image.mode in {"P", "LA"}:
                     image = image.convert("RGBA")
                 else:
                     image = image.convert("RGB")
-                image.save(str(destination), format="PNG", compress_level=6)
+                if image.mode != source.mode and source.mode not in {"P", "RGB", "RGBA"}:
+                    icc_profile = None
+                image.save(str(destination), format="PNG", compress_level=6, icc_profile=icc_profile)
             else:
                 if image.mode not in {"RGB", "L"}:
+                    if image.mode not in {"P", "RGB", "RGBA"}:
+                        icc_profile = None
                     image = image.convert("RGB")
-                image.save(str(destination), format="JPEG", quality=95)
+                image.save(str(destination), format="JPEG", quality=95, icc_profile=icc_profile)
     except Exception as exc:
         raise UserVisibleError("Could not convert the generated image for Photoshop.") from exc
     return destination
@@ -2138,12 +2105,14 @@ class ComfyClient:
         output_format: Any = "jpg",
         local_output_folder: Optional[Path] = None,
         request_id: str = "",
+        preserve_icc: bool = False,
     ) -> Path:
         """Скачивает output в формате, удобном для размещения в Photoshop.
 
         ``jpg`` использует быстрый ``preview=jpeg`` и при необходимости
         локально конвертирует fallback PNG/WebP. ``png`` скачивает исходный
-        output, чтобы по возможности сохранить transparency.
+        output, чтобы по возможности сохранить transparency. При preserve_icc
+        скачиваем исходник и для JPG, чтобы серверное превью не отбросило ICC.
         """
 
         quality = max(1, min(100, int(quality)))
@@ -2186,7 +2155,7 @@ class ComfyClient:
             except (OSError, ValueError, UserVisibleError) as exc:
                 LOGGER.debug("Direct ComfyUI output read failed; using /view: %s", exc)
 
-        if requested_format == "png":
+        if requested_format == "png" or preserve_icc:
             raw = self._request(
                 "GET",
                 "/view?" + urllib.parse.urlencode(base_query),
@@ -2196,7 +2165,7 @@ class ComfyClient:
                 raise UserVisibleError(
                     "ComfyUI returned an unknown image format through /view."
                 )
-            return _save_image_content_for_photoshop(raw, destination, "png")
+            return _save_image_content_for_photoshop(raw, destination, requested_format)
 
         preview_raw: Optional[bytes] = None
         preview_query = dict(base_query)
@@ -7306,9 +7275,8 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
     destination = _decode_forge_image(encoded_image, destination_base)
     if message.get("tag_srgb"):
         if destination.suffix.lower() == ".webp":
-            # Preserve an embedded WebP ICC profile. Untagged WebP has no equally
-            # portable lightweight sRGB marker, so only that case is converted
-            # to lossless PNG pixels and tagged there.
+            # Keep the existing Photoshop-compatible PNG fallback for
+            # unprofiled WebP results.
             webp_content = destination.read_bytes()
             if not _webp_has_icc(webp_content):
                 png_destination = _save_image_content_for_photoshop(webp_content, destination_base, "png")
@@ -7318,7 +7286,7 @@ def _run_forge_generation(task: Dict[str, Any], request_id: str) -> None:
                     except OSError:
                         pass
                     destination = png_destination
-        destination = tag_image_as_srgb(destination)
+        destination = embed_srgb_icc_profile(destination)
     generated_seeds: Dict[str, Any] = {}
     info = result.get("info")
     if isinstance(info, str):
@@ -9184,9 +9152,10 @@ def _run_comfy_generation(task: Dict[str, Any], request_id: str) -> None:
         output_format=output_format,
         local_output_folder=output_folder,
         request_id=request_id,
+        preserve_icc=bool(message.get("tag_srgb")),
     )
     if message.get("tag_srgb"):
-        destination = tag_image_as_srgb(destination)
+        destination = embed_srgb_icc_profile(destination)
     if _comfy_request_output_path(destination, output_folder, request_id) is not None:
         GENERATION.preserved_output_path = destination
 
